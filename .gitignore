@@ -1,0 +1,14 @@
+[Ll]ibrary/
+[Tt]emp/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+[Mm]emoryCaptures/
+Obj/
+*.csproj
+*.unityproj
+*.sln
+*.user
+*.userprefs
+Assets/PocketSphinxUnityDemo-master/Assets/StreamingAssets/*.tar
+Assets/PocketSphinxUnityDemo-master/Assets/PocketSphinx/Lib/**/*.dll

@@ -1,0 +1,67 @@
+{
+  "levelplan": [
+    {
+      "Letters": [
+        "a",
+        "d",
+        "b",
+        "c",
+        "f",
+        "g",
+        "h",
+        "i",
+        "j",
+        "k",
+        "l",
+        "m",
+        "n",
+        "o",
+        "p",
+        "q",
+        "r",
+        "s",
+        "t",
+        "u",
+        "v",
+        "w",
+        "x",
+        "y",
+        "z"
+      ],
+      "Phonemes": [
+        "a",
+        "d",
+        "b",
+        "e",
+        "c",
+        "f",
+        "g",
+        "h",
+        "i",
+        "j",
+        "k",
+        "l",
+        "m",
+        "n",
+        "o",
+        "p",
+        "q",
+        "r",
+        "s",
+        "t",
+        "u",
+        "v",
+        "w",
+        "x",
+        "y",
+        "z"
+      ],
+      "Modes": [
+        "PhonemeChecking",
+        "TraceChecking",
+        "ObjectPlacing"
+      ]
+    }
+  ],
+  "currentLetter": "a"
+}

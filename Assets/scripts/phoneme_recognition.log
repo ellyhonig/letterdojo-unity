@@ -1,0 +1,16 @@
+2024-12-15 14:41:28,202 [INFO] Firebase initialized successfully.
+2024-12-15 14:41:28,292 [DEBUG] Making request: POST https://oauth2.googleapis.com/token
+2024-12-15 14:41:28,306 [DEBUG] Starting new HTTPS connection (1): oauth2.googleapis.com:443
+2024-12-15 14:41:28,399 [DEBUG] https://oauth2.googleapis.com:443 "POST /token HTTP/1.1" 200 None
+2024-12-15 14:41:28,499 [DEBUG] Level 1 already exists for student 'LzjimNub3omIojiFBirc'.
+2024-12-15 14:41:28,500 [INFO] Initial log file size: 3 bytes.
+2024-12-15 14:41:28,503 [INFO] Started monitoring 'Z:\steamVRkickboxer\steamVRkickboxer\phoneme_output.txt' for phoneme detections.
+2024-12-15 14:41:32,310 [DEBUG] Detected modification in 'Z:\steamVRkickboxer\steamVRkickboxer\phoneme_output.txt'.
+2024-12-15 14:41:32,311 [DEBUG] Detected modification in 'Z:\steamVRkickboxer\steamVRkickboxer\phoneme_output.txt'.
+2024-12-15 14:41:45,243 [DEBUG] Detected modification in 'Z:\steamVRkickboxer\steamVRkickboxer\phoneme_output.txt'.
+2024-12-15 14:45:56,049 [DEBUG] Detected modification in 'Z:\steamVRkickboxer\steamVRkickboxer\phoneme_output.txt'.
+2024-12-15 14:45:56,060 [DEBUG] Detected phoneme line: 'CUH'
+2024-12-15 14:45:56,061 [INFO] Processing Phoneme: Detected 'CUH'
+2024-12-15 14:45:56,061 [INFO] Phoneme correct: 'CUH'
+2024-12-15 14:45:56,228 [INFO] Updated Firestore for student 'renee', Level 1
+2024-12-15 14:59:57,358 [INFO] Stopping log file monitoring.

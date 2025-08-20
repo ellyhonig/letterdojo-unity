@@ -1,0 +1,6 @@
+
+#JSGF V1.0;
+
+grammar phonemes;
+
+public <phoneme> = BUH | CUH | DUH | TUH | GUH;
