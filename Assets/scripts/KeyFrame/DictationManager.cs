@@ -47,7 +47,7 @@ public class DictationManager : MonoBehaviour
     [Header("Drawer Host")]
     [Tooltip("GO holding PlaneSurfaceDrawer/HandPlaneConstraint. Enabled only in Dictation mode.")]
     [SerializeField] private GameObject drawerHost;
-
+    [SerializeField] private GameObject tmpLetter;
     private CanvasManager  canvas;
     private SimpleRecorder rec;
     private LevelManager   lvl;
@@ -149,6 +149,9 @@ public class DictationManager : MonoBehaviour
         if (rec != null && rec.currentRecord != null && rec.currentRecord.frames != null)
             rec.currentRecord.frames.Clear();
         if (rec != null) rec.IsRecording = false;
+
+        // Disable tmpLetter when dictation starts
+        if (tmpLetter != null) tmpLetter.SetActive(false);
 
         state = State.Drawing;
         UpdateUI();
@@ -252,6 +255,10 @@ public class DictationManager : MonoBehaviour
         state = State.Idle;
         UpdateUI();
         SetFeedback("");
+        
+        // Re-enable tmpLetter when dictation ends
+        if (tmpLetter != null) tmpLetter.SetActive(true);
+        
         OnDictationComplete?.Invoke();
     }
 

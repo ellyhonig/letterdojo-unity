@@ -58,8 +58,8 @@
       ],
       "Modes": [
         "PhonemeChecking",
-        "TraceChecking",
-        "ObjectPlacing"
+        
+        "Dictation"
       ]
     }
   ],

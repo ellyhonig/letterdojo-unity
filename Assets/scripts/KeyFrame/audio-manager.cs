@@ -1,5 +1,9 @@
 using UnityEngine;
-
+using System;
+using System.IO;
+using System.Collections.Generic;
+using Newtonsoft.Json;
+using System.Collections;
 public class AudioManager : MonoBehaviour
 {
     [SerializeField] private AudioSource audioSource;
@@ -7,7 +11,9 @@ public class AudioManager : MonoBehaviour
     [SerializeField] private AudioClip winSound;
     [SerializeField] private AudioClip munchSound;
     [SerializeField] private AudioClip incorrectSound;    // NEW
-
+    public event Action OnWinSoundPlayed;
+    public event Action OnIncorrectSoundPlayed;
+    
     [SerializeField] private LetterTracingSystem tracingSystem;
     [SerializeField] private ObjectOfInterestManager objManager;
     private DictationManager dictationManager;
@@ -52,7 +58,7 @@ public class AudioManager : MonoBehaviour
         if (dictationManager != null)
         {
             dictationManager.OnLetterCorrect   += PlayWinSound;
-            dictationManager.OnLetterIncorrect+= PlayPopSound;
+            dictationManager.OnLetterIncorrect+= OnPhonemeIncorrectHandler;
         }
         else Debug.LogError("DictationManager missing.");
 
@@ -74,6 +80,7 @@ public class AudioManager : MonoBehaviour
         {
             PlaySound(winSound);
             lastWinSoundTime = Time.time;
+            OnWinSoundPlayed?.Invoke(); 
         }
     }
     private void PlayMunchSound() => PlaySound(munchSound);
@@ -82,6 +89,7 @@ public class AudioManager : MonoBehaviour
     private void OnPhonemeIncorrectHandler()
     {
         PlaySound(incorrectSound);
+        OnIncorrectSoundPlayed?.Invoke();
     }
 
     private void OnPhonemeTriesExhaustedHandler()

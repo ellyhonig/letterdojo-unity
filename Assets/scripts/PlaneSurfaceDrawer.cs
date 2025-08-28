@@ -144,7 +144,7 @@ public class PlaneSurfaceDrawer : MonoBehaviour
         line.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
         line.receiveShadows = false;
         line.motionVectorGenerationMode = MotionVectorGenerationMode.ForceNoMotion;
-        line.material = new Material(Shader.Find("Sprites/Default")) { color = Color.white };
+        line.material = new Material(Shader.Find("Sprites/Default")) { color = Color.black };
         line.positionCount = 0;
 
         pts.Clear(); // new segment list (history kept via old GOs)
