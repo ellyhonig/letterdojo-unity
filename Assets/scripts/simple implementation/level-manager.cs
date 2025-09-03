@@ -278,10 +278,11 @@ public class LevelManager : MonoBehaviour
 
     public void SetLevelByLetter(string letter)
     {
+        if (string.IsNullOrEmpty(letter)) { Debug.LogWarning("Letter is null/empty."); return; }
         for (int p = 0; p < levelPlan.Count; p++)
         {
             var phase = levelPlan[p];
-            int li = phase.Letters.IndexOf(letter);
+            int li = phase.Letters.FindIndex(l => string.Equals(l, letter, StringComparison.OrdinalIgnoreCase));
             if (li >= 0)
             {
                 if (li >= phase.Phonemes.Count)
@@ -290,7 +291,7 @@ public class LevelManager : MonoBehaviour
                     return;
                 }
                 phaseIndex = p; letterIndex = li; modeIndex = 0;
-                currentLetter  = phase.Letters[li];
+                currentLetter  = phase.Letters[li]; // keep plan's casing
                 currentPhoneme = phase.Phonemes[li];
                 LoadLevelData();
                 StartCurrentMode();

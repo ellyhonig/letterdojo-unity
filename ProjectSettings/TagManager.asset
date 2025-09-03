@@ -19,6 +19,8 @@ TagManager:
   - add test section
   - UndoCalibrationButton
   - fillBetween
+  - visualdrill
+  - audiodrill
   layers:
   - Default
   - TransparentFX

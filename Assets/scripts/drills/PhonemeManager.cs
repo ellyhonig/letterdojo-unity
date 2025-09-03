@@ -37,7 +37,7 @@ public class PhonemeManager : MonoBehaviour
 
     [Header("Mic Settings")]
     [SerializeField] private int maxRecordingSeconds = 15;
-    [SerializeField] private int sampleRate = 44100;
+    [SerializeField] private int sampleRate = 16000; // 16 kHz = plenty for speech
 
     [Header("Auto-Start Alignment")]
     [Range(0f,1f)] public float alignmentThreshold = 0.7f;
@@ -72,7 +72,6 @@ public class PhonemeManager : MonoBehaviour
     private bool prevSpeak, prevWait;
     private Coroutine blinkCoroutine;
     private Coroutine flashCoroutine;
-    private bool flashWaitActive;
 
     public event Action OnPhonemeCorrect;
     public event Action OnPhonemeIncorrect;
@@ -81,10 +80,17 @@ public class PhonemeManager : MonoBehaviour
     private simplePlayer sPlayer;
     private Renderer btnRenderer;
     private Color btnColorOriginal;
-    private Material btnMat;
-    private float[] micBuf;
-    private AudioClip recordedClip;
-    private AudioClip micClip;
+    private Material btnMat; // instanced; we Destroy() it on cleanup
+
+    // scratch buffers (REUSED to avoid GC/alloc churn)
+    private float[] micBuf;             // live window buffer for loudness
+    private float[] headScratch;        // SafeGetWindow head copy
+    private float[] tailScratch;        // SafeGetWindow tail copy
+    private float[] clipScratch;        // CopySegmentToMono temp (interleaved)
+    private float[] recMonoScratch;     // up to max clip length (mono)
+
+    private AudioClip recordedClip;     // per-take clip (not micClip)
+    private AudioClip micClip;          // looping mic buffer
     private int startSample;
     private string micDevice;
 
@@ -97,26 +103,20 @@ public class PhonemeManager : MonoBehaviour
     private float loudTimer, peakThisClip;
     private bool autoStopped;
 
-    /* NEW: utterance + silence gate */
+    /* utterance + silence gate */
     private int  utteranceCount;
     private bool waitingForSilence;
     private float silenceTimer;
 
-    /* NEW: beam startup gate */
+    /* beam startup gate */
     private bool beamReady = false;
 
-    /* ===================== INDICATOR GATE (mutex-style) =====================
-       - Guarantees mutual exclusion: never both indicators active.
-       - Multiple callers can "want" an indicator via tags with priorities.
-       - Tie-breaker: higher priority wins, then latest request; tie → Speak.
-       - Accessors: SetSpeakIndicator / SetWaitIndicator (below).
-    ======================================================================== */
+    /* ===================== INDICATOR GATE (mutex-style) ===================== */
     private sealed class IndicatorGate
     {
         private readonly Dictionary<string,int> speakWants = new();
         private readonly Dictionary<string,int> waitWants  = new();
         private uint seq; // recency
-
         private readonly Dictionary<string,uint> speakSeq = new();
         private readonly Dictionary<string,uint> waitSeq  = new();
 
@@ -145,14 +145,13 @@ public class PhonemeManager : MonoBehaviour
             {
                 int topS = speakWants.Values.Max();
                 int topW = waitWants.Values.Max();
-                if (topS != topW)
-                    finalSpeak = topS > topW;
+                if (topS != topW) finalSpeak = topS > topW;
                 else
                 {
                     uint sSeq = speakSeq.Values.Max();
                     uint wSeq = waitSeq.Values.Max();
                     if (sSeq != wSeq) finalSpeak = sSeq > wSeq;
-                    else finalSpeak = true; // perfect tie → Speak
+                    else finalSpeak = true; // tie → Speak
                 }
                 finalWait = !finalSpeak;
             }
@@ -166,20 +165,40 @@ public class PhonemeManager : MonoBehaviour
     /* ---------- PUBLIC ACCESSORS (safe, mutually exclusive) ---------- */
     public void SetSpeakIndicator(bool on, string tag = "external", int priority = 0)
     {
-        indicatorGate.WantSpeak(tag, on, priority);
-        indicatorGate.Apply(speakIndicator, waitIndicator);
+        bool inPhonemeMode = levelManager != null && levelManager.currentMode == LevelManager.GameMode.PhonemeChecking;
+        // Only allow enabling during phoneme checking
+        indicatorGate.WantSpeak(tag, inPhonemeMode && on, priority);
+        if (!inPhonemeMode)
+        {
+            if (speakIndicator && speakIndicator.activeSelf) speakIndicator.SetActive(false);
+            if (waitIndicator  && waitIndicator.activeSelf)  waitIndicator.SetActive(false);
+        }
+        else
+        {
+            indicatorGate.Apply(speakIndicator, waitIndicator);
+        }
         prevSpeak = speakIndicator && speakIndicator.activeSelf;
         prevWait  = waitIndicator  && waitIndicator.activeSelf;
     }
     public void SetWaitIndicator(bool on, string tag = "external", int priority = 0)
     {
-        indicatorGate.WantWait(tag, on, priority);
-        indicatorGate.Apply(speakIndicator, waitIndicator);
+        bool inPhonemeMode = levelManager != null && levelManager.currentMode == LevelManager.GameMode.PhonemeChecking;
+        // Only allow enabling during phoneme checking
+        indicatorGate.WantWait(tag, inPhonemeMode && on, priority);
+        if (!inPhonemeMode)
+        {
+            if (speakIndicator && speakIndicator.activeSelf) speakIndicator.SetActive(false);
+            if (waitIndicator  && waitIndicator.activeSelf)  waitIndicator.SetActive(false);
+        }
+        else
+        {
+            indicatorGate.Apply(speakIndicator, waitIndicator);
+        }
         prevSpeak = speakIndicator && speakIndicator.activeSelf;
         prevWait  = waitIndicator  && waitIndicator.activeSelf;
     }
 
-    /* ultra-lenient IPA map – originals kept, added confusions */
+    /* ultra-lenient IPA map */
     private readonly Dictionary<string,List<string>> letterToIPA = new()
     {
         { "A", new(){ "a","ɑ","æ","ɒ","ʌ","ə","eɪ","aɪ","ɛ","e","ɐ","aː","ɑː","æː","ɜ","ɘ","ə̟","e ɪ" }},
@@ -210,19 +229,21 @@ public class PhonemeManager : MonoBehaviour
         { "Z", new(){ "z","z ə","z ɑ","s","s ə","s ɑ","zi","ziː","z i","z iː","zɪ","z ɪ","zɛd","z ɛ d","ʒ" }},
     };
 
-    // Downmix a segment from micClip (handles wrap at call site)
+    // Downmix a segment from micClip (handles wrap at call site) with REUSED buffer
     void CopySegmentToMono(int startFrame, int frames, float[] dst, int dstOffset)
     {
         if (micClip == null || frames <= 0) return;
         int ch = micClip.channels;
         int needSamples = frames * ch;
-        var tmp = new float[needSamples];
 
-        micClip.GetData(tmp, startFrame);
+        if (clipScratch == null || clipScratch.Length < needSamples)
+            clipScratch = new float[needSamples];
+
+        micClip.GetData(clipScratch, startFrame);
 
         if (ch == 1)
         {
-            Array.Copy(tmp, 0, dst, dstOffset, frames);
+            Buffer.BlockCopy(clipScratch, 0, dst, dstOffset * sizeof(float), frames * sizeof(float));
             return;
         }
 
@@ -230,12 +251,12 @@ public class PhonemeManager : MonoBehaviour
         for (int f = 0; f < frames; f++)
         {
             float acc = 0f;
-            for (int c = 0; c < ch; c++) acc += tmp[si++];
+            for (int c = 0; c < ch; c++) acc += clipScratch[si++];
             dst[dstOffset + f] = acc / ch;
         }
     }
 
-    // Read a wrap-safe window from the circular mic buffer into dst
+    // Read a wrap-safe window from the circular mic buffer into dst (REUSES scratch arrays)
     bool SafeGetWindow(int offsetFrames, int sizeSamples, float[] dst)
     {
         if (micClip == null) return false;
@@ -250,20 +271,19 @@ public class PhonemeManager : MonoBehaviour
         int headFrames  = Math.Min(totalFrames - startFrame, sizeSamples / ch);
         int headSamples = headFrames * ch;
         int tailSamples = sizeSamples - headSamples;
-        int tailFrames  = tailSamples / ch;
 
         if (headSamples > 0)
         {
-            var headBuf = new float[headSamples];
-            micClip.GetData(headBuf, startFrame);
-            Array.Copy(headBuf, 0, dst, 0, headSamples);
+            if (headScratch == null || headScratch.Length < headSamples) headScratch = new float[headSamples];
+            micClip.GetData(headScratch, startFrame);
+            Buffer.BlockCopy(headScratch, 0, dst, 0, headSamples * sizeof(float));
         }
 
         if (tailSamples > 0)
         {
-            var tailBuf = new float[tailSamples];
-            micClip.GetData(tailBuf, 0);
-            Array.Copy(tailBuf, 0, dst, headSamples, tailSamples);
+            if (tailScratch == null || tailScratch.Length < tailSamples) tailScratch = new float[tailSamples];
+            micClip.GetData(tailScratch, 0);
+            Buffer.BlockCopy(tailScratch, 0, dst, headSamples * sizeof(float), tailSamples * sizeof(float));
         }
 
         return true;
@@ -282,6 +302,7 @@ public class PhonemeManager : MonoBehaviour
             btnRenderer = proximityButtonObject.GetComponentInChildren<Renderer>(true);
             if (btnRenderer)
             {
+                // instanced material (we'll Destroy it later)
                 btnMat = btnRenderer.material;
                 btnColorOriginal = btnMat.color;
             }
@@ -290,6 +311,8 @@ public class PhonemeManager : MonoBehaviour
         sPlayer = GetComponent<simplePlayer>();
         RefreshIndicators(true);
         levelManager.OnPhonemeCheckStart += () => SetState(PhonemeCheckState.Start);
+        // Ensure indicators follow mode changes instantly (never on in other modes)
+        if (levelManager != null) levelManager.OnGameModeChanged += HandleModeChanged;
     }
 
     private void Start()
@@ -304,6 +327,8 @@ public class PhonemeManager : MonoBehaviour
             proximityButton.OnButtonPressed += HandlePhysicalPress;
             proximityButton.OnButtonReleased += HandlePhysicalRelease;
         }
+        SetSpeakIndicator(false);
+        SetWaitIndicator(false);
     }
 
     private void Update()
@@ -343,7 +368,6 @@ public class PhonemeManager : MonoBehaviour
             }
         }
     }
-    
 
     /* ---------- Recording monitors ---------- */
     private void HandleRecordingMonitors()
@@ -361,11 +385,17 @@ public class PhonemeManager : MonoBehaviour
         int needed = WIN * micClip.channels;
         if (micBuf == null || micBuf.Length < needed) micBuf = new float[needed];
         if (!SafeGetWindow(offset, needed, micBuf)) return;
-        float framePeak = 0f;
-        foreach (float v in micBuf) framePeak = Mathf.Max(framePeak, Mathf.Abs(v));
-        peakThisClip = Mathf.Max(peakThisClip, framePeak);
 
-        /* --- silence-gate logic ---- */
+        float framePeak = 0f;
+        // interleaved OK; peak is per-sample abs
+        for (int i = 0; i < needed; i++)
+        {
+            float a = Mathf.Abs(micBuf[i]);
+            if (a > framePeak) framePeak = a;
+        }
+        if (framePeak > peakThisClip) peakThisClip = framePeak;
+
+        // silence gate
         if (waitingForSilence)
         {
             if (framePeak < amplitudeThreshold * silenceAmpFactor)
@@ -378,13 +408,12 @@ public class PhonemeManager : MonoBehaviour
                 waitingForSilence = false;
                 loudTimer = 0f;
                 peakThisClip = 0f;
-                flashWaitActive = false; // kept for compatibility, no longer drives UI
             }
             return;
         }
 
-        /* --- loudness count ---- */
-        loudTimer = framePeak >= amplitudeThreshold ? loudTimer + Time.deltaTime : 0f;
+        // loudness count
+        loudTimer = framePeak >= amplitudeThreshold ? (loudTimer + Time.deltaTime) : 0f;
         if (loudTimer >= loudEnoughTime)
         {
             utteranceCount++;
@@ -394,9 +423,10 @@ public class PhonemeManager : MonoBehaviour
             {
                 waitingForSilence = true;
                 silenceTimer = 0f;
-                flashWaitActive = true; // informational only
+
                 if (flashCoroutine != null) StopCoroutine(flashCoroutine);
-                flashCoroutine = StartCoroutine(FlashWaitBetween()); // strictly time-bounded flash
+                flashCoroutine = StartCoroutine(FlashWaitBetween());
+
                 loudTimer = 0f;
                 peakThisClip = 0f;
                 return;
@@ -410,7 +440,6 @@ public class PhonemeManager : MonoBehaviour
 
     private IEnumerator FlashWaitBetween()
     {
-        // High-priority temporary claim for WAIT; disappears after betweenUtteranceFlash.
         SetWaitIndicator(true, tag: "flash", priority: 100);
         yield return new WaitForSeconds(betweenUtteranceFlash);
         SetWaitIndicator(false, tag: "flash");
@@ -484,7 +513,7 @@ public class PhonemeManager : MonoBehaviour
     {
         if (micClip == null) { Debug.LogError("Mic not warmed"); yield break; }
         startSample = Microphone.GetPosition(micDevice);
-        recordedClip = micClip;
+        recordedClip = null; // reset; we'll create a fresh clip at EndMic
         loudTimer = 0f;
         peakThisClip = 0f;
         autoStopped = false;
@@ -492,7 +521,6 @@ public class PhonemeManager : MonoBehaviour
         utteranceCount = 0;
         waitingForSilence = false;
         silenceTimer = 0f;
-        flashWaitActive = false;
         yield break;
     }
 
@@ -500,7 +528,7 @@ public class PhonemeManager : MonoBehaviour
     {
         if (micClip == null) return;
 
-        int endFrame   = Microphone.GetPosition(micDevice);
+        int endFrame    = Microphone.GetPosition(micDevice);
         int totalFrames = micClip.samples;
 
         int lenFrames = endFrame >= startSample
@@ -513,17 +541,22 @@ public class PhonemeManager : MonoBehaviour
             return;
         }
 
-        var mono = new float[lenFrames];
+        // reuse a mono scratch as big as possible take
+        int maxFrames = Mathf.CeilToInt(maxRecordingSeconds * sampleRate);
+        if (recMonoScratch == null || recMonoScratch.Length < maxFrames)
+            recMonoScratch = new float[maxFrames];
 
+        // copy into recMonoScratch
         int headFrames = Math.Min(totalFrames - startSample, lenFrames);
-        CopySegmentToMono(startSample, headFrames, mono, 0);
+        CopySegmentToMono(startSample, headFrames, recMonoScratch, 0);
 
         int tailFrames = lenFrames - headFrames;
         if (tailFrames > 0)
-            CopySegmentToMono(0, tailFrames, mono, headFrames);
+            CopySegmentToMono(0, tailFrames, recMonoScratch, headFrames);
 
+        // create the exact-sized clip
         recordedClip = AudioClip.Create("take", lenFrames, 1, sampleRate, false);
-        recordedClip.SetData(mono, 0);
+        recordedClip.SetData(recMonoScratch, 0);
 
         Debug.Log($"EndMic: captured {(float)lenFrames / sampleRate:F2}s  ({lenFrames} frames)");
     }
@@ -597,27 +630,30 @@ public class PhonemeManager : MonoBehaviour
         int samples = sampleRate * 1;
         AudioClip silentClip = AudioClip.Create("BeamWarmup", samples, 1, sampleRate, false);
         byte[] wav = WavUtility.FromAudioClip(silentClip, out _);
+        Destroy(silentClip);
+
         string b64 = Convert.ToBase64String(wav);
         string json = JsonUtility.ToJson(new BeamReq { audio_file = b64 });
 
-        using var req = new UnityWebRequest(API_URL, "POST")
+        using (var req = new UnityWebRequest(API_URL, "POST"))
         {
-            uploadHandler = new UploadHandlerRaw(Encoding.UTF8.GetBytes(json)),
-            downloadHandler = new DownloadHandlerBuffer()
-        };
-        req.SetRequestHeader("Content-Type", "application/json");
-        req.SetRequestHeader("Authorization", $"Bearer {TOKEN}");
-        Debug.Log("PhonemeManager: Warming up Beam server…");
-        yield return req.SendWebRequest();
+            req.uploadHandler   = new UploadHandlerRaw(Encoding.UTF8.GetBytes(json));
+            req.downloadHandler = new DownloadHandlerBuffer();
+            req.SetRequestHeader("Content-Type", "application/json");
+            req.SetRequestHeader("Authorization", $"Bearer {TOKEN}");
+            Debug.Log("PhonemeManager: Warming up Beam server…");
+            yield return req.SendWebRequest();
 
-        beamReady = true;
-        alignPressed = false;
-        feedbackText?.SetText("Look at the button to begin.");
-        SetState(PhonemeCheckState.Start);
-        if (req.result == UnityWebRequest.Result.Success)
-            Debug.Log("PhonemeManager: Beam warmup complete.");
-        else
-            Debug.LogWarning($"PhonemeManager: Beam warmup failed: {req.error}");
+            beamReady = true;
+            alignPressed = false;
+            feedbackText?.SetText("Look at the button to begin.");
+            SetState(PhonemeCheckState.Start);
+
+            if (req.result == UnityWebRequest.Result.Success)
+                Debug.Log("PhonemeManager: Beam warmup complete.");
+            else
+                Debug.LogWarning($"PhonemeManager: Beam warmup failed: {req.error}");
+        } // disposes handlers
     }
 
     /* ---------- Beam comms ---------- */
@@ -633,38 +669,43 @@ public class PhonemeManager : MonoBehaviour
         if (!recordedClip) { SetState(PhonemeCheckState.Incorrect); return; }
 
         AudioClip clipToSend = trimSilence ? TrimSilence(recordedClip, silenceThreshold) : recordedClip;
-
-        byte[] wav = WavUtility.FromAudioClip(clipToSend, out _);
-        StartCoroutine(PostAudio(Convert.ToBase64String(wav)));
+        StartCoroutine(PostAndCleanup(clipToSend));
     }
 
-    private IEnumerator PostAudio(string b64)
+    private IEnumerator PostAndCleanup(AudioClip clipToSend)
     {
-        var json = JsonUtility.ToJson(new BeamReq { audio_file = b64 });
-        UnityWebRequest r = new(API_URL, "POST")
-        {
-            uploadHandler = new UploadHandlerRaw(Encoding.UTF8.GetBytes(json)),
-            downloadHandler = new DownloadHandlerBuffer()
-        };
-        r.SetRequestHeader("Content-Type", "application/json");
-        r.SetRequestHeader("Authorization", $"Bearer {TOKEN}");
-        yield return r.SendWebRequest();
+        byte[] wav = WavUtility.FromAudioClip(clipToSend, out _);
+        var jsonBytes = Encoding.UTF8.GetBytes(JsonUtility.ToJson(new BeamReq { audio_file = Convert.ToBase64String(wav) }));
 
-        if (blinkCoroutine != null)
+        using (var r = new UnityWebRequest(API_URL, "POST"))
         {
-            StopCoroutine(blinkCoroutine);
-            blinkCoroutine = null;
+            r.uploadHandler   = new UploadHandlerRaw(jsonBytes);
+            r.downloadHandler = new DownloadHandlerBuffer();
+            r.SetRequestHeader("Content-Type", "application/json");
+            r.SetRequestHeader("Authorization", $"Bearer {TOKEN}");
+
+            yield return r.SendWebRequest();
+
+            if (blinkCoroutine != null)
+            {
+                StopCoroutine(blinkCoroutine);
+                blinkCoroutine = null;
+            }
+
+            if (r.result == UnityWebRequest.Result.Success) ParseBeam(r.downloadHandler.text);
+            else SetState(PhonemeCheckState.Incorrect);
         }
 
-        if (r.result == UnityWebRequest.Result.Success) ParseBeam(r.downloadHandler.text);
-        else SetState(PhonemeCheckState.Incorrect);
+        // cleanup temp clips
+        if (clipToSend && clipToSend != recordedClip) Destroy(clipToSend);
+        if (recordedClip) { Destroy(recordedClip); recordedClip = null; }
     }
 
     private void ParseBeam(string json)
     {
         int idx = json.IndexOf("\"text\":\"", StringComparison.Ordinal);
         lastBeamText = idx >= 0
-            ? json[(idx + 8)..json.IndexOf("\"", idx + 8, StringComparison.Ordinal)]
+            ? json.Substring(idx + 8, json.IndexOf("\"", idx + 8, StringComparison.Ordinal) - (idx + 8))
             : "";
 
         if (string.IsNullOrEmpty(lastBeamText))
@@ -701,7 +742,7 @@ public class PhonemeManager : MonoBehaviour
         if (len <= 0) len = 1;
 
         float[] trimmed = new float[len];
-        Array.Copy(samples, start, trimmed, 0, len);
+        Buffer.BlockCopy(samples, start * sizeof(float), trimmed, 0, len * sizeof(float));
 
         AudioClip newClip = AudioClip.Create("trimmed", len, 1, clip.frequency, false);
         newClip.SetData(trimmed, 0);
@@ -734,12 +775,21 @@ public class PhonemeManager : MonoBehaviour
     private void RefreshIndicators(bool force = false)
     {
         bool inPhonemeMode = levelManager != null && levelManager.currentMode == LevelManager.GameMode.PhonemeChecking;
+        // Outside phoneme mode: force both indicators off and clear state wants
+        if (!inPhonemeMode)
+        {
+            indicatorGate.WantSpeak("state", false, priority: 0);
+            indicatorGate.WantWait ("state", false, priority: 0);
+            if (speakIndicator && speakIndicator.activeSelf) speakIndicator.SetActive(false);
+            if (waitIndicator  && waitIndicator.activeSelf)  waitIndicator.SetActive(false);
+            prevSpeak = speakIndicator && speakIndicator.activeSelf;
+            prevWait  = waitIndicator  && waitIndicator.activeSelf;
+            return;
+        }
 
-        // Keep your original intent, but enforce mutual exclusion via the gate.
-        bool wantSpeak = inPhonemeMode && state == PhonemeCheckState.Recording;
-        bool wantWait  = inPhonemeMode && !wantSpeak;
+        bool wantSpeak = state == PhonemeCheckState.Recording;
+        bool wantWait  = !wantSpeak;
 
-        // "state" tag = normal state-driven desires. Give Speak a slight edge.
         indicatorGate.WantSpeak("state", wantSpeak, priority: 10);
         indicatorGate.WantWait ("state", wantWait,  priority: 5);
 
@@ -760,7 +810,37 @@ public class PhonemeManager : MonoBehaviour
             proximityButton.OnButtonPressed  -= HandlePhysicalPress;
             proximityButton.OnButtonReleased -= HandlePhysicalRelease;
         }
+        if (levelManager != null) levelManager.OnGameModeChanged -= HandleModeChanged;
+        if (!string.IsNullOrEmpty(micDevice))
+        {
+            if (Microphone.IsRecording(micDevice)) Microphone.End(micDevice);
+        }
+        if (recordedClip) Destroy(recordedClip);
+        recordedClip = null;
+
+        if (btnMat) Destroy(btnMat);
+        btnMat = null;
     }
 
     [Serializable] private struct BeamReq { public string audio_file; }
+
+    private void HandleModeChanged(LevelManager.GameMode mode)
+    {
+        bool inPhonemeMode = (mode == LevelManager.GameMode.PhonemeChecking);
+        if (!inPhonemeMode)
+        {
+            // Hard-off outside phoneme mode
+            indicatorGate.WantSpeak("state", false, 0);
+            indicatorGate.WantWait ("state", false, 0);
+            if (speakIndicator && speakIndicator.activeSelf) speakIndicator.SetActive(false);
+            if (waitIndicator  && waitIndicator.activeSelf)  waitIndicator.SetActive(false);
+            prevSpeak = speakIndicator && speakIndicator.activeSelf;
+            prevWait  = waitIndicator  && waitIndicator.activeSelf;
+        }
+        else
+        {
+            // Re-evaluate based on current recording state
+            RefreshIndicators(true);
+        }
+    }
 }

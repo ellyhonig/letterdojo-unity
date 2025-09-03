@@ -18,10 +18,29 @@ public class SaveManager : MonoBehaviour
         // 1) try persistent
         //var p = persistFmt(letter);
         //if (File.Exists(p))
-          //  return JsonUtility.FromJson<SimpleRecord>(File.ReadAllText(p));
+        //  return JsonUtility.FromJson<SimpleRecord>(File.ReadAllText(p));
 
         // 2) fallback to Resources
-        var ta = Resources.Load<TextAsset>($"letter3Dpathdata/simple_recording_{letter}");
+        TextAsset ta = null;
+        if (!string.IsNullOrEmpty(letter))
+        {
+            // Try exact case
+            ta = Resources.Load<TextAsset>($"letter3Dpathdata/simple_recording_{letter}");
+            // Try uppercase (Android/Quest is case-sensitive)
+            if (ta == null)
+            {
+                var up = letter.ToUpperInvariant();
+                if (up != letter)
+                    ta = Resources.Load<TextAsset>($"letter3Dpathdata/simple_recording_{up}");
+            }
+            // Try lowercase
+            if (ta == null)
+            {
+                var lo = letter.ToLowerInvariant();
+                if (lo != letter)
+                    ta = Resources.Load<TextAsset>($"letter3Dpathdata/simple_recording_{lo}");
+            }
+        }
         if (ta != null)
             return JsonUtility.FromJson<SimpleRecord>(ta.text);
 

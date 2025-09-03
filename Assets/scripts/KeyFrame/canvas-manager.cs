@@ -7,6 +7,7 @@ public class CanvasManager : MonoBehaviour
 {
     [SerializeField] public GameObject canvasPlane;
     [SerializeField] public SimpleRecorder recorder;
+    [SerializeField] private LevelManager levelManager; // gate visualization by mode
     [SerializeField] public float proximityThreshold = 0.1f;
     [SerializeField] private Color activeColor = Color.green;
     [SerializeField] private Color inactiveColor = Color.white;
@@ -18,6 +19,7 @@ public class CanvasManager : MonoBehaviour
     [SerializeField] private int initialPoolSize = 2000;
     [SerializeField] private GameObject spherePrefab; // kept; not used to avoid asset dependency
     [SerializeField] private float enterThreshold = 0.01f;
+
 
     [Header("Motion Smoothener")]
     [SerializeField, Range(0, 180)] private float angleThreshold = 30f;
@@ -92,6 +94,7 @@ public class CanvasManager : MonoBehaviour
 
     private void Initialize()
     {
+        if (!levelManager) levelManager = GetComponent<LevelManager>();
         if (canvasPlane == null || recorder == null || recorder.playerToRecord == null)
         {
             Debug.LogError("CanvasManager: Missing required references!");
@@ -448,6 +451,9 @@ public class CanvasManager : MonoBehaviour
 
     public void CreateVisualizationForAllPoints()
     {
+        // Skip auto-creating reference spheres while in Dictation mode
+        if (levelManager != null && levelManager.currentMode == LevelManager.GameMode.Dictation)
+            return;
         ClearVisualization();
 
         if (recorder.currentRecord != null && recorder.currentRecord.frames != null)

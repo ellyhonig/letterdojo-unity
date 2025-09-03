@@ -7,6 +7,8 @@
     <!-- mic permission for OpenXR/Meta Quest -->
     <uses-permission android:name="android.permission.RECORD_AUDIO"/>
     <uses-feature android:name="android.hardware.microphone" android:required="true"/>
+    <!-- Internet permission needed by app services (e.g. uploads, diagnostics) -->
+    <uses-permission android:name="android.permission.INTERNET"/>
 
     <application>
         <activity android:name="com.unity3d.player.UnityPlayerActivity"

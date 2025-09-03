@@ -11,6 +11,10 @@ public class PlaneSurfaceDrawer : MonoBehaviour
     [Tooltip("If the first point of a new segment is far from the last point, start a new stroke anyway.")]
     [SerializeField] private float startNewStrokeGap = 0.03f;  // meters (world)
 
+    [Header("Drawing Filters")]
+    [Tooltip("Do not draw when hand is retreating toward the surface; small tolerance to ignore jitter (m)")]
+    [SerializeField] private float retractNoDrawEpsilon = 0.0005f; // meters
+
     [Header("Layers (optional)")]
     [Tooltip("Optional: put strokes on a layer, e.g., 'Board'. Leave empty to keep default.")]
     [SerializeField] private string strokeLayerName = "Board";
@@ -28,6 +32,10 @@ public class PlaneSurfaceDrawer : MonoBehaviour
     // NOTE: these are **LOCAL-SPACE** points (relative to _strokesRoot) for LineRenderer
     private readonly List<Vector3> _ptsR = new();
     private readonly List<Vector3> _ptsL = new();
+
+    // Track last penetration depth per hand to detect retreating motion
+    private float _lastDepthR = float.NaN;
+    private float _lastDepthL = float.NaN;
 
     void OnValidate()
     {
@@ -93,21 +101,25 @@ public class PlaneSurfaceDrawer : MonoBehaviour
         {
             StartNewStroke(ref _activeLineR, _ptsR, "RightStroke");
             AddPointProjected(_ptsR, _activeLineR, projectedPointWorld, forceFirst:true);
+            // Initialize depth tracker
+            _lastDepthR = ComputePenetrationDepth(GetRightCtrlPos());
         }
         else
         {
             StartNewStroke(ref _activeLineL, _ptsL, "LeftStroke");
             AddPointProjected(_ptsL, _activeLineL, projectedPointWorld, forceFirst:true);
+            // Initialize depth tracker
+            _lastDepthL = ComputePenetrationDepth(GetLeftCtrlPos());
         }
     }
 
     private void HandleExit(HandPlaneConstraint.Hand which, Vector3 projectedPointWorld)
     {
-        // Optional: add a final point at exit for neat segment ending
-        if (which == HandPlaneConstraint.Hand.Right && _activeLineR)
-            AddPointProjected(_ptsR, _activeLineR, projectedPointWorld, forceFirst:false);
-        else if (which == HandPlaneConstraint.Hand.Left && _activeLineL)
-            AddPointProjected(_ptsL, _activeLineL, projectedPointWorld, forceFirst:false);
+        // Do not add a point on exit to avoid drawing during retreat
+        if (which == HandPlaneConstraint.Hand.Right)
+            _lastDepthR = float.NaN;
+        else
+            _lastDepthL = float.NaN;
         // Do NOT clear lists here; next penetration starts a fresh stroke anyway.
     }
 
@@ -115,13 +127,44 @@ public class PlaneSurfaceDrawer : MonoBehaviour
     {
         if (_constraint.IsConstrained(HandPlaneConstraint.Hand.Right))
         {
-            Vector3 ctrlWorld = _constraint.ProjectToPlane(GetRightCtrlPos());
-            AddPointSmart(ref _activeLineR, _ptsR, "RightStroke", ctrlWorld);
+            Vector3 ctrlPos = GetRightCtrlPos();
+            float depth = ComputePenetrationDepth(ctrlPos);
+            bool isRetracting = false;
+            if (float.IsNaN(_lastDepthR)) _lastDepthR = depth;
+            else if (depth < _lastDepthR - retractNoDrawEpsilon) isRetracting = true;
+            _lastDepthR = depth;
+
+            if (!isRetracting)
+            {
+                Vector3 ctrlWorld = _constraint.ProjectToPlane(ctrlPos);
+                AddPointSmart(ref _activeLineR, _ptsR, "RightStroke", ctrlWorld);
+            }
         }
+        else
+        {
+            // Not constrained; reset tracker
+            _lastDepthR = float.NaN;
+        }
+
         if (_constraint.IsConstrained(HandPlaneConstraint.Hand.Left))
         {
-            Vector3 ctrlWorld = _constraint.ProjectToPlane(GetLeftCtrlPos());
-            AddPointSmart(ref _activeLineL, _ptsL, "LeftStroke", ctrlWorld);
+            Vector3 ctrlPos = GetLeftCtrlPos();
+            float depth = ComputePenetrationDepth(ctrlPos);
+            bool isRetracting = false;
+            if (float.IsNaN(_lastDepthL)) _lastDepthL = depth;
+            else if (depth < _lastDepthL - retractNoDrawEpsilon) isRetracting = true;
+            _lastDepthL = depth;
+
+            if (!isRetracting)
+            {
+                Vector3 ctrlWorld = _constraint.ProjectToPlane(ctrlPos);
+                AddPointSmart(ref _activeLineL, _ptsL, "LeftStroke", ctrlWorld);
+            }
+        }
+        else
+        {
+            // Not constrained; reset tracker
+            _lastDepthL = float.NaN;
         }
     }
 
@@ -211,6 +254,28 @@ public class PlaneSurfaceDrawer : MonoBehaviour
             System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
         var sp = (simplePlayer)spField?.GetValue(_constraint);
         return sp != null ? sp.conL.transform.position : transform.position;
+    }
+
+    private float ComputePenetrationDepth(Vector3 ctrlWorldPos)
+    {
+        // Mirror HandPlaneConstraint's penetration calculation
+        Vector3 normal = _constraint.PlaneNormal;
+        Vector3 planePoint = _constraint.transform.position;
+        float dist = Vector3.Dot(normal, ctrlWorldPos - planePoint); // signed (positive on normal side)
+
+        // Determine side sign based on HMD
+        var spField = typeof(HandPlaneConstraint).GetField("player",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        var sp = (simplePlayer)spField?.GetValue(_constraint);
+        float sideSign = 1f;
+        if (sp != null && sp.hmd != null)
+        {
+            bool hmdSide = Vector3.Dot(normal, sp.hmd.transform.position - planePoint) > 0f;
+            sideSign = hmdSide ? 1f : -1f;
+        }
+
+        // Depth > 0 means past the plane away from the HMD
+        return -sideSign * dist;
     }
 
     /* Expose anchors for other scripts (e.g., DictationManager) */
