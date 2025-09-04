@@ -111,22 +111,33 @@ public class VolumeIndicator : MonoBehaviour
 
     float GetLivePeak()
     {
-        // reflectively grab the private 'recordedClip' from PhonemeManager
-        var fi = typeof(PhonemeManager)
-                 .GetField("recordedClip", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-        var clip = fi?.GetValue(pm) as AudioClip;
-        if (clip == null || !Microphone.IsRecording(null))
+        // On Quest, Microphone.GetPosition(null) does not refer to the active device.
+        // Read the live looping mic clip + device name from PhonemeManager instead.
+        var clipField = typeof(PhonemeManager)
+                        .GetField("micClip", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        var devField  = typeof(PhonemeManager)
+                        .GetField("micDevice", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+        var clip = clipField?.GetValue(pm) as AudioClip;
+        var dev  = devField?.GetValue(pm) as string;
+        if (clip == null || string.IsNullOrEmpty(dev) || !Microphone.IsRecording(dev))
             return 0f;
 
         const int WIN = 1024;
-        int pos = Microphone.GetPosition(null);
-        if (pos < WIN) return 0f;
+        int pos = Microphone.GetPosition(dev);
+        if (pos < WIN) return 0f; // not enough data yet
 
-        float[] buf = new float[WIN * clip.channels];
+        // Read the last WIN frames. If channels > 1, buffer is interleaved.
+        int channels = Mathf.Max(1, clip.channels);
+        float[] buf = new float[WIN * channels];
         clip.GetData(buf, pos - WIN);
 
         float peak = 0f;
-        foreach (var v in buf) peak = Mathf.Max(peak, Mathf.Abs(v));
+        for (int i = 0; i < buf.Length; i++)
+        {
+            float a = Mathf.Abs(buf[i]);
+            if (a > peak) peak = a;
+        }
         return peak;
     }
 }
