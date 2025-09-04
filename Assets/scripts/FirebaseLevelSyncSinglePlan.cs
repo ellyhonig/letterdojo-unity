@@ -53,7 +53,26 @@ public class FirebaseLevelSyncSinglePlan : MonoBehaviour
         }
     }
 
-    private void OnEnable() { StartCoroutine(PollLoop()); }
+    // Defer polling until Start(), after we conform once
+    private void OnEnable() { }
+
+    // Ensure we conform immediately on startup without waiting for the first poll tick
+    private IEnumerator Start()
+    {
+        // Wait a few frames for LevelManager to finish Start()/LoadLevelPlan()
+        // so our initial Apply won't be immediately overwritten.
+        int frames = 0;
+        while (frames < 10 && (levelManager == null || string.IsNullOrEmpty(levelManager.currentLetter)))
+        {
+            frames++;
+            yield return null;
+        }
+
+        yield return StartCoroutine(BootstrapOnce());
+
+        // Begin steady-state polling after initial conform
+        StartCoroutine(PollLoop());
+    }
 
     private IEnumerator PollLoop()
     {
@@ -147,6 +166,52 @@ public class FirebaseLevelSyncSinglePlan : MonoBehaviour
         {
             try { levelManager.SetLevelByLetter(letter); }
             catch (Exception ex) { Debug.LogError("[HttpSync] SetLevelByLetter failed: " + ex.Message); }
+        }
+    }
+
+    // One-shot fetch-and-apply at startup so the scene conforms to Firebase immediately
+    private IEnumerator BootstrapOnce()
+    {
+        var url = $"https://firestore.googleapis.com/v1/projects/{projectId}/databases/(default)/documents/levelmanager_control/{room}?key={apiKey}";
+        using (var req = UnityWebRequest.Get(url))
+        {
+            req.timeout = 10;
+            yield return req.SendWebRequest();
+
+#if UNITY_2020_2_OR_NEWER
+            bool ok = req.result == UnityWebRequest.Result.Success;
+#else
+            bool ok = !req.isNetworkError && !req.isHttpError;
+#endif
+            if (ok)
+            {
+                try
+                {
+                    var root = JObject.Parse(req.downloadHandler.text);
+                    var fields = (JObject)root["fields"];
+                    if (fields != null)
+                    {
+                        long seq = FInt(fields, "seq", -1);
+                        string drill = FStr(fields, "currentDrill", "Audio");
+                        string letter = FStr(fields, "currentLetter", "A");
+                        string command = FStr(fields, "command", "none");
+
+                        Apply(drill, letter, command);
+                        _lastSeq = seq;
+                        _lastDrill = drill;
+                        _lastLetter = letter;
+                        _lastCommand = command;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning("[HttpSync] Bootstrap parse error: " + ex.Message);
+                }
+            }
+            else
+            {
+                // Ignore failures here; PollLoop will retry
+            }
         }
     }
 

@@ -179,7 +179,7 @@ public class PlaneSurfaceDrawer : MonoBehaviour
         if (strokeLayer >= 0) SetLayerRecursive(go, strokeLayer);
 
         line = go.AddComponent<LineRenderer>();
-        line.useWorldSpace = false; // <<< LOCAL SPACE so strokes move with parent
+        line.useWorldSpace = false; // LOCAL SPACE so strokes move with parent (original logic)
         line.textureMode = LineTextureMode.Stretch;
         line.numCapVertices = 4;
         line.numCornerVertices = 4;

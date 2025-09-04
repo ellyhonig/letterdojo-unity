@@ -93,4 +93,12 @@ public class Letter3DDisplay : MonoBehaviour
             mat.mainTexture = null;
         displayRenderer.enabled = false;
     }
+
+    // Public entry for external hints (e.g., Dictation first mistake)
+    public void ShowHintNow()
+    {
+        if (displayCoroutine != null)
+            StopCoroutine(displayCoroutine);
+        displayCoroutine = StartCoroutine(DisplayCoroutine());
+    }
 }

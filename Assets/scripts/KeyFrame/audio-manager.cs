@@ -317,6 +317,9 @@ public class AudioManager : MonoBehaviour
 
     private void PlayPopSound() => PlaySound(popSound);
 
+    // Public wrapper so other systems (e.g., Dictation replay) can trigger pops per point
+    public void PlayPop() => PlaySound(popSound);
+
     private void PlayWinSound()
     {
         if (Time.time >= lastWinSoundTime + winSoundCooldown)

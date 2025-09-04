@@ -2495,11 +2495,11 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 5041a22123e0e234b886746bd64e94a9, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  lineWidth: 0.05
-  minPointSpacing: 0.005
+  lineWidth: 0.027
+  minPointSpacing: 0.0029
   surfaceLift: 0.001
   startNewStrokeGap: 0.03
-  retractNoDrawEpsilon: 0.0009
+  retractNoDrawEpsilon: 0.006
   strokeLayerName: Board
 --- !u!114 &894810392
 MonoBehaviour:
@@ -4052,27 +4052,27 @@ PrefabInstance:
     m_Modifications:
     - target: {fileID: 5770206506279660804, guid: 95be9324c48d05a4f9097552f22a0694, type: 3}
       propertyPath: m_LocalScale.x
-      value: 7.350826
+      value: 2.5428712
       objectReference: {fileID: 0}
     - target: {fileID: 5770206506279660804, guid: 95be9324c48d05a4f9097552f22a0694, type: 3}
       propertyPath: m_LocalScale.y
-      value: 7.295264
+      value: 2.5236506
       objectReference: {fileID: 0}
     - target: {fileID: 5770206506279660804, guid: 95be9324c48d05a4f9097552f22a0694, type: 3}
       propertyPath: m_LocalScale.z
-      value: 3.354692
+      value: 1.1604886
       objectReference: {fileID: 0}
     - target: {fileID: 5770206506279660804, guid: 95be9324c48d05a4f9097552f22a0694, type: 3}
       propertyPath: m_LocalPosition.x
-      value: 3.132
+      value: 3.1306
       objectReference: {fileID: 0}
     - target: {fileID: 5770206506279660804, guid: 95be9324c48d05a4f9097552f22a0694, type: 3}
       propertyPath: m_LocalPosition.y
-      value: 3.86
+      value: 3.8646
       objectReference: {fileID: 0}
     - target: {fileID: 5770206506279660804, guid: 95be9324c48d05a4f9097552f22a0694, type: 3}
       propertyPath: m_LocalPosition.z
-      value: -3.422
+      value: -3.4203
       objectReference: {fileID: 0}
     - target: {fileID: 5770206506279660804, guid: 95be9324c48d05a4f9097552f22a0694, type: 3}
       propertyPath: m_LocalRotation.w

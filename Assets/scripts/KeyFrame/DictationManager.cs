@@ -2,6 +2,7 @@ using UnityEngine;
 using UnityEngine.Networking;
 using System;
 using System.Collections;
+using System.Collections.Generic;
 using System.Text;
 using TMPro;
 using System.Security.Cryptography;
@@ -70,6 +71,9 @@ public class DictationManager : MonoBehaviour
     private SaveManager    saver;
     private ProximityButton gradingBtn;
     private ProximityButton eraseBtn;
+    private AudioManager audioManager;
+    private int attemptCount = 0; // two tries policy
+    private readonly List<GameObject> replayDots = new List<GameObject>();
 
     private enum State { Idle, Drawing, WaitingForResponse, GradedAccept, GradedReject }
     private State state = State.Idle;
@@ -89,6 +93,7 @@ public class DictationManager : MonoBehaviour
         rec    = GetComponent<SimpleRecorder>();
         lvl    = GetComponent<LevelManager>();
         saver  = GetComponent<SaveManager>();
+        audioManager = FindObjectOfType<AudioManager>();
 
         if (drawerHost == null)
         {
@@ -169,6 +174,7 @@ public class DictationManager : MonoBehaviour
     {
         if (!lvl) return;
 
+        attemptCount = 0; // reset tries
         ClearBoardVisuals();
 
         if (rec != null)
@@ -230,8 +236,8 @@ public class DictationManager : MonoBehaviour
         string gotRaw = (ocrText ?? "");
         DebugCodepoint("[Vision] RAW", gotRaw);
 
-        string got = NormalizeToAsciiLetter(gotRaw);
-        string expected = NormalizeToAsciiLetter(lvl != null ? lvl.currentLetter : null);
+        string got = NormalizeAsciiStrict(gotRaw);
+        string expected = NormalizeAsciiStrict(lvl != null ? lvl.currentLetter : null);
 
         // if you still want to enforce single-char, this already returns 0–1 char
         bool correct = (!string.IsNullOrEmpty(got) && got == expected);
@@ -254,13 +260,29 @@ public class DictationManager : MonoBehaviour
         {
             OnDictationGraded?.Invoke(0f);
             OnLetterIncorrect?.Invoke();
-            SetFeedback($"Almost. Saw: '{gotRaw}', expected: '{lvl?.currentLetter}'. Watch the demo…");
-            ClearBoardVisuals();
-            yield return new WaitForSeconds(waitBeforeRef);
-            yield return ReplayReference();
-            SetFeedback("Your turn →");
-            yield return new WaitForSeconds(waitAfterReplay);
-            Advance();
+            if (attemptCount == 0)
+            {
+                // First mistake: show image hint (same as phoneme manager)
+                var hint = FindObjectOfType<Letter3DDisplay>();
+                if (hint != null) hint.ShowHintNow();
+                SetFeedback($"Hint shown. Try '{lvl?.currentLetter}' again.");
+                attemptCount = 1;
+                state = State.Drawing;
+                UpdateUI();
+                yield break; // give user another try
+            }
+            else
+            {
+                // Second mistake: replay with stroke filling + pops, then move on
+                SetFeedback($"Watch the demo of '{lvl?.currentLetter}'…");
+                ClearBoardVisuals();
+                yield return new WaitForSeconds(waitBeforeRef);
+                yield return ReplayReference(); // revert to classic sphere replay
+                SetFeedback("Your turn →");
+                yield return new WaitForSeconds(waitAfterReplay);
+                attemptCount = 2;
+                Advance();
+            }
         }
     }
 
@@ -309,7 +331,8 @@ public class DictationManager : MonoBehaviour
         // AGGRESSIVE CLEARING: Find and destroy ONLY visualization sphere objects
         var allSpheres = FindObjectsOfType<GameObject>().Where(go => 
             (go.name.StartsWith("keypoint_") || 
-             go.name.StartsWith("TraceSegment")) &&
+             go.name.StartsWith("TraceSegment") ||
+             go.name.StartsWith("ReplayDot_")) &&
             !go.GetComponent<TMPro.TextMeshPro>() && // Don't destroy TMP objects
             !go.GetComponent<TMPro.TextMeshProUGUI>() && // Don't destroy TMP objects
             !go.GetComponent<TextMesh>() && // Don't destroy regular TextMesh
@@ -336,12 +359,16 @@ public class DictationManager : MonoBehaviour
             {
                 var child = drawerHost.transform.GetChild(i);
                 if (child.name.StartsWith("Stroke", StringComparison.OrdinalIgnoreCase) ||
-                    child.name.StartsWith("Line",   StringComparison.OrdinalIgnoreCase))
+                    child.name.StartsWith("Line",   StringComparison.OrdinalIgnoreCase) ||
+                    child.name.StartsWith("ReplayDot_", StringComparison.OrdinalIgnoreCase))
                 {
                     Destroy(child.gameObject);
                 }
             }
         }
+
+        // Clear tracked replay dots
+        replayDots.Clear();
     }
 
     // ===== Replay (unchanged) =====
@@ -352,11 +379,15 @@ public class DictationManager : MonoBehaviour
 
         yield return null;
 
+        // Build spheres even in Dictation (bypass gating) using local->world conversion for robustness
+        if (canvas != null)
+            canvas.CreateVisualizationForAllPointsEvenInDictation();
+
         if (canvas != null && canvas.activeSpheres != null)
         {
             foreach (var s in canvas.activeSpheres) s.SetActive(false);
 
-            float replayTotal = 1.25f;
+            float replayTotal = 2.0f; // slowed down per request
             float step = replayTotal / Mathf.Max(canvas.activeSpheres.Count, 1);
 
             foreach (var s in canvas.activeSpheres)
@@ -375,8 +406,111 @@ public class DictationManager : MonoBehaviour
                     yield return null;
                 }
                 s.transform.localScale = Vector3.one * canvas.sphereRadius * 5f;
+                if (!audioManager) audioManager = FindObjectOfType<AudioManager>();
+                if (audioManager) audioManager.PlayPop();
             }
         }
+    }
+
+    // Enhanced replay: fill connecting segments with dot marks at ~pointDistance, pop on each
+    // Replay showing spheres sequentially and drawing a connecting stroke (cylinder) from n-1 -> n
+    private IEnumerator ReplayReferenceWithSegments()
+    {
+        if (rec != null && lvl != null)
+            rec.LoadRecording(lvl.currentLetter);
+
+        yield return null;
+
+        // Build spheres even in Dictation (provides point anchors). Use local->world conversion
+        if (canvas != null)
+            canvas.CreateVisualizationForAllPointsEvenInDictation();
+
+        if (canvas == null || canvas.activeSpheres == null || canvas.activeSpheres.Count == 0) yield break;
+
+        // Hide all spheres initially
+        foreach (var s in canvas.activeSpheres) if (s) s.SetActive(false);
+
+        float replayTotal = 1.25f;
+        float step = replayTotal / Mathf.Max(canvas.activeSpheres.Count, 1);
+
+        Transform root = null;
+        if (canvas.activeSpheres.Count > 0 && canvas.activeSpheres[0])
+            root = canvas.activeSpheres[0].transform.parent;
+
+        GameObject prev = null;
+        for (int i = 0; i < canvas.activeSpheres.Count; i++)
+        {
+            var cur = canvas.activeSpheres[i];
+            if (!cur) continue;
+
+            // reveal current sphere with a quick scale-in
+            cur.SetActive(true);
+            Vector3 targetScale = Vector3.one * canvas.sphereRadius * 5f;
+            cur.transform.localScale = Vector3.zero;
+            float t = 0f;
+            while (t < step)
+            {
+                cur.transform.localScale = targetScale * (t / step);
+                t += Time.deltaTime;
+                yield return null;
+            }
+            cur.transform.localScale = targetScale;
+
+            if (!audioManager) audioManager = FindObjectOfType<AudioManager>();
+            if (audioManager) audioManager.PlayPop();
+
+            // draw segment to previous
+            if (prev && root)
+            {
+                CreateReplaySegment(prev.transform.position, cur.transform.position, root);
+            }
+            prev = cur;
+        }
+    }
+
+    private void CreateReplaySegment(Vector3 a, Vector3 b, Transform parent)
+    {
+        float dist = Vector3.Distance(a, b);
+        if (dist <= 1e-6f) return;
+        GameObject cyl = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
+        cyl.name = "TraceSegment";
+        cyl.transform.SetParent(parent, true);
+        var col = cyl.GetComponent<Collider>(); if (col) Destroy(col);
+
+        // material
+        var mr = cyl.GetComponent<MeshRenderer>();
+        if (mr != null)
+        {
+            var mat = new Material(Shader.Find("Universal Render Pipeline/Lit"));
+            if (mat.HasProperty("_BaseColor")) mat.SetColor("_BaseColor", Color.black);
+            else if (mat.HasProperty("_Color")) mat.SetColor("_Color", Color.black);
+            mr.material = mat;
+        }
+
+        // align between a and b
+        cyl.transform.position = (a + b) * 0.5f;
+        cyl.transform.up = (b - a).normalized;
+        float radius = (canvas != null ? Mathf.Max(0.0015f, canvas.sphereRadius * 1.8f) : 0.003f); // thin stroke scaled
+        cyl.transform.localScale = new Vector3(radius, dist * 0.5f, radius); // height = 2*y
+    }
+
+    private void CreateReplayDot(Vector3 worldPos)
+    {
+        var dot = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+        dot.name = "ReplayDot_" + replayDots.Count;
+        dot.transform.position = worldPos;
+        dot.transform.localScale = Vector3.one * Mathf.Max(0.0015f, canvas != null ? canvas.sphereRadius * 2.5f : 0.01f);
+        Destroy(dot.GetComponent<Collider>());
+        var r = dot.GetComponent<Renderer>();
+        if (r != null)
+        {
+            var mat = r.material;
+            if (mat.HasProperty("_BaseColor")) mat.SetColor("_BaseColor", Color.black);
+            else if (mat.HasProperty("_Color")) mat.color = Color.black;
+        }
+        // Parent under drawerHost if available
+        if (drawerHost) dot.transform.SetParent(drawerHost.transform, true);
+        replayDots.Add(dot);
     }
 
     private void YieldFailImmediate()
@@ -596,7 +730,7 @@ public class DictationManager : MonoBehaviour
                 {
                     image = new VisionImage { content = b64 },
                     features = new[] { new VisionFeature { type = "DOCUMENT_TEXT_DETECTION", maxResults = 1 } },
-                    imageContext = (languageHints != null && languageHints.Length > 0) ? new VisionImageContext { languageHints = languageHints } : null
+                    imageContext = new VisionImageContext { languageHints = (languageHints != null && languageHints.Length > 0) ? languageHints : new [] { "en" } }
                 }
             }
         };
@@ -819,6 +953,44 @@ onDone?.Invoke(parsed);
         foreach (var ch in s)
             sb.Append($"U+{((int)ch):X4} ");
         Debug.Log($"{label}: '{s}' ({sb})");
+    }
+
+    // Robust ASCII-only normalization with homoglyph mapping
+    private static readonly Dictionary<char, char> ConfusableToAscii = new Dictionary<char, char>
+    {
+        // Cyrillic lowercase
+        ['\u0430'] = 'a', ['\u0435'] = 'e', ['\u043E'] = 'o', ['\u0440'] = 'p', ['\u0441'] = 'c',
+        ['\u0443'] = 'y', ['\u0445'] = 'x', ['\u043A'] = 'k', ['\u043C'] = 'm', ['\u0442'] = 't',
+        ['\u0432'] = 'b', ['\u043D'] = 'h', ['\u0438'] = 'u', ['\u0456'] = 'i',
+        // Cyrillic uppercase
+        ['\u0410'] = 'a', ['\u0412'] = 'b', ['\u0415'] = 'e', ['\u041A'] = 'k', ['\u041C'] = 'm',
+        ['\u041D'] = 'h', ['\u041E'] = 'o', ['\u0420'] = 'p', ['\u0421'] = 'c', ['\u0422'] = 't',
+        ['\u0423'] = 'y', ['\u0425'] = 'x', ['\u0406'] = 'i',
+        // Greek lowercase
+        ['\u03B1'] = 'a', ['\u03B5'] = 'e', ['\u03BF'] = 'o', ['\u03C1'] = 'p', ['\u03BD'] = 'v',
+        ['\u03BC'] = 'm', ['\u03B9'] = 'i', ['\u03BA'] = 'k', ['\u03C7'] = 'x', ['\u03C5'] = 'y', ['\u03C4'] = 't',
+        // Greek uppercase
+        ['\u0391'] = 'a', ['\u0392'] = 'b', ['\u0395'] = 'e', ['\u0397'] = 'h', ['\u0399'] = 'i', ['\u039A'] = 'k',
+        ['\u039C'] = 'm', ['\u039D'] = 'n', ['\u039F'] = 'o', ['\u03A1'] = 'p', ['\u03A4'] = 't', ['\u03A5'] = 'y', ['\u03A7'] = 'x', ['\u039B'] = 'l',
+    };
+
+    private static string NormalizeAsciiStrict(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return "";
+        s = s.Trim();
+        // Normalize and strip combining marks
+        var norm = s.Normalize(NormalizationForm.FormKD);
+        foreach (var ch in norm)
+        {
+            var cat = CharUnicodeInfo.GetUnicodeCategory(ch);
+            if (cat == UnicodeCategory.NonSpacingMark || cat == UnicodeCategory.SpacingCombiningMark || cat == UnicodeCategory.EnclosingMark)
+                continue;
+
+            char c = char.ToLowerInvariant(ch);
+            if (c >= 'a' && c <= 'z') return c.ToString();
+            if (ConfusableToAscii.TryGetValue(c, out var mapped)) return mapped.ToString();
+        }
+        return "";
     }
 // ==================   PEM/DER PARSER (FIXED)   ===================
 private static class PemKeyUtil

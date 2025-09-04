@@ -465,6 +465,37 @@ public class CanvasManager : MonoBehaviour
         }
     }
 
+    // Force-create spheres regardless of current mode (used by Dictation replay)
+    public void CreateVisualizationForAllPointsEvenInDictation()
+    {
+        ClearVisualization();
+
+        if (recorder != null && recorder.currentRecord != null && recorder.currentRecord.frames != null)
+        {
+            foreach (var frame in recorder.currentRecord.frames)
+            {
+                CreateVisualizationSphere(frame.position); // keep identical behavior
+            }
+        }
+    }
+
+    // Force-create spheres from frames interpreted as LOCAL positions (convert to world first)
+    // Useful if recordings store points relative to the saved canvas transform
+    public void CreateVisualizationFromLocalFramesEvenInDictation()
+    {
+        ClearVisualization();
+        if (recorder == null || recorder.currentRecord == null || recorder.currentRecord.frames == null)
+            return;
+
+        foreach (var frame in recorder.currentRecord.frames)
+        {
+            Vector3 world = canvasPlane != null
+                ? canvasPlane.transform.TransformPoint(frame.position)
+                : frame.position;
+            CreateVisualizationSphere(world);
+        }
+    }
+
     // *** DO NOT TOUCH POSITION LOGIC ***
     public GameObject CreateVisualizationSphere(Vector3 worldPosition)
     {
