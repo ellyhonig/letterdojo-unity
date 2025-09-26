@@ -18,10 +18,116 @@ public class PlaneSurfaceDrawer : MonoBehaviour
     [Header("Layers (optional)")]
     [Tooltip("Optional: put strokes on a layer, e.g., 'Board'. Leave empty to keep default.")]
     [SerializeField] private string strokeLayerName = "Board";
-
     private int strokeLayer = -1;
 
-    private HandPlaneConstraint _constraint;
+    // (Removed legacy pop sound logic by request)
+
+    [Header("Visual Lines")]
+    [SerializeField] private Color armIdleColor = new Color(1,1,1,0.2f);
+    [SerializeField] private Color armExtendedColor = new Color(0.2f,1f,0.2f,0.9f);
+    [SerializeField] private Color laserColor = new Color(1f, 0.2f, 0.2f, 0.9f);
+    [SerializeField] private float armLineWidth = 0.005f;
+    [SerializeField] private float laserLineWidth = 0.0035f;
+
+    [Header("Laser Halo (glow)")]
+    [Tooltip("Duplicate a wider, faint line for a glow effect")] [SerializeField]
+    private bool useHaloLaser = true;
+    [Tooltip("Halo width relative to main laser")] [SerializeField]
+    private float haloWidthMultiplier = 2.5f;
+    [Tooltip("Halo color (low alpha additive)")] [SerializeField]
+    private Color haloColor = new Color(1f, 0.15f, 0.15f, 0.28f);
+
+    [Header("Handedness")]
+    [Tooltip("If true, only left hand can charge/draw and show beam")] [SerializeField]
+    private bool leftHanded = false;
+    [Tooltip("Draw helper line from HMD-down origin to controller (debug)")]
+    [SerializeField] private bool showArmHelperLine = false;
+
+    [Header("Charging + Laser FX")]
+    [Tooltip("Require charging gesture (fist) before drawing")] [SerializeField]
+    private bool requireChargeToDraw = true;
+    [Tooltip("Seconds to charge once extended with fist")] [SerializeField]
+    private float chargeTime = 1.0f;
+    [Tooltip("Hand tint while charging")] [SerializeField]
+    private Color chargingHandColor = new Color(1f, 0f, 0f, 1f);
+    [Tooltip("Laser color while charging")] [SerializeField]
+    private Color laserChargingColor = new Color(0.2f, 1.0f, 0.2f, 0.9f);
+    [Tooltip("Laser color while drawing")] [SerializeField]
+    private Color laserDrawingColor = new Color(1.0f, 0.4f, 0.2f, 1f);
+    [Tooltip("Laser pulse speed while charging")] [SerializeField]
+    private float laserPulseSpeed = 4.0f;
+    [Tooltip("Laser pulse intensity (0..1)")] [SerializeField, Range(0f,1f)]
+    private float laserPulseIntensity = 0.45f;
+    [Tooltip("Optional additive laser material (Quest-friendly). If null, fallback is used.")]
+    [SerializeField] private Material laserMaterial;
+    [Tooltip("Laser width when drawing")] [SerializeField]
+    private float laserWidthDrawing = 0.0055f;
+    [Tooltip("Laser width when charging")] [SerializeField]
+    private float laserWidthCharging = 0.0045f;
+
+    [Header("Hand Pose Gate")]
+    [Tooltip("Require at least one non-thumb finger to point toward the board to draw")] [SerializeField]
+    private bool requireExtendedFinger = true;
+    [Tooltip("Cosine threshold for finger alignment with aim dir (0..1)")] [SerializeField, Range(0f,1f)]
+    private float fingerAlignDot = 0.65f; // ~49 degrees
+    [Serializable]
+    private class FingerJoints { public Transform tip; public Transform prev; }
+    [Serializable]
+    private class HandFingers
+    {
+        public Transform handRoot; // optional override; will default to player's hand
+        public FingerJoints index = new FingerJoints();
+        public FingerJoints middle = new FingerJoints();
+        public FingerJoints ring = new FingerJoints();
+        public FingerJoints pinky = new FingerJoints();
+    }
+    [SerializeField] private HandFingers rightFingers = new HandFingers();
+    [SerializeField] private HandFingers leftFingers  = new HandFingers();
+
+    [Header("Impact FX")]
+    [Tooltip("Optional spark prefab to place at impact while drawing")] [SerializeField]
+    private GameObject sparkImpactPrefab;
+    [Tooltip("Optional smoke prefab to place at impact while drawing")] [SerializeField]
+    private GameObject smokeImpactPrefab;
+    [Tooltip("Enable impact FX while drawing")] [SerializeField]
+    private bool useImpactFX = true;
+    [SerializeField, Tooltip("Seconds between spark burst emits while drawing")]
+    private float impactSparkInterval = 0.06f;
+    [SerializeField, Tooltip("Particles per spark burst emit")] private int impactSparkCount = 8;
+
+    [Header("Stroke Cooldown")] 
+    [Tooltip("Recent stroke color that cools to black")] [SerializeField]
+    private Color strokeHotColor = new Color(1f, 0.1f, 0.1f, 1f);
+    [SerializeField] private Color strokeColdColor = Color.black;
+    [SerializeField, Tooltip("Seconds to fade from hot to cold")] private float strokeCooldownSeconds = 0.25f;
+
+    [Header("Hand Models")]
+    [Tooltip("Root of the right hand model (e.g., OpenXRCustomHandPrefab_R)")]
+    [SerializeField] private Transform rightHandModelRoot;
+    [Tooltip("Root of the left hand model (e.g., OpenXRCustomHandPrefab_L)")]
+    [SerializeField] private Transform leftHandModelRoot;
+    [SerializeField] private Color triggeredHandColor = Color.red;
+    private MaterialPropertyBlock _mpb; // init in Awake to satisfy Unity ctor rules
+    private readonly List<Renderer> _rightHandRenderers = new List<Renderer>();
+    private readonly List<Renderer> _leftHandRenderers  = new List<Renderer>();
+    private bool _rightRenderersCached = false;
+    private bool _leftRenderersCached = false;
+
+    [Header("External Laser Beams (optional)")]
+    [Tooltip("External bright beam GO for right hand (enabled when charging/drawing if beams enabled)")]
+    [SerializeField] private GameObject rightLaserBeamGO;
+    [Tooltip("External bright beam GO for left hand (enabled when charging/drawing if beams enabled)")]
+    [SerializeField] private GameObject leftLaserBeamGO;
+    [Tooltip("Control external beam GO visibility via SetLaserBeamsEnabled or toggle here")] [SerializeField]
+    private bool laserBeamsEnabled = false;
+
+    [Header("Beam Visuals")] 
+    [Tooltip("Beam tint while charging (cleared when charged/drawing)")]
+    [SerializeField] private Color beamChargingColor = Color.red;
+    private MaterialPropertyBlock _beamMpb;
+    private readonly List<Renderer> _beamRenderersR = new List<Renderer>();
+    private readonly List<Renderer> _beamRenderersL = new List<Renderer>();
+    private bool _beamCachedR = false, _beamCachedL = false;
 
     // Stable parent for all strokes under this component's GameObject
     private Transform _strokesRoot;

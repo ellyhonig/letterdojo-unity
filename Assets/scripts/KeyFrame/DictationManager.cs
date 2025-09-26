@@ -8,6 +8,8 @@ using TMPro;
 using System.Security.Cryptography;
 using System.Globalization;
 using System.Linq;
+using Unity.Sentis;
+using LetterDojo.Dictation.OnDevice;
 
 /*
  * DictationManager (Vision OCR backend, Unity-safe PEM import)
@@ -34,6 +36,7 @@ public class DictationManager : MonoBehaviour
     [Header("UI / Flow")]
     [SerializeField] private GameObject gradingButtonGO;
     [SerializeField] private GameObject eraseButtonGO;
+    [SerializeField] private GameObject repeatButtonGO;
     [SerializeField] private TMP_Text   feedbackText;
     [SerializeField] private float waitBeforeRef    = 0.75f;
     [SerializeField] private float waitAfterReplay  = 0.5f;
@@ -54,6 +57,20 @@ public class DictationManager : MonoBehaviour
     [SerializeField, Range(1, 8)] private int beamLengthHint = 1;
     [SerializeField] private string[] languageHints;
 
+    [Header("Local Classifier (Sentis)")]
+    [SerializeField] private bool useLocalClassifier = false;
+    [SerializeField] private OnDeviceLetterClassifier localClassifier;
+    [SerializeField, Range(0f, 1f)] private float localConfidenceThreshold = 0.5f;
+    [SerializeField] private bool fallbackToVisionOnLocalFailure = true;
+    [SerializeField] private bool autoCreateLocalClassifier = true;
+    [SerializeField] private ModelAsset localClassifierModelAsset;
+    [SerializeField] private BackendType localPreferredBackend = BackendType.GPUCompute;
+    [SerializeField] private bool localPreloadModelOnAwake = true;
+    [SerializeField, Range(0f, 1f)] private float localForegroundThreshold = 32f / 255f;
+    [SerializeField, Range(0f, 0.25f)] private float localPaddingFraction = 0.05f;
+    [SerializeField, Min(0)] private int localMinimumPaddingPixels = 2;
+    [SerializeField] private GameObject debugLocalButtonGO;
+
     [Header("Guide Lines (optional visuals)")]
     public Transform skyLine, planeLine, groundLine;
 
@@ -69,8 +86,16 @@ public class DictationManager : MonoBehaviour
     private SimpleRecorder rec;
     private LevelManager   lvl;
     private SaveManager    saver;
+
     private ProximityButton gradingBtn;
     private ProximityButton eraseBtn;
+    private ProximityButton debugLocalBtn;
+
+    // Laser UI buttons (preferred)
+    private LaserUIButton gradingLaserBtn;
+    private LaserUIButton eraseLaserBtn;
+    private LaserUIButton repeatLaserBtn;
+
     private AudioManager audioManager;
     private int attemptCount = 0; // two tries policy
     private readonly List<GameObject> replayDots = new List<GameObject>();
@@ -81,6 +106,23 @@ public class DictationManager : MonoBehaviour
     private bool _lastDrawerActive = true;
     private LevelManager.GameMode _lastNotifiedMode = LevelManager.GameMode.PhonemeChecking;
     private bool _hasLastMode = false;
+
+    private bool ShouldUseLocalGrading => useLocalClassifier && localClassifier != null && localClassifier.HasModelAsset;
+    private Coroutine _debugLocalRoutine;
+
+    public void ReleaseMemory()
+    {
+        if (_debugLocalRoutine != null)
+        {
+            StopCoroutine(_debugLocalRoutine);
+            _debugLocalRoutine = null;
+        }
+
+        ClearBoardVisuals();
+
+        if (debugLocalButtonGO)
+            debugLocalButtonGO.SetActive(false);
+    }
 
     // ===== Auth cache =====
     private string _cachedAccessToken = null;
@@ -95,6 +137,14 @@ public class DictationManager : MonoBehaviour
         saver  = GetComponent<SaveManager>();
         audioManager = FindObjectOfType<AudioManager>();
 
+        EnsureLocalClassifierConfigured();
+
+        if (debugLocalButtonGO)
+        {
+            debugLocalBtn = debugLocalButtonGO.GetComponent<ProximityButton>();
+            debugLocalButtonGO.SetActive(false);
+        }
+
         if (drawerHost == null)
         {
             var drawer = GetComponent<PlaneSurfaceDrawer>();
@@ -106,15 +156,42 @@ public class DictationManager : MonoBehaviour
             }
         }
 
-        if (gradingButtonGO)
+                if (gradingButtonGO)
         {
-            gradingBtn = gradingButtonGO.GetComponent<ProximityButton>();
+            gradingLaserBtn = gradingButtonGO.GetComponent<LaserUIButton>();
+            if (gradingLaserBtn)
+            {
+                gradingLaserBtn.SetCustomAction(HandleGradeBtn);
+            }
+            else
+            {
+                gradingBtn = gradingButtonGO.GetComponent<ProximityButton>();
+            }
             gradingButtonGO.SetActive(false);
         }
+
         if (eraseButtonGO)
         {
-            eraseBtn = eraseButtonGO.GetComponent<ProximityButton>();
+            eraseLaserBtn = eraseButtonGO.GetComponent<LaserUIButton>();
+            if (eraseLaserBtn)
+            {
+                eraseLaserBtn.SetCustomAction(HandleEraseBtn);
+            }
+            else
+            {
+                eraseBtn = eraseButtonGO.GetComponent<ProximityButton>();
+            }
             eraseButtonGO.SetActive(false);
+        }
+
+        if (repeatButtonGO)
+        {
+            repeatLaserBtn = repeatButtonGO.GetComponent<LaserUIButton>();
+            if (repeatLaserBtn)
+            {
+                repeatLaserBtn.SetCustomAction(HandleRepeatBtn);
+            }
+            repeatButtonGO.SetActive(false);
         }
 
         HardConfigureCaptureCamera();
@@ -122,7 +199,21 @@ public class DictationManager : MonoBehaviour
 
     void Start()
     {
-        if (beamMode == BeamMode.BeamOn)
+        EnsureLocalClassifierConfigured();
+
+        if (ShouldUseLocalGrading)
+        {
+            try
+            {
+                localClassifier?.WarmupModel();
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[Dictation] Failed to warm up local classifier: {ex.Message}");
+            }
+        }
+
+        if ((!ShouldUseLocalGrading || fallbackToVisionOnLocalFailure) && beamMode == BeamMode.BeamOn)
             StartCoroutine(WarmupBeam()); // primes token + HTTP path
     }
 
@@ -130,12 +221,54 @@ public class DictationManager : MonoBehaviour
     {
         if (gradingBtn) gradingBtn.OnButtonPressed += HandleGradeBtn;
         if (eraseBtn)   eraseBtn.OnButtonPressed   += HandleEraseBtn;
-          ClearBoardVisuals();
+        if (debugLocalBtn) debugLocalBtn.OnButtonPressed += HandleDebugLocalBtn;
+        ClearBoardVisuals();
+        UpdateUI();
     }
     void OnDisable()
     {
         if (gradingBtn) gradingBtn.OnButtonPressed -= HandleGradeBtn;
         if (eraseBtn)   eraseBtn.OnButtonPressed   -= HandleEraseBtn;
+        if (debugLocalBtn) debugLocalBtn.OnButtonPressed -= HandleDebugLocalBtn;
+        if (_debugLocalRoutine != null)
+        {
+            StopCoroutine(_debugLocalRoutine);
+            _debugLocalRoutine = null;
+        }
+    }
+
+    private void EnsureLocalClassifierConfigured()
+    {
+        if (localClassifier == null)
+            localClassifier = GetComponent<OnDeviceLetterClassifier>();
+
+        if (localClassifier == null)
+        {
+            var existing = FindObjectsOfType<OnDeviceLetterClassifier>(true);
+            if (existing != null && existing.Length > 0)
+                localClassifier = existing[0];
+        }
+
+        bool needsLocalComponent = useLocalClassifier || debugLocalButtonGO != null;
+
+        if (localClassifier == null && autoCreateLocalClassifier && needsLocalComponent)
+            localClassifier = gameObject.AddComponent<OnDeviceLetterClassifier>();
+
+        if (debugLocalButtonGO && debugLocalBtn == null)
+            debugLocalBtn = debugLocalButtonGO.GetComponent<ProximityButton>();
+
+        if (localClassifier == null)
+        {
+            if (useLocalClassifier)
+                Debug.LogWarning("[Dictation] Local classifier is enabled but no OnDeviceLetterClassifier component is available.");
+            return;
+        }
+
+        localClassifier.Configure(localClassifierModelAsset, localPreferredBackend, localPreloadModelOnAwake,
+            localForegroundThreshold, localPaddingFraction, localMinimumPaddingPixels);
+
+        if (useLocalClassifier && !localClassifier.HasModelAsset)
+            Debug.LogWarning("[Dictation] Local classifier mode is enabled but no model asset is assigned.");
     }
 
     void Update()
@@ -206,11 +339,74 @@ public class DictationManager : MonoBehaviour
         SetFeedback("Board cleared");
     }
 
+    
+    private void HandleRepeatBtn()
+    {
+        if (!isActiveAndEnabled)
+            return;
+        StartCoroutine(RepeatReplayCo());
+    }
+
+    private IEnumerator RepeatReplayCo()
+    {
+        string targetLetter = lvl?.currentLetter ?? "?";
+        SetFeedback($"Watch the demo of '{targetLetter}'...");
+        ClearBoardVisuals();
+        yield return new WaitForSeconds(waitBeforeRef);
+        yield return ReplayReference();
+        SetFeedback("Your turn!");
+    }public void TriggerLocalDebug()
+    {
+        if (!isActiveAndEnabled)
+        {
+            Debug.LogWarning("[Dictation] Cannot run local debug while DictationManager is disabled.");
+            return;
+        }
+
+        if (!Application.isPlaying)
+        {
+            Debug.LogWarning("[Dictation] Local debug can only run in Play Mode.");
+            return;
+        }
+
+        TriggerLocalDebugInternal();
+    }
+
+    private void HandleDebugLocalBtn()
+    {
+        TriggerLocalDebugInternal();
+    }
+
+    private void TriggerLocalDebugInternal()
+    {
+        EnsureLocalClassifierConfigured();
+
+        if (localClassifier == null)
+        {
+            Debug.LogWarning("[Dictation] Debug triggered but local classifier is not assigned.");
+            return;
+        }
+
+        if (!localClassifier.HasModelAsset)
+        {
+            Debug.LogWarning("[Dictation] Debug triggered but local classifier has no model asset assigned.");
+            return;
+        }
+
+        if (_debugLocalRoutine != null)
+            StopCoroutine(_debugLocalRoutine);
+
+        Debug.Log("[Dictation] Running local classifier debug sample.");
+        _debugLocalRoutine = StartCoroutine(RunLocalDebugSample());
+    }
+
     // ===== Flow =====
     private IEnumerator GradeFlow()
     {
         if (gradingButtonGO) gradingButtonGO.SetActive(false);
         if (eraseButtonGO)   eraseButtonGO.SetActive(false);
+
+        EnsureLocalClassifierConfigured();
 
         // Capture the board EXACTLY as rendered by boardCamera
         Texture2D snap = null;
@@ -227,22 +423,112 @@ public class DictationManager : MonoBehaviour
 
         state = State.WaitingForResponse;
         UpdateUI();
-        SetFeedback("Grading…");
+        SetFeedback("Grading...");
+
+        bool attemptedLocal = ShouldUseLocalGrading;
+        bool localFailedHard = false;
+        LetterPrediction localPrediction = null;
+
+        if (attemptedLocal)
+        {
+            if (localClassifier == null)
+            {
+                Debug.LogWarning("[Dictation] Local grading enabled but classifier reference is missing.");
+                localFailedHard = true;
+            }
+            else
+            {
+                try
+                {
+                    localPrediction = localClassifier.Predict(snap);
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning($"[Dictation] Local classifier inference failed: {ex.Message}");
+                    localFailedHard = true;
+                }
+            }
+
+            if (localFailedHard && fallbackToVisionOnLocalFailure)
+            {
+                attemptedLocal = false;
+            }
+        }
 
         string ocrText = null;
-        yield return StartCoroutine(BeamRecognize(snap, t => ocrText = t)); // now Vision-backed
+        if (!attemptedLocal)
+        {
+            yield return StartCoroutine(BeamRecognize(snap, t => ocrText = t));
+        }
+
         Destroy(snap);
 
-        string gotRaw = (ocrText ?? "");
-        DebugCodepoint("[Vision] RAW", gotRaw);
-
-        string got = NormalizeAsciiStrict(gotRaw);
         string expected = NormalizeAsciiStrict(lvl != null ? lvl.currentLetter : null);
+        string targetLetter = lvl?.currentLetter ?? "?";
+        string gotRaw;
+        string gotNormalized;
+        bool correct;
+        bool usedLocal = attemptedLocal;
+        float localConfidence = 0f;
+        bool localHasWriting = true;
 
-        // if you still want to enforce single-char, this already returns 0–1 char
-        bool correct = (!string.IsNullOrEmpty(got) && got == expected);
+        if (attemptedLocal)
+        {
+            LetterPrediction prediction = localFailedHard ? LetterPrediction.NoWriting : localPrediction ?? LetterPrediction.NoWriting;
+            localHasWriting = prediction.HasWriting;
 
-        Debug.Log($"[Vision] NORMALIZED got='{got}' expected='{expected}'");
+            string matchedRaw = prediction.HasWriting ? prediction.TopLetter : string.Empty;
+            float matchedConfidence = prediction.TopConfidence;
+            string matchedNormalized = NormalizeAsciiStrict(matchedRaw);
+
+            bool inTopThreeMatch = false;
+
+            if (prediction.Ranked != null)
+            {
+                int limit = Mathf.Min(3, prediction.Ranked.Count);
+                for (int i = 0; i < limit; i++)
+                {
+                    var candidate = prediction.Ranked[i];
+                    string candidateNorm = NormalizeAsciiStrict(candidate.letter);
+                    if (!string.IsNullOrEmpty(candidateNorm) && candidateNorm == expected)
+                    {
+                        matchedRaw = candidate.letter;
+                        matchedConfidence = candidate.probability;
+                        matchedNormalized = candidateNorm;
+                        inTopThreeMatch = true;
+                        break;
+                    }
+                }
+            }
+
+            localConfidence = matchedConfidence;
+            gotRaw = matchedRaw;
+            gotNormalized = matchedNormalized;
+
+            bool normalizedMatch = !string.IsNullOrEmpty(gotNormalized) && gotNormalized == expected;
+            bool thresholdSatisfied = prediction.HasWriting && normalizedMatch && localConfidence >= localConfidenceThreshold;
+
+            if (inTopThreeMatch && normalizedMatch)
+            {
+                correct = true;
+                localHasWriting = true; // treat as valid writing when ranked guesses include the letter
+            }
+            else
+            {
+                correct = thresholdSatisfied;
+            }
+
+            DebugCodepoint("[Local] RAW", gotRaw);
+            Debug.Log($"[Local] NORMALIZED got='{gotNormalized}' expected='{expected}' conf={localConfidence:F3} hasWriting={localHasWriting}");
+        }
+        else
+        {
+            gotRaw = ocrText ?? string.Empty;
+            DebugCodepoint("[Vision] RAW", gotRaw);
+            gotNormalized = NormalizeAsciiStrict(gotRaw);
+            correct = (!string.IsNullOrEmpty(gotNormalized) && gotNormalized == expected);
+            Debug.Log($"[Vision] NORMALIZED got='{gotNormalized}' expected='{expected}'");
+        }
 
         state = correct ? State.GradedAccept : State.GradedReject;
         UpdateUI();
@@ -251,7 +537,10 @@ public class DictationManager : MonoBehaviour
         {
             OnDictationGraded?.Invoke(100f);
             OnLetterCorrect?.Invoke();
-            SetFeedback($"Correct ✅ (saw: '{gotRaw}')");
+            if (usedLocal)
+                SetFeedback($"Correct (local '{gotRaw}' @ {Mathf.RoundToInt(localConfidence * 100f)}%)");
+            else
+                SetFeedback($"Correct (saw: '{gotRaw}')");
             ClearBoardVisuals();
             yield return new WaitForSeconds(waitAfterCorrect);
             Advance();
@@ -265,7 +554,22 @@ public class DictationManager : MonoBehaviour
                 // First mistake: show image hint (same as phoneme manager)
                 var hint = FindObjectOfType<Letter3DDisplay>();
                 if (hint != null) hint.ShowHintNow();
-                SetFeedback($"Hint shown. Try '{lvl?.currentLetter}' again.");
+                string retryMsg;
+                if (usedLocal)
+                {
+                    if (!localHasWriting)
+                        retryMsg = "No writing detected. Try again.";
+                    else if (localConfidence < localConfidenceThreshold)
+                        retryMsg = $"Not quite yet ({Mathf.RoundToInt(localConfidence * 100f)}% confidence). Try again.";
+                    else
+                        retryMsg = $"Local saw '{(string.IsNullOrEmpty(gotRaw) ? "?" : gotRaw)}'. Try '{targetLetter}' again.";
+                }
+                else
+                {
+                    retryMsg = $"Hint shown. Try '{targetLetter}' again.";
+                }
+
+                SetFeedback(retryMsg);
                 attemptCount = 1;
                 state = State.Drawing;
                 UpdateUI();
@@ -274,16 +578,115 @@ public class DictationManager : MonoBehaviour
             else
             {
                 // Second mistake: replay with stroke filling + pops, then move on
-                SetFeedback($"Watch the demo of '{lvl?.currentLetter}'…");
+                if (usedLocal && !localHasWriting)
+                    SetFeedback("No writing detected. Watch the demo and try again.");
+                else
+                    SetFeedback($"Watch the demo of '{targetLetter}'...");
                 ClearBoardVisuals();
                 yield return new WaitForSeconds(waitBeforeRef);
                 yield return ReplayReference(); // revert to classic sphere replay
-                SetFeedback("Your turn →");
+                SetFeedback("Your turn!");
                 yield return new WaitForSeconds(waitAfterReplay);
                 attemptCount = 2;
                 Advance();
             }
         }
+    }
+
+    private IEnumerator RunLocalDebugSample()
+    {
+        string previousFeedback = feedbackText ? feedbackText.text : string.Empty;
+        SetFeedback("Local debug...");
+
+        Texture2D snap = null;
+        yield return StartCoroutine(CaptureBoardExactCo(t => snap = t));
+        if (snap == null)
+        {
+            SetFeedback("Debug capture failed");
+            yield return new WaitForSeconds(1f);
+            SetFeedback(previousFeedback);
+            _debugLocalRoutine = null;
+            yield break;
+        }
+
+        if (localClassifier == null || !localClassifier.HasModelAsset)
+        {
+            Debug.LogWarning("[Dictation] Local debug aborted because classifier became unavailable.");
+            Destroy(snap);
+            SetFeedback("Local debug unavailable");
+            yield return new WaitForSeconds(1.5f);
+            SetFeedback(previousFeedback);
+            _debugLocalRoutine = null;
+            yield break;
+        }
+
+        LetterPrediction prediction = null;
+        bool inferenceError = false;
+        string inferenceMessage = null;
+        try
+        {
+            prediction = localClassifier.Predict(snap);
+        }
+        catch (Exception ex)
+        {
+            Debug.LogWarning($"[Dictation] Local debug failed: {ex.Message}");
+            inferenceError = true;
+            inferenceMessage = "Local debug error";
+        }
+
+        Destroy(snap);
+
+        if (inferenceError)
+        {
+            SetFeedback(inferenceMessage ?? "Local debug error");
+            yield return new WaitForSeconds(1.5f);
+            SetFeedback(previousFeedback);
+            _debugLocalRoutine = null;
+            yield break;
+        }
+
+        if (prediction == null)
+        {
+            SetFeedback("Local debug: no result");
+            yield return new WaitForSeconds(1.5f);
+            SetFeedback(previousFeedback);
+            _debugLocalRoutine = null;
+            yield break;
+        }
+
+        string msg;
+        if (!prediction.HasWriting)
+        {
+            msg = "Local debug: no writing detected";
+        }
+        else
+        {
+            float pct = Mathf.Round(prediction.TopConfidence * 100f);
+            msg = $"Local debug: '{prediction.TopLetter}' @ {pct}%";
+        }
+
+        SetFeedback(msg);
+
+        if (prediction.Ranked != null && prediction.Ranked.Count > 0)
+        {
+            int topCount = Mathf.Min(3, prediction.Ranked.Count);
+            var sb = new StringBuilder();
+            sb.Append("[Dictation][LocalDebug] Top predictions: ");
+            for (int i = 0; i < topCount; i++)
+            {
+                var entry = prediction.Ranked[i];
+                sb.Append(entry.Item1);
+                sb.Append("(");
+                sb.AppendFormat(CultureInfo.InvariantCulture, "{0:F3}", entry.Item2);
+                sb.Append(")");
+                if (i < topCount - 1) sb.Append(", ");
+            }
+            Debug.Log(sb.ToString());
+        }
+
+        yield return new WaitForSeconds(2f);
+        SetFeedback(previousFeedback);
+        _debugLocalRoutine = null;
     }
 
     private void Advance()
@@ -305,6 +708,8 @@ public class DictationManager : MonoBehaviour
 
         if (gradingButtonGO) gradingButtonGO.SetActive(inDict && canDraw);
         if (eraseButtonGO)   eraseButtonGO.SetActive(inDict && canDraw);
+        if (repeatButtonGO)  repeatButtonGO.SetActive(inDict);
+        if (debugLocalButtonGO) debugLocalButtonGO.SetActive(inDict && localClassifier != null && localClassifier.HasModelAsset);
         if (feedbackText)    feedbackText.gameObject.SetActive(inDict);
     }
 
@@ -1113,3 +1518,17 @@ private static class PemKeyUtil
 
 
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
