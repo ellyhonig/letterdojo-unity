@@ -363,6 +363,7 @@ public class DictationManager : MonoBehaviour
             if (letter != '\0') SetFeedback($"Letter: '{char.ToUpperInvariant(letter)}'");
         }
     }
+    public void TriggerLocalDebug()
     {
         if (!isActiveAndEnabled)
         {
