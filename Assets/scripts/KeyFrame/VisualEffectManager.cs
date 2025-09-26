@@ -2,7 +2,7 @@ using UnityEngine;
 using System.Collections.Generic;
 using System.Reflection;
 
-public class VisualEffectManager : MonoBehaviour
+public class VisualEffectManager : MonoBehaviour, IMemoryBudgetConsumer
 {
     [SerializeField] private LetterTracingSystem tracingSystem;
     [SerializeField] private SimpleRecorder recorder;
@@ -187,7 +187,12 @@ public class VisualEffectManager : MonoBehaviour
             {
                 float dist = Vector3.Distance(handPos, s.transform.position);
                 float scale = dist < proximityDistance ? proximityScale : 1f;
-                s.transform.localScale = originalScales[s] * scale;
+                if (!originalScales.TryGetValue(s, out var baseScale))
+                {
+                    baseScale = s.transform.localScale;
+                    originalScales[s] = baseScale;
+                }
+                s.transform.localScale = baseScale * scale;
             }
         }
     }
@@ -295,6 +300,11 @@ public class VisualEffectManager : MonoBehaviour
     }
 
     // --- clearing (only on mode/letter change or disable)
+    public void ReleaseMemory()
+    {
+        ClearAllVisuals();
+    }
+
     private void ClearAllVisuals()
     {
         foreach (var seg in segmentCylinders) if (seg) Destroy(seg);
@@ -319,7 +329,6 @@ public class VisualEffectManager : MonoBehaviour
         if (!showSegmentsInPhonemeChecking) return;
         if (!canvasManager || canvasManager.activeSpheres == null) return;
         if (canvasManager.activeSpheres.Count < 2) return;
-        if (!IsPhonemeMode()) return;
 
         // establish a reasonable bound for long links
         maxAllowedDistance = Vector3.Distance(canvasManager.activeSpheres[0].transform.position,
@@ -381,3 +390,4 @@ public class VisualEffectManager : MonoBehaviour
         return sig;
     }
 }
+

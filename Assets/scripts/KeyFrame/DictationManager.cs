@@ -344,18 +344,26 @@ public class DictationManager : MonoBehaviour
     {
         if (!isActiveAndEnabled)
             return;
-        StartCoroutine(RepeatReplayCo());
+        PlayRepeatAudio();
     }
 
-    private IEnumerator RepeatReplayCo()
+    private void PlayRepeatAudio()
     {
-        string targetLetter = lvl?.currentLetter ?? "?";
-        SetFeedback($"Watch the demo of '{targetLetter}'...");
-        ClearBoardVisuals();
-        yield return new WaitForSeconds(waitBeforeRef);
-        yield return ReplayReference();
-        SetFeedback("Your turn!");
-    }public void TriggerLocalDebug()
+        if (!isActiveAndEnabled) return;
+        char letter = '\0';
+        if (lvl != null && !string.IsNullOrEmpty(lvl.currentLetter))
+            letter = lvl.currentLetter[0];
+        if (audioManager != null)
+        {
+            audioManager.PlayCurrentLetterPronunciation();
+            if (letter != '\0') SetFeedback($"Listen: '{char.ToUpperInvariant(letter)}'");
+        }
+        else
+        {
+            if (letter != '\0') SetFeedback($"Letter: '{char.ToUpperInvariant(letter)}'");
+        }
+    }
+    public void TriggerLocalDebug()
     {
         if (!isActiveAndEnabled)
         {
@@ -733,23 +741,19 @@ public class DictationManager : MonoBehaviour
             clearMethod?.Invoke(visualEffectManager, null);
         }
 
-        // AGGRESSIVE CLEARING: Find and destroy ONLY visualization sphere objects
-        var allSpheres = FindObjectsOfType<GameObject>().Where(go => 
-            (go.name.StartsWith("keypoint_") || 
-             go.name.StartsWith("TraceSegment") ||
-             go.name.StartsWith("ReplayDot_")) &&
-            !go.GetComponent<TMPro.TextMeshPro>() && // Don't destroy TMP objects
-            !go.GetComponent<TMPro.TextMeshProUGUI>() && // Don't destroy TMP objects
-            !go.GetComponent<TextMesh>() && // Don't destroy regular TextMesh
-            go.GetComponent<Renderer>() != null); // Only objects with renderers
-        
-        foreach (var sphere in allSpheres)
+        // Clean up only transient visuals we own; leave keypoint spheres (CanvasManager manages them via pooling)
+        var visuals = FindObjectsOfType<GameObject>().Where(go =>
+             (go.name.StartsWith("TraceSegment") ||
+              go.name.StartsWith("ReplayDot_")) &&
+             !go.GetComponent<TMPro.TextMeshPro>() &&
+             !go.GetComponent<TMPro.TextMeshProUGUI>() &&
+             !go.GetComponent<TextMesh>() &&
+             go.GetComponent<Renderer>() != null);
+
+        foreach (var v in visuals)
         {
-            if (sphere != null && sphere.activeInHierarchy)
-            {
-                Debug.Log($"[Dictation] Force destroying visualization: {sphere.name}");
-                Destroy(sphere);
-            }
+            if (v != null && v.activeInHierarchy)
+                Destroy(v);
         }
 
         if (drawerHost != null)
