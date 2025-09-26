@@ -741,23 +741,19 @@ public class DictationManager : MonoBehaviour
             clearMethod?.Invoke(visualEffectManager, null);
         }
 
-        // AGGRESSIVE CLEARING: Find and destroy ONLY visualization sphere objects
-        var allSpheres = FindObjectsOfType<GameObject>().Where(go => 
-            (go.name.StartsWith("keypoint_") || 
-             go.name.StartsWith("TraceSegment") ||
-             go.name.StartsWith("ReplayDot_")) &&
-            !go.GetComponent<TMPro.TextMeshPro>() && // Don't destroy TMP objects
-            !go.GetComponent<TMPro.TextMeshProUGUI>() && // Don't destroy TMP objects
-            !go.GetComponent<TextMesh>() && // Don't destroy regular TextMesh
-            go.GetComponent<Renderer>() != null); // Only objects with renderers
-        
-        foreach (var sphere in allSpheres)
+        // Clean up only transient visuals we own; leave keypoint spheres (CanvasManager manages them via pooling)
+        var visuals = FindObjectsOfType<GameObject>().Where(go =>
+             (go.name.StartsWith("TraceSegment") ||
+              go.name.StartsWith("ReplayDot_")) &&
+             !go.GetComponent<TMPro.TextMeshPro>() &&
+             !go.GetComponent<TMPro.TextMeshProUGUI>() &&
+             !go.GetComponent<TextMesh>() &&
+             go.GetComponent<Renderer>() != null);
+
+        foreach (var v in visuals)
         {
-            if (sphere != null && sphere.activeInHierarchy)
-            {
-                Debug.Log($"[Dictation] Force destroying visualization: {sphere.name}");
-                Destroy(sphere);
-            }
+            if (v != null && v.activeInHierarchy)
+                Destroy(v);
         }
 
         if (drawerHost != null)
