@@ -344,18 +344,25 @@ public class DictationManager : MonoBehaviour
     {
         if (!isActiveAndEnabled)
             return;
-        StartCoroutine(RepeatReplayCo());
+        PlayRepeatAudio();
     }
 
-    private IEnumerator RepeatReplayCo()
+    private void PlayRepeatAudio()
     {
-        string targetLetter = lvl?.currentLetter ?? "?";
-        SetFeedback($"Watch the demo of '{targetLetter}'...");
-        ClearBoardVisuals();
-        yield return new WaitForSeconds(waitBeforeRef);
-        yield return ReplayReference();
-        SetFeedback("Your turn!");
-    }public void TriggerLocalDebug()
+        if (!isActiveAndEnabled) return;
+        char letter = '\0';
+        if (lvl != null && !string.IsNullOrEmpty(lvl.currentLetter))
+            letter = lvl.currentLetter[0];
+        if (audioManager != null)
+        {
+            audioManager.PlayCurrentLetterPronunciation();
+            if (letter != '\0') SetFeedback($"Listen: '{char.ToUpperInvariant(letter)}'");
+        }
+        else
+        {
+            if (letter != '\0') SetFeedback($"Letter: '{char.ToUpperInvariant(letter)}'");
+        }
+    }
     {
         if (!isActiveAndEnabled)
         {
