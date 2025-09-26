@@ -2,8 +2,22 @@ using UnityEngine;
 using UnityEngine.Networking;
 using System;
 using System.Collections;
+using System.Collections.Generic;
 using System.Text;
 using TMPro;
+using System.Security.Cryptography;
+using System.Globalization;
+using System.Linq;
+using Unity.Sentis;
+using LetterDojo.Dictation.OnDevice;
+
+/*
+ * DictationManager (Vision OCR backend, Unity-safe PEM import)
+ * - Same public API / events / flow as your original
+ * - WarmupBeam / BeamRecognize kept (now call Google Vision)
+ * - Auth: service-account JSON loaded from Resources/
+ * - No RSA.ImportFromPem / ImportPkcs8PrivateKey calls; uses manual PEM/DER parser
+ */
 
 [RequireComponent(typeof(CanvasManager))]
 [RequireComponent(typeof(SimpleRecorder))]
@@ -21,55 +35,115 @@ public class DictationManager : MonoBehaviour
 
     [Header("UI / Flow")]
     [SerializeField] private GameObject gradingButtonGO;
-    [SerializeField] private GameObject eraseButtonGO;          // NEW
-    [SerializeField] private TMP_Text   feedbackText;           // NEW
-    [SerializeField] private float waitBeforeRef = 0.75f;       // before replay (wrong)
-    [SerializeField] private float waitAfterReplay = 0.5f;      // NEW: after replay, before advance
-    [SerializeField] private float waitAfterCorrect = 0.5f;     // NEW: after correct, before advance
+    [SerializeField] private GameObject eraseButtonGO;
+    [SerializeField] private GameObject repeatButtonGO;
+    [SerializeField] private TMP_Text   feedbackText;
+    [SerializeField] private float waitBeforeRef    = 0.75f;
+    [SerializeField] private float waitAfterReplay  = 0.5f;
+    [SerializeField] private float waitAfterCorrect = 0.5f;
 
-    [Header("Board Screenshot (for OCR)")]
-    [SerializeField] private Camera boardCamera;
-    [SerializeField] private int captureWidth = 512;
+    [Header("Board Capture (no crop/rotate)")]
+    [SerializeField] private Camera   boardCamera;
+    [SerializeField] private Renderer boardRenderer;
+    [SerializeField] private LayerMask boardLayer = 0;
+    [SerializeField] private int captureWidth  = 512;
     [SerializeField] private int captureHeight = 512;
+    [SerializeField] private bool debugWriteCapture = false;
 
-    [Header("Beam OCR")]
+    [Header("OCR (Vision API)")]
     [SerializeField] private BeamMode beamMode = BeamMode.BeamOn;
-    [SerializeField] private string beamUrl = "https://recognize-handwriting-56bf23f-v4.app.beam.cloud";
-    [SerializeField] private string beamBearerToken = "m1DC_VrjUplOzgiTbAexPIvvKR25tT9LeXRb8avJ46M-2FzVeMiApL3yJ02Gp6UWFP9RWZKT2ThBw3zzLcOR5A==";
-    [SerializeField, Range(1, 8)] private int beamLengthHint = 1; // 1-char output
+    [SerializeField] private string visionEndpoint = "https://vision.googleapis.com/v1/images:annotate";
+    [SerializeField] private string serviceAccountJsonResource = "plenary-treat-471015-i5-84297c030ee9"; // Resources/<name>.json
+    [SerializeField, Range(1, 8)] private int beamLengthHint = 1;
+    [SerializeField] private string[] languageHints;
 
-    [Header("Writing-line marker objects")]
+    [Header("Local Classifier (Sentis)")]
+    [SerializeField] private bool useLocalClassifier = false;
+    [SerializeField] private OnDeviceLetterClassifier localClassifier;
+    [SerializeField, Range(0f, 1f)] private float localConfidenceThreshold = 0.5f;
+    [SerializeField] private bool fallbackToVisionOnLocalFailure = true;
+    [SerializeField] private bool autoCreateLocalClassifier = true;
+    [SerializeField] private ModelAsset localClassifierModelAsset;
+    [SerializeField] private BackendType localPreferredBackend = BackendType.GPUCompute;
+    [SerializeField] private bool localPreloadModelOnAwake = true;
+    [SerializeField, Range(0f, 1f)] private float localForegroundThreshold = 32f / 255f;
+    [SerializeField, Range(0f, 0.25f)] private float localPaddingFraction = 0.05f;
+    [SerializeField, Min(0)] private int localMinimumPaddingPixels = 2;
+    [SerializeField] private GameObject debugLocalButtonGO;
+
+    [Header("Guide Lines (optional visuals)")]
     public Transform skyLine, planeLine, groundLine;
 
     [Header("Pass/Fail")]
     [Range(0f, 1f)] public float passRate = 1f;
 
-    [Header("Drawer Host")]
-    [Tooltip("GO holding PlaneSurfaceDrawer/HandPlaneConstraint. Enabled only in Dictation mode.")]
+    [Header("Drawer Host (strokes in dictation)")]
     [SerializeField] private GameObject drawerHost;
+
     [SerializeField] private GameObject tmpLetter;
+
     private CanvasManager  canvas;
     private SimpleRecorder rec;
     private LevelManager   lvl;
     private SaveManager    saver;
-    private ProximityButton gradingBtn;
-    private ProximityButton eraseBtn; // NEW
 
-    private enum State { Idle, Drawing, WaitingForResponse, GradedAccept, GradedReject } // NEW WaitingForResponse
+    private ProximityButton gradingBtn;
+    private ProximityButton eraseBtn;
+    private ProximityButton debugLocalBtn;
+
+    // Laser UI buttons (preferred)
+    private LaserUIButton gradingLaserBtn;
+    private LaserUIButton eraseLaserBtn;
+    private LaserUIButton repeatLaserBtn;
+
+    private AudioManager audioManager;
+    private int attemptCount = 0; // two tries policy
+    private readonly List<GameObject> replayDots = new List<GameObject>();
+
+    private enum State { Idle, Drawing, WaitingForResponse, GradedAccept, GradedReject }
     private State state = State.Idle;
 
-    private bool isReplaying = false;
     private bool _lastDrawerActive = true;
-
     private LevelManager.GameMode _lastNotifiedMode = LevelManager.GameMode.PhonemeChecking;
     private bool _hasLastMode = false;
 
+    private bool ShouldUseLocalGrading => useLocalClassifier && localClassifier != null && localClassifier.HasModelAsset;
+    private Coroutine _debugLocalRoutine;
+
+    public void ReleaseMemory()
+    {
+        if (_debugLocalRoutine != null)
+        {
+            StopCoroutine(_debugLocalRoutine);
+            _debugLocalRoutine = null;
+        }
+
+        ClearBoardVisuals();
+
+        if (debugLocalButtonGO)
+            debugLocalButtonGO.SetActive(false);
+    }
+
+    // ===== Auth cache =====
+    private string _cachedAccessToken = null;
+    private double _tokenExpiryEpoch  = 0; // unix seconds
+
+    // ===== Unity lifecycle =====
     void Awake()
     {
         canvas = GetComponent<CanvasManager>();
         rec    = GetComponent<SimpleRecorder>();
         lvl    = GetComponent<LevelManager>();
         saver  = GetComponent<SaveManager>();
+        audioManager = FindObjectOfType<AudioManager>();
+
+        EnsureLocalClassifierConfigured();
+
+        if (debugLocalButtonGO)
+        {
+            debugLocalBtn = debugLocalButtonGO.GetComponent<ProximityButton>();
+            debugLocalButtonGO.SetActive(false);
+        }
 
         if (drawerHost == null)
         {
@@ -82,33 +156,119 @@ public class DictationManager : MonoBehaviour
             }
         }
 
-        if (gradingButtonGO)
+                if (gradingButtonGO)
         {
-            gradingBtn = gradingButtonGO.GetComponent<ProximityButton>();
+            gradingLaserBtn = gradingButtonGO.GetComponent<LaserUIButton>();
+            if (gradingLaserBtn)
+            {
+                gradingLaserBtn.SetCustomAction(HandleGradeBtn);
+            }
+            else
+            {
+                gradingBtn = gradingButtonGO.GetComponent<ProximityButton>();
+            }
             gradingButtonGO.SetActive(false);
         }
+
         if (eraseButtonGO)
         {
-            eraseBtn = eraseButtonGO.GetComponent<ProximityButton>();
+            eraseLaserBtn = eraseButtonGO.GetComponent<LaserUIButton>();
+            if (eraseLaserBtn)
+            {
+                eraseLaserBtn.SetCustomAction(HandleEraseBtn);
+            }
+            else
+            {
+                eraseBtn = eraseButtonGO.GetComponent<ProximityButton>();
+            }
             eraseButtonGO.SetActive(false);
         }
+
+        if (repeatButtonGO)
+        {
+            repeatLaserBtn = repeatButtonGO.GetComponent<LaserUIButton>();
+            if (repeatLaserBtn)
+            {
+                repeatLaserBtn.SetCustomAction(HandleRepeatBtn);
+            }
+            repeatButtonGO.SetActive(false);
+        }
+
+        HardConfigureCaptureCamera();
     }
 
     void Start()
     {
-        if (beamMode == BeamMode.BeamOn)
-            StartCoroutine(WarmupBeam());
+        EnsureLocalClassifierConfigured();
+
+        if (ShouldUseLocalGrading)
+        {
+            try
+            {
+                localClassifier?.WarmupModel();
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[Dictation] Failed to warm up local classifier: {ex.Message}");
+            }
+        }
+
+        if ((!ShouldUseLocalGrading || fallbackToVisionOnLocalFailure) && beamMode == BeamMode.BeamOn)
+            StartCoroutine(WarmupBeam()); // primes token + HTTP path
     }
 
     void OnEnable()
     {
         if (gradingBtn) gradingBtn.OnButtonPressed += HandleGradeBtn;
         if (eraseBtn)   eraseBtn.OnButtonPressed   += HandleEraseBtn;
+        if (debugLocalBtn) debugLocalBtn.OnButtonPressed += HandleDebugLocalBtn;
+        ClearBoardVisuals();
+        UpdateUI();
     }
     void OnDisable()
     {
         if (gradingBtn) gradingBtn.OnButtonPressed -= HandleGradeBtn;
         if (eraseBtn)   eraseBtn.OnButtonPressed   -= HandleEraseBtn;
+        if (debugLocalBtn) debugLocalBtn.OnButtonPressed -= HandleDebugLocalBtn;
+        if (_debugLocalRoutine != null)
+        {
+            StopCoroutine(_debugLocalRoutine);
+            _debugLocalRoutine = null;
+        }
+    }
+
+    private void EnsureLocalClassifierConfigured()
+    {
+        if (localClassifier == null)
+            localClassifier = GetComponent<OnDeviceLetterClassifier>();
+
+        if (localClassifier == null)
+        {
+            var existing = FindObjectsOfType<OnDeviceLetterClassifier>(true);
+            if (existing != null && existing.Length > 0)
+                localClassifier = existing[0];
+        }
+
+        bool needsLocalComponent = useLocalClassifier || debugLocalButtonGO != null;
+
+        if (localClassifier == null && autoCreateLocalClassifier && needsLocalComponent)
+            localClassifier = gameObject.AddComponent<OnDeviceLetterClassifier>();
+
+        if (debugLocalButtonGO && debugLocalBtn == null)
+            debugLocalBtn = debugLocalButtonGO.GetComponent<ProximityButton>();
+
+        if (localClassifier == null)
+        {
+            if (useLocalClassifier)
+                Debug.LogWarning("[Dictation] Local classifier is enabled but no OnDeviceLetterClassifier component is available.");
+            return;
+        }
+
+        localClassifier.Configure(localClassifierModelAsset, localPreferredBackend, localPreloadModelOnAwake,
+            localForegroundThreshold, localPaddingFraction, localMinimumPaddingPixels);
+
+        if (useLocalClassifier && !localClassifier.HasModelAsset)
+            Debug.LogWarning("[Dictation] Local classifier mode is enabled but no model asset is assigned.");
     }
 
     void Update()
@@ -130,98 +290,244 @@ public class DictationManager : MonoBehaviour
         bool isDict = (mode == LevelManager.GameMode.Dictation);
         if (drawerHost) drawerHost.SetActive(isDict);
 
-        // clear when leaving Dictation
+        // Clear visuals when leaving Dictation mode OR when entering Dictation mode
         if (_hasLastMode && _lastNotifiedMode == LevelManager.GameMode.Dictation && mode != LevelManager.GameMode.Dictation)
             ClearBoardVisuals();
+        else if (isDict)
+            ClearBoardVisuals(); // Clear any existing visuals when entering Dictation mode
 
         _lastNotifiedMode = mode;
         _hasLastMode = true;
 
         UpdateUI();
-        if (!isDict) SetFeedback(""); // hide text outside dictation
+        if (!isDict) SetFeedback("");
     }
 
     public void StartDictation()
     {
         if (!lvl) return;
 
+        attemptCount = 0; // reset tries
         ClearBoardVisuals();
-        if (rec != null && rec.currentRecord != null && rec.currentRecord.frames != null)
-            rec.currentRecord.frames.Clear();
-        if (rec != null) rec.IsRecording = false;
 
-        // Disable tmpLetter when dictation starts
+        if (rec != null)
+        {
+            rec.IsRecording = false; // not using stroke capture here
+            if (rec.currentRecord != null && rec.currentRecord.frames != null)
+                rec.currentRecord.frames.Clear();
+        }
+
         if (tmpLetter != null) tmpLetter.SetActive(false);
 
         state = State.Drawing;
         UpdateUI();
-        SetFeedback(lvl != null && !string.IsNullOrEmpty(lvl.currentLetter)
-            ? $"Write the letter '{lvl.currentLetter}'"
-            : "Write the letter");
+        SetFeedback(!string.IsNullOrEmpty(lvl.currentLetter) ? $"Write '{lvl.currentLetter}'" : "Write the letter");
         OnDictationStart?.Invoke();
+        ClearBoardVisuals();
     }
 
     // ===== Buttons =====
     private void HandleGradeBtn()
     {
         if (state == State.Drawing)
-            StartCoroutine(GradeFlow()); // single press → full flow
+            StartCoroutine(GradeFlow());
     }
 
     private void HandleEraseBtn()
     {
-        if (lvl != null && lvl.currentMode == LevelManager.GameMode.Dictation)
+        ClearBoardVisuals();
+        SetFeedback("Board cleared");
+    }
+
+    
+    private void HandleRepeatBtn()
+    {
+        if (!isActiveAndEnabled)
+            return;
+        StartCoroutine(RepeatReplayCo());
+    }
+
+    private IEnumerator RepeatReplayCo()
+    {
+        string targetLetter = lvl?.currentLetter ?? "?";
+        SetFeedback($"Watch the demo of '{targetLetter}'...");
+        ClearBoardVisuals();
+        yield return new WaitForSeconds(waitBeforeRef);
+        yield return ReplayReference();
+        SetFeedback("Your turn!");
+    }public void TriggerLocalDebug()
+    {
+        if (!isActiveAndEnabled)
         {
-            ClearBoardVisuals();
-            SetFeedback("Board cleared");
+            Debug.LogWarning("[Dictation] Cannot run local debug while DictationManager is disabled.");
+            return;
         }
+
+        if (!Application.isPlaying)
+        {
+            Debug.LogWarning("[Dictation] Local debug can only run in Play Mode.");
+            return;
+        }
+
+        TriggerLocalDebugInternal();
+    }
+
+    private void HandleDebugLocalBtn()
+    {
+        TriggerLocalDebugInternal();
+    }
+
+    private void TriggerLocalDebugInternal()
+    {
+        EnsureLocalClassifierConfigured();
+
+        if (localClassifier == null)
+        {
+            Debug.LogWarning("[Dictation] Debug triggered but local classifier is not assigned.");
+            return;
+        }
+
+        if (!localClassifier.HasModelAsset)
+        {
+            Debug.LogWarning("[Dictation] Debug triggered but local classifier has no model asset assigned.");
+            return;
+        }
+
+        if (_debugLocalRoutine != null)
+            StopCoroutine(_debugLocalRoutine);
+
+        Debug.Log("[Dictation] Running local classifier debug sample.");
+        _debugLocalRoutine = StartCoroutine(RunLocalDebugSample());
     }
 
     // ===== Flow =====
     private IEnumerator GradeFlow()
     {
-        if (rec != null) rec.IsRecording = false;
-        if (gradingButtonGO) gradingButtonGO.SetActive(false); // prevent double taps
+        if (gradingButtonGO) gradingButtonGO.SetActive(false);
         if (eraseButtonGO)   eraseButtonGO.SetActive(false);
 
-        bool correct;
+        EnsureLocalClassifierConfigured();
 
-        if (beamMode == BeamMode.BeamOn)
+        // Capture the board EXACTLY as rendered by boardCamera
+        Texture2D snap = null;
+        yield return StartCoroutine(CaptureBoardExactCo(t => snap = t));
+        if (snap == null)
         {
-            Texture2D snap = CaptureBoardTexture();
-            if (snap == null)
+            Debug.LogWarning("[Dictation] Capture failed.");
+            YieldFailImmediate();
+            SetFeedback("Capture failed");
+            yield return new WaitForSeconds(waitAfterReplay);
+            Advance();
+            yield break;
+        }
+
+        state = State.WaitingForResponse;
+        UpdateUI();
+        SetFeedback("Grading...");
+
+        bool attemptedLocal = ShouldUseLocalGrading;
+        bool localFailedHard = false;
+        LetterPrediction localPrediction = null;
+
+        if (attemptedLocal)
+        {
+            if (localClassifier == null)
             {
-                Debug.LogWarning("[Dictation] Board camera missing or capture failed.");
-                YieldFailImmediate();
-                SetFeedback("Capture failed");
-                yield return new WaitForSeconds(waitAfterReplay);
-                Advance();
-                yield break;
+                Debug.LogWarning("[Dictation] Local grading enabled but classifier reference is missing.");
+                localFailedHard = true;
+            }
+            else
+            {
+                try
+                {
+                    localPrediction = localClassifier.Predict(snap);
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning($"[Dictation] Local classifier inference failed: {ex.Message}");
+                    localFailedHard = true;
+                }
             }
 
-            state = State.WaitingForResponse;
-            UpdateUI();
-            SetFeedback("Grading… (one sec)");
+            if (localFailedHard && fallbackToVisionOnLocalFailure)
+            {
+                attemptedLocal = false;
+            }
+        }
 
-            string ocrText = null;
+        string ocrText = null;
+        if (!attemptedLocal)
+        {
             yield return StartCoroutine(BeamRecognize(snap, t => ocrText = t));
-            Destroy(snap);
+        }
 
-            string got = (ocrText ?? "").Trim().ToLowerInvariant();
-            string expected = (lvl != null ? (lvl.currentLetter ?? "").Trim().ToLowerInvariant() : "");
+        Destroy(snap);
 
-            if (beamLengthHint > 0 && got.Length >= beamLengthHint)
-                got = got.Substring(0, beamLengthHint);
+        string expected = NormalizeAsciiStrict(lvl != null ? lvl.currentLetter : null);
+        string targetLetter = lvl?.currentLetter ?? "?";
+        string gotRaw;
+        string gotNormalized;
+        bool correct;
+        bool usedLocal = attemptedLocal;
+        float localConfidence = 0f;
+        bool localHasWriting = true;
 
-            correct = (!string.IsNullOrEmpty(got) && got == expected);
+        if (attemptedLocal)
+        {
+            LetterPrediction prediction = localFailedHard ? LetterPrediction.NoWriting : localPrediction ?? LetterPrediction.NoWriting;
+            localHasWriting = prediction.HasWriting;
+
+            string matchedRaw = prediction.HasWriting ? prediction.TopLetter : string.Empty;
+            float matchedConfidence = prediction.TopConfidence;
+            string matchedNormalized = NormalizeAsciiStrict(matchedRaw);
+
+            bool inTopThreeMatch = false;
+
+            if (prediction.Ranked != null)
+            {
+                int limit = Mathf.Min(3, prediction.Ranked.Count);
+                for (int i = 0; i < limit; i++)
+                {
+                    var candidate = prediction.Ranked[i];
+                    string candidateNorm = NormalizeAsciiStrict(candidate.letter);
+                    if (!string.IsNullOrEmpty(candidateNorm) && candidateNorm == expected)
+                    {
+                        matchedRaw = candidate.letter;
+                        matchedConfidence = candidate.probability;
+                        matchedNormalized = candidateNorm;
+                        inTopThreeMatch = true;
+                        break;
+                    }
+                }
+            }
+
+            localConfidence = matchedConfidence;
+            gotRaw = matchedRaw;
+            gotNormalized = matchedNormalized;
+
+            bool normalizedMatch = !string.IsNullOrEmpty(gotNormalized) && gotNormalized == expected;
+            bool thresholdSatisfied = prediction.HasWriting && normalizedMatch && localConfidence >= localConfidenceThreshold;
+
+            if (inTopThreeMatch && normalizedMatch)
+            {
+                correct = true;
+                localHasWriting = true; // treat as valid writing when ranked guesses include the letter
+            }
+            else
+            {
+                correct = thresholdSatisfied;
+            }
+
+            DebugCodepoint("[Local] RAW", gotRaw);
+            Debug.Log($"[Local] NORMALIZED got='{gotNormalized}' expected='{expected}' conf={localConfidence:F3} hasWriting={localHasWriting}");
         }
         else
         {
-            state = State.WaitingForResponse;
-            UpdateUI();
-            SetFeedback("Checking…");
-            yield return null;
-            correct = (beamMode == BeamMode.MarkAnswersCorrect);
+            gotRaw = ocrText ?? string.Empty;
+            DebugCodepoint("[Vision] RAW", gotRaw);
+            gotNormalized = NormalizeAsciiStrict(gotRaw);
+            correct = (!string.IsNullOrEmpty(gotNormalized) && gotNormalized == expected);
+            Debug.Log($"[Vision] NORMALIZED got='{gotNormalized}' expected='{expected}'");
         }
 
         state = correct ? State.GradedAccept : State.GradedReject;
@@ -231,23 +537,156 @@ public class DictationManager : MonoBehaviour
         {
             OnDictationGraded?.Invoke(100f);
             OnLetterCorrect?.Invoke();
-            SetFeedback("Correct ✅");
+            if (usedLocal)
+                SetFeedback($"Correct (local '{gotRaw}' @ {Mathf.RoundToInt(localConfidence * 100f)}%)");
+            else
+                SetFeedback($"Correct (saw: '{gotRaw}')");
             ClearBoardVisuals();
             yield return new WaitForSeconds(waitAfterCorrect);
-            Advance(); // auto-advance
+            Advance();
         }
         else
         {
             OnDictationGraded?.Invoke(0f);
             OnLetterIncorrect?.Invoke();
-            SetFeedback("Almost. Watch the demo…");
-            ClearBoardVisuals();
-            yield return new WaitForSeconds(waitBeforeRef);
-            yield return ReplayReference();
-            SetFeedback("Your turn next →");
-            yield return new WaitForSeconds(waitAfterReplay);
-            Advance(); // auto-advance after replay
+            if (attemptCount == 0)
+            {
+                // First mistake: show image hint (same as phoneme manager)
+                var hint = FindObjectOfType<Letter3DDisplay>();
+                if (hint != null) hint.ShowHintNow();
+                string retryMsg;
+                if (usedLocal)
+                {
+                    if (!localHasWriting)
+                        retryMsg = "No writing detected. Try again.";
+                    else if (localConfidence < localConfidenceThreshold)
+                        retryMsg = $"Not quite yet ({Mathf.RoundToInt(localConfidence * 100f)}% confidence). Try again.";
+                    else
+                        retryMsg = $"Local saw '{(string.IsNullOrEmpty(gotRaw) ? "?" : gotRaw)}'. Try '{targetLetter}' again.";
+                }
+                else
+                {
+                    retryMsg = $"Hint shown. Try '{targetLetter}' again.";
+                }
+
+                SetFeedback(retryMsg);
+                attemptCount = 1;
+                state = State.Drawing;
+                UpdateUI();
+                yield break; // give user another try
+            }
+            else
+            {
+                // Second mistake: replay with stroke filling + pops, then move on
+                if (usedLocal && !localHasWriting)
+                    SetFeedback("No writing detected. Watch the demo and try again.");
+                else
+                    SetFeedback($"Watch the demo of '{targetLetter}'...");
+                ClearBoardVisuals();
+                yield return new WaitForSeconds(waitBeforeRef);
+                yield return ReplayReference(); // revert to classic sphere replay
+                SetFeedback("Your turn!");
+                yield return new WaitForSeconds(waitAfterReplay);
+                attemptCount = 2;
+                Advance();
+            }
         }
+    }
+
+    private IEnumerator RunLocalDebugSample()
+    {
+        string previousFeedback = feedbackText ? feedbackText.text : string.Empty;
+        SetFeedback("Local debug...");
+
+        Texture2D snap = null;
+        yield return StartCoroutine(CaptureBoardExactCo(t => snap = t));
+        if (snap == null)
+        {
+            SetFeedback("Debug capture failed");
+            yield return new WaitForSeconds(1f);
+            SetFeedback(previousFeedback);
+            _debugLocalRoutine = null;
+            yield break;
+        }
+
+        if (localClassifier == null || !localClassifier.HasModelAsset)
+        {
+            Debug.LogWarning("[Dictation] Local debug aborted because classifier became unavailable.");
+            Destroy(snap);
+            SetFeedback("Local debug unavailable");
+            yield return new WaitForSeconds(1.5f);
+            SetFeedback(previousFeedback);
+            _debugLocalRoutine = null;
+            yield break;
+        }
+
+        LetterPrediction prediction = null;
+        bool inferenceError = false;
+        string inferenceMessage = null;
+        try
+        {
+            prediction = localClassifier.Predict(snap);
+        }
+        catch (Exception ex)
+        {
+            Debug.LogWarning($"[Dictation] Local debug failed: {ex.Message}");
+            inferenceError = true;
+            inferenceMessage = "Local debug error";
+        }
+
+        Destroy(snap);
+
+        if (inferenceError)
+        {
+            SetFeedback(inferenceMessage ?? "Local debug error");
+            yield return new WaitForSeconds(1.5f);
+            SetFeedback(previousFeedback);
+            _debugLocalRoutine = null;
+            yield break;
+        }
+
+        if (prediction == null)
+        {
+            SetFeedback("Local debug: no result");
+            yield return new WaitForSeconds(1.5f);
+            SetFeedback(previousFeedback);
+            _debugLocalRoutine = null;
+            yield break;
+        }
+
+        string msg;
+        if (!prediction.HasWriting)
+        {
+            msg = "Local debug: no writing detected";
+        }
+        else
+        {
+            float pct = Mathf.Round(prediction.TopConfidence * 100f);
+            msg = $"Local debug: '{prediction.TopLetter}' @ {pct}%";
+        }
+
+        SetFeedback(msg);
+
+        if (prediction.Ranked != null && prediction.Ranked.Count > 0)
+        {
+            int topCount = Mathf.Min(3, prediction.Ranked.Count);
+            var sb = new StringBuilder();
+            sb.Append("[Dictation][LocalDebug] Top predictions: ");
+            for (int i = 0; i < topCount; i++)
+            {
+                var entry = prediction.Ranked[i];
+                sb.Append(entry.Item1);
+                sb.Append("(");
+                sb.AppendFormat(CultureInfo.InvariantCulture, "{0:F3}", entry.Item2);
+                sb.Append(")");
+                if (i < topCount - 1) sb.Append(", ");
+            }
+            Debug.Log(sb.ToString());
+        }
+
+        yield return new WaitForSeconds(2f);
+        SetFeedback(previousFeedback);
+        _debugLocalRoutine = null;
     }
 
     private void Advance()
@@ -255,10 +694,9 @@ public class DictationManager : MonoBehaviour
         state = State.Idle;
         UpdateUI();
         SetFeedback("");
-        
-        // Re-enable tmpLetter when dictation ends
+
         if (tmpLetter != null) tmpLetter.SetActive(true);
-        
+
         OnDictationComplete?.Invoke();
     }
 
@@ -270,6 +708,8 @@ public class DictationManager : MonoBehaviour
 
         if (gradingButtonGO) gradingButtonGO.SetActive(inDict && canDraw);
         if (eraseButtonGO)   eraseButtonGO.SetActive(inDict && canDraw);
+        if (repeatButtonGO)  repeatButtonGO.SetActive(inDict);
+        if (debugLocalButtonGO) debugLocalButtonGO.SetActive(inDict && localClassifier != null && localClassifier.HasModelAsset);
         if (feedbackText)    feedbackText.gameObject.SetActive(inDict);
     }
 
@@ -283,6 +723,35 @@ public class DictationManager : MonoBehaviour
     {
         if (canvas != null) canvas.ClearVisualization();
 
+        // Also clear VisualEffectManager visuals (spheres, cylinders, etc.)
+        var visualEffectManager = GetComponent<VisualEffectManager>();
+        if (visualEffectManager != null)
+        {
+            // Use reflection to call ClearAllVisuals since it's private
+            var clearMethod = typeof(VisualEffectManager).GetMethod("ClearAllVisuals", 
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            clearMethod?.Invoke(visualEffectManager, null);
+        }
+
+        // AGGRESSIVE CLEARING: Find and destroy ONLY visualization sphere objects
+        var allSpheres = FindObjectsOfType<GameObject>().Where(go => 
+            (go.name.StartsWith("keypoint_") || 
+             go.name.StartsWith("TraceSegment") ||
+             go.name.StartsWith("ReplayDot_")) &&
+            !go.GetComponent<TMPro.TextMeshPro>() && // Don't destroy TMP objects
+            !go.GetComponent<TMPro.TextMeshProUGUI>() && // Don't destroy TMP objects
+            !go.GetComponent<TextMesh>() && // Don't destroy regular TextMesh
+            go.GetComponent<Renderer>() != null); // Only objects with renderers
+        
+        foreach (var sphere in allSpheres)
+        {
+            if (sphere != null && sphere.activeInHierarchy)
+            {
+                Debug.Log($"[Dictation] Force destroying visualization: {sphere.name}");
+                Destroy(sphere);
+            }
+        }
+
         if (drawerHost != null)
         {
             var trails = drawerHost.GetComponentsInChildren<TrailRenderer>(true);
@@ -295,29 +764,35 @@ public class DictationManager : MonoBehaviour
             {
                 var child = drawerHost.transform.GetChild(i);
                 if (child.name.StartsWith("Stroke", StringComparison.OrdinalIgnoreCase) ||
-                    child.name.StartsWith("Line",   StringComparison.OrdinalIgnoreCase))
+                    child.name.StartsWith("Line",   StringComparison.OrdinalIgnoreCase) ||
+                    child.name.StartsWith("ReplayDot_", StringComparison.OrdinalIgnoreCase))
                 {
                     Destroy(child.gameObject);
                 }
             }
         }
+
+        // Clear tracked replay dots
+        replayDots.Clear();
     }
 
-    // ===== Replay =====
+    // ===== Replay (unchanged) =====
     private IEnumerator ReplayReference()
     {
-        isReplaying = true;
-
         if (rec != null && lvl != null)
             rec.LoadRecording(lvl.currentLetter);
 
         yield return null;
 
+        // Build spheres even in Dictation (bypass gating) using local->world conversion for robustness
+        if (canvas != null)
+            canvas.CreateVisualizationForAllPointsEvenInDictation();
+
         if (canvas != null && canvas.activeSpheres != null)
         {
             foreach (var s in canvas.activeSpheres) s.SetActive(false);
 
-            float replayTotal = 1.25f;
+            float replayTotal = 2.0f; // slowed down per request
             float step = replayTotal / Mathf.Max(canvas.activeSpheres.Count, 1);
 
             foreach (var s in canvas.activeSpheres)
@@ -336,10 +811,111 @@ public class DictationManager : MonoBehaviour
                     yield return null;
                 }
                 s.transform.localScale = Vector3.one * canvas.sphereRadius * 5f;
+                if (!audioManager) audioManager = FindObjectOfType<AudioManager>();
+                if (audioManager) audioManager.PlayPop();
             }
         }
+    }
 
-        isReplaying = false;
+    // Enhanced replay: fill connecting segments with dot marks at ~pointDistance, pop on each
+    // Replay showing spheres sequentially and drawing a connecting stroke (cylinder) from n-1 -> n
+    private IEnumerator ReplayReferenceWithSegments()
+    {
+        if (rec != null && lvl != null)
+            rec.LoadRecording(lvl.currentLetter);
+
+        yield return null;
+
+        // Build spheres even in Dictation (provides point anchors). Use local->world conversion
+        if (canvas != null)
+            canvas.CreateVisualizationForAllPointsEvenInDictation();
+
+        if (canvas == null || canvas.activeSpheres == null || canvas.activeSpheres.Count == 0) yield break;
+
+        // Hide all spheres initially
+        foreach (var s in canvas.activeSpheres) if (s) s.SetActive(false);
+
+        float replayTotal = 1.25f;
+        float step = replayTotal / Mathf.Max(canvas.activeSpheres.Count, 1);
+
+        Transform root = null;
+        if (canvas.activeSpheres.Count > 0 && canvas.activeSpheres[0])
+            root = canvas.activeSpheres[0].transform.parent;
+
+        GameObject prev = null;
+        for (int i = 0; i < canvas.activeSpheres.Count; i++)
+        {
+            var cur = canvas.activeSpheres[i];
+            if (!cur) continue;
+
+            // reveal current sphere with a quick scale-in
+            cur.SetActive(true);
+            Vector3 targetScale = Vector3.one * canvas.sphereRadius * 5f;
+            cur.transform.localScale = Vector3.zero;
+            float t = 0f;
+            while (t < step)
+            {
+                cur.transform.localScale = targetScale * (t / step);
+                t += Time.deltaTime;
+                yield return null;
+            }
+            cur.transform.localScale = targetScale;
+
+            if (!audioManager) audioManager = FindObjectOfType<AudioManager>();
+            if (audioManager) audioManager.PlayPop();
+
+            // draw segment to previous
+            if (prev && root)
+            {
+                CreateReplaySegment(prev.transform.position, cur.transform.position, root);
+            }
+            prev = cur;
+        }
+    }
+
+    private void CreateReplaySegment(Vector3 a, Vector3 b, Transform parent)
+    {
+        float dist = Vector3.Distance(a, b);
+        if (dist <= 1e-6f) return;
+        GameObject cyl = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
+        cyl.name = "TraceSegment";
+        cyl.transform.SetParent(parent, true);
+        var col = cyl.GetComponent<Collider>(); if (col) Destroy(col);
+
+        // material
+        var mr = cyl.GetComponent<MeshRenderer>();
+        if (mr != null)
+        {
+            var mat = new Material(Shader.Find("Universal Render Pipeline/Lit"));
+            if (mat.HasProperty("_BaseColor")) mat.SetColor("_BaseColor", Color.black);
+            else if (mat.HasProperty("_Color")) mat.SetColor("_Color", Color.black);
+            mr.material = mat;
+        }
+
+        // align between a and b
+        cyl.transform.position = (a + b) * 0.5f;
+        cyl.transform.up = (b - a).normalized;
+        float radius = (canvas != null ? Mathf.Max(0.0015f, canvas.sphereRadius * 1.8f) : 0.003f); // thin stroke scaled
+        cyl.transform.localScale = new Vector3(radius, dist * 0.5f, radius); // height = 2*y
+    }
+
+    private void CreateReplayDot(Vector3 worldPos)
+    {
+        var dot = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+        dot.name = "ReplayDot_" + replayDots.Count;
+        dot.transform.position = worldPos;
+        dot.transform.localScale = Vector3.one * Mathf.Max(0.0015f, canvas != null ? canvas.sphereRadius * 2.5f : 0.01f);
+        Destroy(dot.GetComponent<Collider>());
+        var r = dot.GetComponent<Renderer>();
+        if (r != null)
+        {
+            var mat = r.material;
+            if (mat.HasProperty("_BaseColor")) mat.SetColor("_BaseColor", Color.black);
+            else if (mat.HasProperty("_Color")) mat.color = Color.black;
+        }
+        // Parent under drawerHost if available
+        if (drawerHost) dot.transform.SetParent(drawerHost.transform, true);
+        replayDots.Add(dot);
     }
 
     private void YieldFailImmediate()
@@ -350,61 +926,227 @@ public class DictationManager : MonoBehaviour
         OnLetterIncorrect?.Invoke();
     }
 
-    // ===== Capture & Beam =====
-    private Texture2D CaptureBoardTexture()
-    {
-        if (boardCamera == null) return null;
+    // =========================================================
+    // ==================   BOARD CAPTURE   ====================
+    // =========================================================
 
-        var rt = new RenderTexture(captureWidth, captureHeight, 16, RenderTextureFormat.ARGB32);
-        var prev = boardCamera.targetTexture;
+    private void HardConfigureCaptureCamera()
+    {
+        if (!boardCamera) { Debug.LogError("[Dictation] Assign boardCamera."); return; }
+
+        boardCamera.stereoTargetEye = StereoTargetEyeMask.None;
+        boardCamera.allowHDR  = false;
+        boardCamera.allowMSAA = false;
+        boardCamera.clearFlags = CameraClearFlags.SolidColor;
+        boardCamera.backgroundColor = Color.white;
+
+        if (boardLayer.value != 0)
+            boardCamera.cullingMask = boardLayer;
+
+        boardCamera.orthographic = true;
+        boardCamera.nearClipPlane = -10f;
+        boardCamera.farClipPlane  =  10f;
+
+        if (!boardCamera.gameObject.activeSelf)
+            boardCamera.gameObject.SetActive(true);
+    }
+
+    private void FitOrthoToRenderer(Camera cam, Renderer target, float padding = 1.02f)
+    {
+        if (!cam || !target) return;
+
+        Bounds b = target.bounds;
+
+        Vector3[] corners = new Vector3[8];
+        Vector3 c = b.center; Vector3 e = b.extents;
+        corners[0] = c + new Vector3(-e.x, -e.y, -e.z);
+        corners[1] = c + new Vector3( e.x, -e.y, -e.z);
+        corners[2] = c + new Vector3(-e.x,  e.y, -e.z);
+        corners[3] = c + new Vector3( e.x,  e.y, -e.z);
+        corners[4] = c + new Vector3(-e.x, -e.y,  e.z);
+        corners[5] = c + new Vector3( e.x, -e.y,  e.z);
+        corners[6] = c + new Vector3(-e.x,  e.y,  e.z);
+        corners[7] = c + new Vector3( e.x,  e.y,  e.z);
+
+        Matrix4x4 w2c = cam.worldToCameraMatrix;
+        Vector2 min = new Vector2(float.PositiveInfinity, float.PositiveInfinity);
+        Vector2 max = new Vector2(float.NegativeInfinity, float.NegativeInfinity);
+        float zmin = float.PositiveInfinity, zmax = float.NegativeInfinity;
+
+        for (int i = 0; i < 8; i++)
+        {
+            Vector3 v = w2c.MultiplyPoint(corners[i]);
+            if (v.x < min.x) min.x = v.x;
+            if (v.y < min.y) min.y = v.y;
+            if (v.x > max.x) max.x = v.x;
+            if (v.y > max.y) max.y = v.y;
+            if (v.z < zmin) zmin = v.z;
+            if (v.z > zmax) zmax = v.z;
+        }
+
+        float width  = (max.x - min.x) * padding;
+        float height = (max.y - min.y) * padding;
+
+        cam.orthographic = true;
+        cam.orthographicSize = height * 0.5f;
+
+        Vector3 camPosWS = cam.cameraToWorldMatrix.MultiplyPoint(new Vector3((min.x + max.x) * 0.5f, (min.y + max.y) * 0.5f, (zmin + zmax) * 0.5f));
+        cam.transform.position = camPosWS;
+
+        // aspect mismatch will letterbox in the RT
+    }
+
+    private IEnumerator CaptureBoardExactCo(Action<Texture2D> done)
+    {
+        if (!boardCamera) { done?.Invoke(null); yield break; }
+
+        if (boardRenderer != null)
+            FitOrthoToRenderer(boardCamera, boardRenderer, 1.02f);
+
+        int w = Mathf.Max(64, captureWidth);
+        int h = Mathf.Max(64, captureHeight);
+
+        var rt = new RenderTexture(w, h, 24, RenderTextureFormat.ARGB32, RenderTextureReadWrite.Default)
+        {
+            antiAliasing = 1,
+            autoGenerateMips = false,
+            useMipMap = false,
+            wrapMode = TextureWrapMode.Clamp,
+            filterMode = FilterMode.Bilinear
+        };
+
+        var prevTarget = boardCamera.targetTexture;
+        var prevActive = RenderTexture.active;
+
         boardCamera.targetTexture = rt;
+
+        int prevMask = boardCamera.cullingMask;
+        if (boardLayer.value != 0)
+            boardCamera.cullingMask = boardLayer;
+
+        yield return new WaitForEndOfFrame();
+        yield return new WaitForEndOfFrame();
+
         boardCamera.Render();
 
         RenderTexture.active = rt;
-        var tex = new Texture2D(captureWidth, captureHeight, TextureFormat.RGBA32, false, false);
-        tex.ReadPixels(new Rect(0, 0, captureWidth, captureHeight), 0, 0, false);
-        tex.Apply();
+        var tex = new Texture2D(w, h, TextureFormat.RGB24, false, false);
+        tex.ReadPixels(new Rect(0, 0, w, h), 0, 0, false);
+        tex.Apply(false, false);
 
-        boardCamera.targetTexture = prev;
-        RenderTexture.active = null;
+        RenderTexture.active = prevActive;
+        boardCamera.targetTexture = prevTarget;
+        if (boardLayer.value != 0) boardCamera.cullingMask = prevMask;
         rt.Release();
         Destroy(rt);
 
-        return tex;
+        if (debugWriteCapture)
+        {
+            try
+            {
+                var jpg = tex.EncodeToJPG(90);
+                string path = System.IO.Path.Combine(Application.persistentDataPath, $"board_cap_{DateTime.Now:HHmmssfff}.jpg");
+                System.IO.File.WriteAllBytes(path, jpg);
+                Debug.Log("[Dictation] Wrote debug capture: " + path);
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning("[Dictation] Debug write failed: " + e.Message);
+            }
+        }
+
+        done?.Invoke(tex);
     }
 
-    [Serializable] private struct BeamPayload { public string image_b64; public int length; }
-    [Serializable] private class BeamRespLoose
+    // =========================================================
+    // ====================   VISION I/O   =====================
+    // =========================================================
+
+    [Serializable] private struct BeamPayload { public string image_b64; public int length; } // kept for compatibility
+    [Serializable] private class BeamRespLoose { public string text; public string[] texts; [Serializable] public class Prediction { public string text; } public Prediction[] predictions; } // compatibility
+
+    [Serializable] private class ServiceAccountJson
     {
-        public string text;
-        public string[] texts;
-        [Serializable] public class Prediction { public string text; }
-        public Prediction[] predictions;
+        public string type;
+        public string project_id;
+        public string private_key_id;
+        public string private_key;   // PEM
+        public string client_email;
+        public string client_id;
+        public string auth_uri;
+        public string token_uri;
     }
+
+    [Serializable] private class TokenResp { public string access_token; public string token_type; public int expires_in; }
+
+    [Serializable] private class VisionRequestWrapper { public VisionRequest[] requests; }
+    [Serializable] private class VisionRequest
+    {
+        public VisionImage image;
+        public VisionFeature[] features;
+        public VisionImageContext imageContext;
+    }
+    [Serializable] private class VisionImage { public string content; }
+    [Serializable] private class VisionFeature { public string type; public int maxResults; }
+    [Serializable] private class VisionImageContext { public string[] languageHints; }
+
+    [Serializable] private class VisionRespWrapper { public VisionResp[] responses; }
+    [Serializable] private class VisionResp
+    {
+        public VisionTextAnn[] textAnnotations;
+        public VisionFullText fullTextAnnotation;
+    }
+    [Serializable] private class VisionTextAnn { public string description; }
+    [Serializable] private class VisionFullText { public string text; }
 
     private IEnumerator WarmupBeam()
     {
-        var tex = new Texture2D(1, 1, TextureFormat.RGBA32, false);
-        tex.SetPixel(0, 0, new Color(0, 0, 0, 0));
+        var tex = new Texture2D(32, 32, TextureFormat.RGB24, false);
+        var px = new Color32[32 * 32];
+        for (int i = 0; i < px.Length; i++) px[i] = new Color32(255, 255, 255, 255);
+        tex.SetPixels32(px);
         tex.Apply();
 
         yield return StartCoroutine(BeamRecognize(tex, _ => { }));
         Destroy(tex);
     }
 
+    // Kept name for compatibility
     private IEnumerator BeamRecognize(Texture2D snap, Action<string> onDone)
     {
-        byte[] png = snap.EncodeToPNG();
-        string b64 = Convert.ToBase64String(png);
-        var payload = new BeamPayload { image_b64 = b64, length = Mathf.Max(1, beamLengthHint) };
-        string json = JsonUtility.ToJson(payload);
+        string accessToken = null;
+        bool tokenOk = false;
+        yield return StartCoroutine(GetAccessTokenCo(t => { accessToken = t; tokenOk = !string.IsNullOrEmpty(t); }));
+        if (!tokenOk)
+        {
+            Debug.LogWarning("[Dictation] Failed to get access token.");
+            onDone?.Invoke(null);
+            yield break;
+        }
 
-        using (var req = new UnityWebRequest(beamUrl, "POST"))
+        byte[] jpg = snap.EncodeToJPG(85);
+        string b64 = Convert.ToBase64String(jpg);
+
+        var reqObj = new VisionRequestWrapper
+        {
+            requests = new[]
+            {
+                new VisionRequest
+                {
+                    image = new VisionImage { content = b64 },
+                    features = new[] { new VisionFeature { type = "DOCUMENT_TEXT_DETECTION", maxResults = 1 } },
+                    imageContext = new VisionImageContext { languageHints = (languageHints != null && languageHints.Length > 0) ? languageHints : new [] { "en" } }
+                }
+            }
+        };
+        string json = JsonUtility.ToJson(reqObj);
+
+        using (var req = new UnityWebRequest(visionEndpoint, "POST"))
         {
             byte[] body = Encoding.UTF8.GetBytes(json);
             req.uploadHandler = new UploadHandlerRaw(body);
             req.downloadHandler = new DownloadHandlerBuffer();
-            req.SetRequestHeader("Authorization", $"Bearer {beamBearerToken}");
+            req.SetRequestHeader("Authorization", $"Bearer {accessToken}");
             req.SetRequestHeader("Content-Type", "application/json");
             req.timeout = 20;
 
@@ -412,32 +1154,381 @@ public class DictationManager : MonoBehaviour
 
             if (req.result != UnityWebRequest.Result.Success)
             {
-                Debug.LogWarning($"[DictationManager] Beam error {req.responseCode}: {req.error}\n{req.downloadHandler.text}");
+                Debug.LogWarning($"[Dictation] Vision error {req.responseCode}: {req.error}\n{req.downloadHandler.text}");
                 onDone?.Invoke(null);
                 yield break;
             }
 
-            string parsed = ParseBeamText(req.downloadHandler.text);
-            if (parsed == null) parsed = req.downloadHandler.text;
-            onDone?.Invoke(parsed);
+          
+// parsed text
+string parsed = ParseVisionText(req.downloadHandler.text);
+Debug.Log($"[Vision] PARSED: '{parsed}'");
+onDone?.Invoke(parsed);
         }
     }
 
-    private string ParseBeamText(string resp)
+    private string ParseVisionText(string resp)
     {
         try
         {
-            var obj = JsonUtility.FromJson<BeamRespLoose>(resp);
-            if (obj != null)
+            var wrap = JsonUtility.FromJson<VisionRespWrapper>(resp);
+            if (wrap != null && wrap.responses != null && wrap.responses.Length > 0)
             {
-                if (!string.IsNullOrEmpty(obj.text)) return obj.text;
-                if (obj.texts != null && obj.texts.Length > 0) return obj.texts[0];
-                if (obj.predictions != null && obj.predictions.Length > 0 &&
-                    !string.IsNullOrEmpty(obj.predictions[0].text))
-                    return obj.predictions[0].text;
+                var r = wrap.responses[0];
+                if (r == null) return null;
+
+                if (r.fullTextAnnotation != null && !string.IsNullOrEmpty(r.fullTextAnnotation.text))
+                    return r.fullTextAnnotation.text.Trim();
+
+                if (r.textAnnotations != null && r.textAnnotations.Length > 0 && !string.IsNullOrEmpty(r.textAnnotations[0].description))
+                    return r.textAnnotations[0].description.Trim();
             }
         }
         catch { }
         return null;
     }
+
+    // =========================================================
+    // ===================   AUTH (JWT)   ======================
+    // =========================================================
+
+    private IEnumerator GetAccessTokenCo(Action<string> onDone)
+    {
+        double now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        if (!string.IsNullOrEmpty(_cachedAccessToken) && now < _tokenExpiryEpoch - 60)
+        {
+            onDone?.Invoke(_cachedAccessToken);
+            yield break;
+        }
+
+        if (string.IsNullOrEmpty(serviceAccountJsonResource))
+        {
+            Debug.LogError("[Dictation] serviceAccountJsonResource is empty. Put your key in Resources/ and set the name (without .json).");
+            onDone?.Invoke(null);
+            yield break;
+        }
+        TextAsset ta = Resources.Load<TextAsset>(serviceAccountJsonResource);
+        if (ta == null || string.IsNullOrEmpty(ta.text))
+        {
+            Debug.LogError("[Dictation] Could not load service account JSON from Resources/" + serviceAccountJsonResource + ".json");
+            onDone?.Invoke(null);
+            yield break;
+        }
+
+        ServiceAccountJson sa = null;
+        try { sa = JsonUtility.FromJson<ServiceAccountJson>(ta.text); }
+        catch (Exception e)
+        {
+            Debug.LogError("[Dictation] Invalid service account JSON: " + e.Message);
+            onDone?.Invoke(null);
+            yield break;
+        }
+        if (sa == null || string.IsNullOrEmpty(sa.client_email) || string.IsNullOrEmpty(sa.private_key) || string.IsNullOrEmpty(sa.token_uri))
+        {
+            Debug.LogError("[Dictation] Missing fields in service account JSON.");
+            onDone?.Invoke(null);
+            yield break;
+        }
+
+        string scope = "https://www.googleapis.com/auth/cloud-vision";
+        long iat = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        long exp = iat + 3600;
+
+        string headerJson = "{\"alg\":\"RS256\",\"typ\":\"JWT\"}";
+        string claimJson  = "{\"iss\":\"" + sa.client_email + "\",\"scope\":\"" + scope + "\",\"aud\":\"" + sa.token_uri + "\",\"exp\":" + exp + ",\"iat\":" + iat + "}";
+
+        string headerB64 = ToBase64Url(Encoding.UTF8.GetBytes(headerJson));
+        string claimB64  = ToBase64Url(Encoding.UTF8.GetBytes(claimJson));
+        string signingInput = headerB64 + "." + claimB64;
+
+        byte[] signature;
+        try
+        {
+            using (RSA rsa = PemKeyUtil.CreateRSAFromPem(sa.private_key))
+            {
+                if (rsa == null) throw new Exception("PEM parse failed");
+                signature = rsa.SignData(Encoding.ASCII.GetBytes(signingInput), HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+            }
+        }
+        catch (Exception e)
+        {
+            Debug.LogError("[Dictation] RSA sign failed: " + e.Message);
+            onDone?.Invoke(null);
+            yield break;
+        }
+
+        string jwt = signingInput + "." + ToBase64Url(signature);
+
+        WWWForm form = new WWWForm();
+        form.AddField("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer");
+        form.AddField("assertion", jwt);
+
+        using (var req = UnityWebRequest.Post(sa.token_uri, form))
+        {
+            req.downloadHandler = new DownloadHandlerBuffer();
+            req.timeout = 20;
+            yield return req.SendWebRequest();
+
+            if (req.result != UnityWebRequest.Result.Success)
+            {
+                Debug.LogError($"[Dictation] Token request failed {req.responseCode}: {req.error}\n{req.downloadHandler.text}");
+                onDone?.Invoke(null);
+                yield break;
+            }
+
+            TokenResp tok = null;
+            try { tok = JsonUtility.FromJson<TokenResp>(req.downloadHandler.text); } catch { }
+            if (tok == null || string.IsNullOrEmpty(tok.access_token))
+            {
+                Debug.LogError("[Dictation] Token parse failed: " + req.downloadHandler.text);
+                onDone?.Invoke(null);
+                yield break;
+            }
+
+            _cachedAccessToken = tok.access_token;
+            _tokenExpiryEpoch  = DateTimeOffset.UtcNow.ToUnixTimeSeconds() + Math.Max(60, tok.expires_in);
+            onDone?.Invoke(_cachedAccessToken);
+        }
+    }
+
+    private static string ToBase64Url(byte[] input)
+    {
+        string s = Convert.ToBase64String(input);
+        s = s.Replace('+', '-').Replace('/', '_').TrimEnd('=');
+        return s;
+    }
+
+    // === Character normalization methods ===
+    private static string NormalizeToAsciiLetter(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return "";
+
+        // 1) lowercase + trim
+        s = s.Trim().ToLowerInvariant();
+
+        // 2) NFKD to strip accents
+        var norm = s.Normalize(NormalizationForm.FormKD);
+        var sb = new StringBuilder(norm.Length);
+        foreach (var ch in norm)
+        {
+            var uc = CharUnicodeInfo.GetUnicodeCategory(ch);
+            if (uc != UnicodeCategory.NonSpacingMark &&
+                uc != UnicodeCategory.SpacingCombiningMark &&
+                uc != UnicodeCategory.EnclosingMark)
+                sb.Append(ch);
+        }
+        s = sb.ToString();
+
+        // 3) common homoglyphs → latin
+        //   (cyrillic)        (greek)
+        s = s
+            .Replace('а', 'a') // Cyrillic a
+            .Replace('е', 'e') // Cyrillic e
+            .Replace('о', 'o') // Cyrillic o
+            .Replace('р', 'p') // Cyrillic r
+            .Replace('с', 'c') // Cyrillic s
+            .Replace('у', 'y') // Cyrillic u
+            .Replace('х', 'x') // Cyrillic x
+            .Replace('к', 'k') // Cyrillic k
+            .Replace('м', 'm') // Cyrillic m
+            .Replace('т', 't') // Cyrillic t
+            .Replace('н', 'h') // Cyrillic n (visually h in some fonts; keep if you ever use 'h')
+            .Replace('ι', 'i') // Greek iota
+            .Replace('ο', 'o') // Greek omicron
+            .Replace('ρ', 'p') // Greek rho
+            .Replace('χ', 'x') // Greek chi
+            .Replace('κ', 'k') // Greek kappa
+            .Replace('μ', 'm') // Greek mu
+            .Replace('τ', 't') // Greek tau
+            .Replace('ν', 'v'); // Greek nu
+
+        // 4) grab the first ascii a-z only
+        for (int i = 0; i < s.Length; i++)
+        {
+            char ch = s[i];
+            if (ch >= 'a' && ch <= 'z') return ch.ToString();
+        }
+        return "";
+    }
+
+    private static void DebugCodepoint(string label, string s)
+    {
+        if (string.IsNullOrEmpty(s)) { Debug.Log($"{label}: <null/empty>"); return; }
+        var sb = new StringBuilder();
+        foreach (var ch in s)
+            sb.Append($"U+{((int)ch):X4} ");
+        Debug.Log($"{label}: '{s}' ({sb})");
+    }
+
+    // Robust ASCII-only normalization with homoglyph mapping
+    private static readonly Dictionary<char, char> ConfusableToAscii = new Dictionary<char, char>
+    {
+        // Cyrillic lowercase
+        ['\u0430'] = 'a', ['\u0435'] = 'e', ['\u043E'] = 'o', ['\u0440'] = 'p', ['\u0441'] = 'c',
+        ['\u0443'] = 'y', ['\u0445'] = 'x', ['\u043A'] = 'k', ['\u043C'] = 'm', ['\u0442'] = 't',
+        ['\u0432'] = 'b', ['\u043D'] = 'h', ['\u0438'] = 'u', ['\u0456'] = 'i',
+        // Cyrillic uppercase
+        ['\u0410'] = 'a', ['\u0412'] = 'b', ['\u0415'] = 'e', ['\u041A'] = 'k', ['\u041C'] = 'm',
+        ['\u041D'] = 'h', ['\u041E'] = 'o', ['\u0420'] = 'p', ['\u0421'] = 'c', ['\u0422'] = 't',
+        ['\u0423'] = 'y', ['\u0425'] = 'x', ['\u0406'] = 'i',
+        // Greek lowercase
+        ['\u03B1'] = 'a', ['\u03B5'] = 'e', ['\u03BF'] = 'o', ['\u03C1'] = 'p', ['\u03BD'] = 'v',
+        ['\u03BC'] = 'm', ['\u03B9'] = 'i', ['\u03BA'] = 'k', ['\u03C7'] = 'x', ['\u03C5'] = 'y', ['\u03C4'] = 't',
+        // Greek uppercase
+        ['\u0391'] = 'a', ['\u0392'] = 'b', ['\u0395'] = 'e', ['\u0397'] = 'h', ['\u0399'] = 'i', ['\u039A'] = 'k',
+        ['\u039C'] = 'm', ['\u039D'] = 'n', ['\u039F'] = 'o', ['\u03A1'] = 'p', ['\u03A4'] = 't', ['\u03A5'] = 'y', ['\u03A7'] = 'x', ['\u039B'] = 'l',
+    };
+
+    private static string NormalizeAsciiStrict(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return "";
+        s = s.Trim();
+        // Normalize and strip combining marks
+        var norm = s.Normalize(NormalizationForm.FormKD);
+        foreach (var ch in norm)
+        {
+            var cat = CharUnicodeInfo.GetUnicodeCategory(ch);
+            if (cat == UnicodeCategory.NonSpacingMark || cat == UnicodeCategory.SpacingCombiningMark || cat == UnicodeCategory.EnclosingMark)
+                continue;
+
+            char c = char.ToLowerInvariant(ch);
+            if (c >= 'a' && c <= 'z') return c.ToString();
+            if (ConfusableToAscii.TryGetValue(c, out var mapped)) return mapped.ToString();
+        }
+        return "";
+    }
+// ==================   PEM/DER PARSER (FIXED)   ===================
+private static class PemKeyUtil
+{
+    public static RSA CreateRSAFromPem(string pem)
+    {
+        if (string.IsNullOrEmpty(pem)) return null;
+        pem = NormalizePem(pem);
+
+        if (pem.Contains("-----BEGIN RSA PRIVATE KEY-----"))
+        {
+            byte[] der = DecodePem(pem, "RSA PRIVATE KEY");
+            RSAParameters p = ParsePkcs1PrivateKey(der);
+            var rsa = RSA.Create(); rsa.ImportParameters(p); return rsa;
+        }
+        if (pem.Contains("-----BEGIN PRIVATE KEY-----"))
+        {
+            byte[] der = DecodePem(pem, "PRIVATE KEY");            // PKCS#8
+            byte[] inner = ExtractPkcs8PrivateKeyOctet(der);       // RSAPrivateKey DER
+            RSAParameters p = ParsePkcs1PrivateKey(inner);
+            var rsa = RSA.Create(); rsa.ImportParameters(p); return rsa;
+        }
+        throw new Exception("Unsupported key: missing BEGIN PRIVATE KEY header");
+    }
+
+    private static string NormalizePem(string pem)
+    {
+        return pem.Replace("\\n", "\n").Replace("\r", "").Trim()
+                  .Replace("-----BEGIN  PRIVATE KEY-----", "-----BEGIN PRIVATE KEY-----")
+                  .Replace("-----END  PRIVATE KEY-----", "-----END PRIVATE KEY-----");
+    }
+
+    private static byte[] DecodePem(string pem, string label)
+    {
+        string header = $"-----BEGIN {label}-----";
+        string footer = $"-----END {label}-----";
+        int start = pem.IndexOf(header, StringComparison.Ordinal);
+        if (start < 0) throw new Exception($"Missing {header}");
+        start += header.Length;
+        int end = pem.IndexOf(footer, start, StringComparison.Ordinal);
+        if (end < 0) throw new Exception($"Missing {footer}");
+        string b64 = pem.Substring(start, end - start).Replace("\n", "").Replace("\t", "").Replace(" ", "");
+        return Convert.FromBase64String(b64);
+    }
+
+    // ---------- minimal DER helpers ----------
+    private static int ReadLen(byte[] der, ref int ofs)
+    {
+        if (ofs >= der.Length) throw new IndexOutOfRangeException("DER len read");
+        int len = der[ofs++];
+        if ((len & 0x80) == 0) return len;
+        int bytes = len & 0x7F;
+        if (bytes < 1 || bytes > 4 || ofs + bytes > der.Length) throw new Exception("Invalid DER length");
+        int v = 0; for (int i = 0; i < bytes; i++) v = (v << 8) | der[ofs++]; return v;
+    }
+
+    // Read only the SEQUENCE header; leave ofs at start of its content
+    private static int ReadSeqHeader(byte[] der, ref int ofs)
+    {
+        if (ofs >= der.Length) throw new IndexOutOfRangeException("DER tag read");
+        byte tag = der[ofs++]; if (tag != 0x30) throw new Exception("ASN.1: SEQUENCE expected");
+        int len = ReadLen(der, ref ofs);
+        if (ofs + len > der.Length) throw new IndexOutOfRangeException("DER seq overflow");
+        return len; // content length
+    }
+
+    // Read a full block (tag + length + content), return content bytes
+    private static byte[] ReadBlock(byte[] der, ref int ofs, byte expectTag)
+    {
+        if (ofs >= der.Length) throw new IndexOutOfRangeException("DER tag read");
+        byte tag = der[ofs++]; if (tag != expectTag) throw new Exception($"ASN.1 tag {expectTag:X2} expected, got {tag:X2}");
+        int len = ReadLen(der, ref ofs);
+        if (ofs + len > der.Length) throw new IndexOutOfRangeException("DER block overflow");
+        var val = new byte[len]; Buffer.BlockCopy(der, ofs, val, 0, len); ofs += len; return val;
+    }
+
+    private static byte[] ReadIntegerBytes(byte[] der, ref int ofs)
+    {
+        byte[] v = ReadBlock(der, ref ofs, 0x02); // INTEGER
+        if (v.Length > 1 && v[0] == 0x00) { var t = new byte[v.Length - 1]; Buffer.BlockCopy(v, 1, t, 0, t.Length); v = t; }
+        return v;
+    }
+
+    // PKCS#8 PrivateKeyInfo => OCTET STRING "privateKey"
+    private static byte[] ExtractPkcs8PrivateKeyOctet(byte[] der)
+    {
+        int ofs = 0;
+        int seqLen = ReadSeqHeader(der, ref ofs); // enter PrivateKeyInfo
+        int end = ofs + seqLen;
+
+        ReadIntegerBytes(der, ref ofs);           // version
+        ReadBlock(der, ref ofs, 0x30);            // AlgorithmIdentifier (skip content)
+        byte[] oct = ReadBlock(der, ref ofs, 0x04); // privateKey
+        // attributes [0] optional may follow; we don't need it
+        if (ofs > end) throw new Exception("PKCS#8 parse overflow");
+        return oct;
+    }
+
+    // PKCS#1 RSAPrivateKey => RSAParameters
+    private static RSAParameters ParsePkcs1PrivateKey(byte[] der)
+    {
+        int ofs = 0;
+        int seqLen = ReadSeqHeader(der, ref ofs); // enter RSAPrivateKey
+        int end = ofs + seqLen;
+
+        ReadIntegerBytes(der, ref ofs);           // version
+        byte[] n  = ReadIntegerBytes(der, ref ofs); // modulus
+        byte[] e  = ReadIntegerBytes(der, ref ofs); // publicExponent
+        byte[] d  = ReadIntegerBytes(der, ref ofs); // privateExponent
+        byte[] p  = ReadIntegerBytes(der, ref ofs); // prime1
+        byte[] q  = ReadIntegerBytes(der, ref ofs); // prime2
+        byte[] dp = ReadIntegerBytes(der, ref ofs); // exponent1
+        byte[] dq = ReadIntegerBytes(der, ref ofs); // exponent2
+        byte[] iq = ReadIntegerBytes(der, ref ofs); // coefficient
+
+        if (ofs > end) throw new Exception("PKCS#1 parse overflow");
+        return new RSAParameters { Modulus = n, Exponent = e, D = d, P = p, Q = q, DP = dp, DQ = dq, InverseQ = iq };
+    }
 }
+
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
