@@ -79,8 +79,7 @@ public class VisualEffectManager : MonoBehaviour, IMemoryBudgetConsumer
         recorder.OnRecordingLoaded      += OnLetterReloaded;
 
         _lastModeName = GetModeName();
-        _lastSpheresSig = ComputeSpheresSignature();
-        MaybeBuildPhonemeSegments();
+        _lastSpheresSig = ComputeSpheresSignature();\n        MaybeBuildPhonemeSegments();\n        if (canvasManager && (canvasManager.activeSpheres == null || canvasManager.activeSpheres.Count == 0))\n            canvasManager.CreateVisualizationForAllPointsEvenInDictation();
     }
 
     private void OnDisable()
@@ -164,8 +163,7 @@ public class VisualEffectManager : MonoBehaviour, IMemoryBudgetConsumer
         {
             _lastModeName = modeNow;
             _lastSpheresSig = sigNow;
-            ClearAllVisuals();
-            MaybeBuildPhonemeSegments();
+            ClearAllVisuals();\n            MaybeBuildPhonemeSegments();\n            if (canvasManager && (canvasManager.activeSpheres == null || canvasManager.activeSpheres.Count == 0))\n                canvasManager.CreateVisualizationForAllPointsEvenInDictation();
         }
 
         HandleProximityEffects();
@@ -320,8 +318,7 @@ public class VisualEffectManager : MonoBehaviour, IMemoryBudgetConsumer
     private void OnLetterReloaded()
     {
         ClearAllVisuals();
-        _lastSpheresSig = ComputeSpheresSignature();
-        MaybeBuildPhonemeSegments();
+        _lastSpheresSig = ComputeSpheresSignature();\n        MaybeBuildPhonemeSegments();\n        if (canvasManager && (canvasManager.activeSpheres == null || canvasManager.activeSpheres.Count == 0))\n            canvasManager.CreateVisualizationForAllPointsEvenInDictation();
     }
 
     private void MaybeBuildPhonemeSegments()
@@ -390,4 +387,6 @@ public class VisualEffectManager : MonoBehaviour, IMemoryBudgetConsumer
         return sig;
     }
 }
+
+
 
