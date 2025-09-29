@@ -79,7 +79,10 @@ public class VisualEffectManager : MonoBehaviour, IMemoryBudgetConsumer
         recorder.OnRecordingLoaded      += OnLetterReloaded;
 
         _lastModeName = GetModeName();
-        _lastSpheresSig = ComputeSpheresSignature();\n        MaybeBuildPhonemeSegments();\n        if (canvasManager && (canvasManager.activeSpheres == null || canvasManager.activeSpheres.Count == 0))\n            canvasManager.CreateVisualizationForAllPointsEvenInDictation();
+        _lastSpheresSig = ComputeSpheresSignature();
+        MaybeBuildPhonemeSegments();
+        if (canvasManager && (canvasManager.activeSpheres == null || canvasManager.activeSpheres.Count == 0))
+            canvasManager.CreateVisualizationForAllPointsEvenInDictation();
     }
 
     private void OnDisable()
@@ -163,7 +166,10 @@ public class VisualEffectManager : MonoBehaviour, IMemoryBudgetConsumer
         {
             _lastModeName = modeNow;
             _lastSpheresSig = sigNow;
-            ClearAllVisuals();\n            MaybeBuildPhonemeSegments();\n            if (canvasManager && (canvasManager.activeSpheres == null || canvasManager.activeSpheres.Count == 0))\n                canvasManager.CreateVisualizationForAllPointsEvenInDictation();
+            ClearAllVisuals();
+            MaybeBuildPhonemeSegments();
+            if (canvasManager && (canvasManager.activeSpheres == null || canvasManager.activeSpheres.Count == 0))
+                canvasManager.CreateVisualizationForAllPointsEvenInDictation();
         }
 
         HandleProximityEffects();
@@ -318,7 +324,12 @@ public class VisualEffectManager : MonoBehaviour, IMemoryBudgetConsumer
     private void OnLetterReloaded()
     {
         ClearAllVisuals();
-        _lastSpheresSig = ComputeSpheresSignature();\n        MaybeBuildPhonemeSegments();\n        if (canvasManager && (canvasManager.activeSpheres == null || canvasManager.activeSpheres.Count == 0))\n            canvasManager.CreateVisualizationForAllPointsEvenInDictation();
+        _lastSpheresSig = ComputeSpheresSignature();
+        MaybeBuildPhonemeSegments();
+        if (canvasManager && (canvasManager.activeSpheres == null || canvasManager.activeSpheres.Count == 0))
+            canvasManager.CreateVisualizationForAllPointsEvenInDictation();
+        if (canvasManager && (canvasManager.activeSpheres == null || canvasManager.activeSpheres.Count == 0))
+            canvasManager.CreateVisualizationForAllPointsEvenInDictation();
     }
 
     private void MaybeBuildPhonemeSegments()
