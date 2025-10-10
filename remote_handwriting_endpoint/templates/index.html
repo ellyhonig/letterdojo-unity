@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Letter Confidence Explorer</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #f5f5f5;
+            margin: 0;
+            padding: 0;
+        }
+        main {
+            max-width: 960px;
+            margin: 40px auto;
+            background: #fff;
+            border-radius: 12px;
+            padding: 32px;
+            box-shadow: 0 12px 30px rgba(0, 0, 0, 0.08);
+        }
+        h1 {
+            margin-top: 0;
+            font-size: 28px;
+            color: #2c3e50;
+        }
+        .upload {
+            border: 2px dashed #9ca3af;
+            border-radius: 10px;
+            padding: 24px;
+            text-align: center;
+            background-color: #fafafa;
+        }
+        .upload input[type="file"] {
+            margin-top: 12px;
+        }
+        .hint {
+            margin-top: 12px;
+            color: #6b7280;
+            font-size: 14px;
+        }
+        .canvas-wrapper {
+            margin-top: 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 12px;
+        }
+        #drawing-canvas {
+            width: 280px;
+            height: 280px;
+            border: 1px solid #d1d5db;
+            border-radius: 8px;
+            background-color: #ffffff;
+            box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.08);
+            touch-action: none;
+            cursor: crosshair;
+        }
+        .canvas-actions {
+            display: flex;
+            gap: 12px;
+        }
+        button.secondary {
+            background-color: #6b7280;
+            margin-top: 0;
+            padding: 10px 20px;
+        }
+        button.secondary:hover:not(:disabled) {
+            background-color: #4b5563;
+        }
+        #preview {
+            margin-top: 20px;
+            max-width: 200px;
+            image-rendering: pixelated;
+        }
+        button {
+            margin-top: 20px;
+            padding: 12px 28px;
+            font-size: 16px;
+            border: none;
+            border-radius: 8px;
+            background-color: #2563eb;
+            color: #fff;
+            cursor: pointer;
+        }
+        button:disabled {
+            background-color: #9ca3af;
+            cursor: not-allowed;
+        }
+        table {
+            margin-top: 30px;
+            width: 100%;
+            border-collapse: collapse;
+        }
+        th, td {
+            padding: 10px 12px;
+            border-bottom: 1px solid #e5e7eb;
+            text-align: left;
+        }
+        th {
+            background-color: #eff6ff;
+            color: #1d4ed8;
+        }
+        .status {
+            margin-top: 16px;
+            min-height: 24px;
+            color: #374151;
+        }
+    </style>
+</head>
+<body>
+    <main>
+        <h1>Handwritten Letter Confidence Explorer</h1>
+        <p>Upload or sketch a lowercase letter to see the model's confidence across all 26 classes.</p>
+        <form id="upload-form" class="upload">
+            <strong>Upload an image or draw your own letter:</strong>
+            <input id="file-input" type="file" name="file" accept="image/png,image/jpeg">
+            <p class="hint">Use the canvas below to sketch if you don't have an image handy.</p>
+            <div class="canvas-wrapper">
+                <canvas id="drawing-canvas" width="280" height="280"></canvas>
+                <div class="canvas-actions">
+                    <button type="button" id="clear-canvas" class="secondary">Clear Drawing</button>
+                </div>
+            </div>
+            <div>
+                <img id="preview" alt="Preview" hidden>
+            </div>
+            <button id="submit" type="submit">Run Prediction</button>
+        </form>
+        <div id="status" class="status"></div>
+        <table id="results-table" hidden>
+            <thead>
+                <tr>
+                    <th>Rank</th>
+                    <th>Letter</th>
+                    <th>Confidence</th>
+                </tr>
+            </thead>
+            <tbody id="results-body"></tbody>
+        </table>
+    </main>
+    <script>
+        const form = document.getElementById('upload-form');
+        const fileInput = document.getElementById('file-input');
+        const status = document.getElementById('status');
+        const submitButton = document.getElementById('submit');
+        const previewImage = document.getElementById('preview');
+        const resultsTable = document.getElementById('results-table');
+        const resultsBody = document.getElementById('results-body');
+        const canvas = document.getElementById('drawing-canvas');
+        const clearButton = document.getElementById('clear-canvas');
+        const ctx = canvas ? canvas.getContext('2d') : null;
+
+        let isDrawing = false;
+        let canvasDirty = false;
+
+        const initCanvas = () => {
+            if (!ctx) {
+                return;
+            }
+            ctx.lineWidth = 18;
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+            ctx.strokeStyle = '#000000';
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+        };
+
+        const updatePreviewFromCanvas = () => {
+            if (!canvas) {
+                return;
+            }
+            const dataUrl = canvas.toDataURL('image/png');
+            previewImage.src = dataUrl;
+            previewImage.hidden = false;
+        };
+
+        const getCanvasCoordinates = (event) => {
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = canvas.width / rect.width;
+            const scaleY = canvas.height / rect.height;
+            return {
+                x: (event.clientX - rect.left) * scaleX,
+                y: (event.clientY - rect.top) * scaleY,
+            };
+        };
+
+        const startDrawing = (event) => {
+            if (!ctx) {
+                return;
+            }
+            event.preventDefault();
+            const { x, y } = getCanvasCoordinates(event);
+            if (canvas.setPointerCapture && event.pointerId !== undefined) {
+                canvas.setPointerCapture(event.pointerId);
+            }
+            isDrawing = true;
+            canvasDirty = true;
+            ctx.beginPath();
+            ctx.moveTo(x, y);
+            ctx.lineTo(x, y);
+            ctx.stroke();
+        };
+
+        const draw = (event) => {
+            if (!isDrawing || !ctx) {
+                return;
+            }
+            event.preventDefault();
+            const { x, y } = getCanvasCoordinates(event);
+            ctx.lineTo(x, y);
+            ctx.stroke();
+        };
+
+        const stopDrawing = (event) => {
+            if (!isDrawing || !ctx) {
+                return;
+            }
+            event.preventDefault();
+            if (canvas.releasePointerCapture && event.pointerId !== undefined) {
+                try {
+                    if (!canvas.hasPointerCapture || canvas.hasPointerCapture(event.pointerId)) {
+                        canvas.releasePointerCapture(event.pointerId);
+                    }
+                } catch (releaseError) {
+                    console.warn('Pointer capture release failed', releaseError);
+                }
+            }
+            isDrawing = false;
+            ctx.closePath();
+            updatePreviewFromCanvas();
+        };
+
+        const clearCanvas = () => {
+            if (!ctx) {
+                return;
+            }
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.strokeStyle = '#000000';
+            canvasDirty = false;
+            if (!fileInput.files.length) {
+                previewImage.hidden = true;
+                previewImage.src = '';
+            }
+        };
+
+        if (canvas && ctx) {
+            initCanvas();
+            canvas.addEventListener('pointerdown', startDrawing);
+            canvas.addEventListener('pointermove', draw);
+            canvas.addEventListener('pointerup', stopDrawing);
+            canvas.addEventListener('pointerleave', stopDrawing);
+            canvas.addEventListener('pointercancel', stopDrawing);
+            canvas.addEventListener('contextmenu', (event) => event.preventDefault());
+        }
+
+        if (clearButton) {
+            clearButton.addEventListener('click', () => {
+                clearCanvas();
+                status.textContent = '';
+            });
+        }
+
+        fileInput.addEventListener('change', () => {
+            const file = fileInput.files[0];
+            if (file) {
+                const reader = new FileReader();
+                reader.onload = (event) => {
+                    previewImage.src = event.target.result;
+                    previewImage.hidden = false;
+                };
+                reader.readAsDataURL(file);
+            } else if (canvasDirty) {
+                updatePreviewFromCanvas();
+            } else {
+                previewImage.hidden = true;
+                previewImage.src = '';
+            }
+        });
+
+        form.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            const formData = new FormData();
+            const file = fileInput.files[0];
+
+            if (file) {
+                formData.append('file', file);
+            } else if (canvas && canvasDirty) {
+                const blob = await new Promise((resolve, reject) => {
+                    canvas.toBlob((result) => {
+                        if (result) {
+                            resolve(result);
+                        } else {
+                            reject(new Error('Could not capture drawing.'));
+                        }
+                    }, 'image/png');
+                });
+                formData.append('file', blob, 'drawing.png');
+                updatePreviewFromCanvas();
+            } else {
+                status.textContent = 'Upload an image or draw on the canvas before running prediction.';
+                return;
+            }
+
+            submitButton.disabled = true;
+            status.textContent = 'Running inference...';
+            resultsTable.hidden = true;
+            resultsBody.innerHTML = '';
+
+            try {
+                const response = await fetch('/predict', {
+                    method: 'POST',
+                    body: formData
+                });
+                if (!response.ok) {
+                    throw new Error(`Server returned ${response.status}`);
+                }
+                const payload = await response.json();
+                status.textContent = `Top prediction: ${payload.top_prediction.letter} (${(payload.top_prediction.confidence * 100).toFixed(2)}%)`;
+                const sorted = payload.sorted_predictions;
+                sorted.forEach(([letter, confidence], index) => {
+                    const row = document.createElement('tr');
+                    const rank = document.createElement('td');
+                    rank.textContent = index + 1;
+                    const letterCell = document.createElement('td');
+                    letterCell.textContent = letter;
+                    const confidenceCell = document.createElement('td');
+                    confidenceCell.textContent = (confidence * 100).toFixed(2) + '%';
+                    row.appendChild(rank);
+                    row.appendChild(letterCell);
+                    row.appendChild(confidenceCell);
+                    resultsBody.appendChild(row);
+                });
+                resultsTable.hidden = false;
+            } catch (error) {
+                status.textContent = `Error: ${error.message}`;
+                console.error(error);
+            } finally {
+                submitButton.disabled = false;
+            }
+        });
+    </script>
+</body>
+</html>

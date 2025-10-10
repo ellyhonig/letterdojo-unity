@@ -1,0 +1,12 @@
+fastapi==0.112.0
+uvicorn[standard]==0.30.1
+torch==2.4.0
+torchvision==0.19.0
+pillow==10.4.0
+numpy==1.26.4
+python-multipart==0.0.9
+jinja2==3.1.4
+torchaudio==2.4.0
+soundfile==0.12.1
+onnx==1.16.1
+onnxruntime==1.18.1

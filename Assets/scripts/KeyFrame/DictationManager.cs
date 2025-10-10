@@ -72,6 +72,12 @@ public class DictationManager : MonoBehaviour
     [SerializeField, Min(0)] private int localMinimumPaddingPixels = 2;
     [SerializeField] private GameObject debugLocalButtonGO;
 
+    [Header("Remote Classifier")]
+    [SerializeField] private bool useRemoteClassifier = true;
+    [SerializeField] private string remoteClassifierBaseUrl = "http://127.0.0.1:8000";
+    [SerializeField, Range(0f, 1f)] private float remoteConfidenceThreshold = 0.9f;
+    [SerializeField, Range(1f, 60f)] private float remoteRequestTimeoutSeconds = 10f;
+
     [Header("Auto Grading")]
     [SerializeField] private bool autoGradeOnIdle = true;
     [SerializeField, Range(0.1f, 2f)] private float autoGradeIdleSeconds = 0.7f;
@@ -124,6 +130,7 @@ public class DictationManager : MonoBehaviour
     private HandState _leftHandState = HandState.Idle;
     private int _lastObservedStrokeTotal = 0;
     private static readonly HashSet<char> LettersRequiringTwoStrokes = new HashSet<char> { 'f', 't', 'k', 'x' };
+    private bool ShouldUseRemoteGrading => useRemoteClassifier && !string.IsNullOrWhiteSpace(remoteClassifierBaseUrl);
 
     public void ReleaseMemory()
     {
@@ -375,7 +382,10 @@ public class DictationManager : MonoBehaviour
         if (!autoGradeOnIdle || canvas == null || canvas.activeSpheres == null || state != State.Drawing)
             return;
 
-        if (!ShouldUseLocalGrading || localClassifier == null || !localClassifier.HasModelAsset)
+        bool canRemote = ShouldUseRemoteGrading;
+        bool canLocal = ShouldUseLocalGrading && localClassifier != null && localClassifier.HasModelAsset;
+
+        if (!canRemote && !canLocal)
             return;
 
         int pointCount = canvas.activeSpheres.Count;
@@ -619,6 +629,116 @@ public class DictationManager : MonoBehaviour
         return result;
     }
 
+    [Serializable]
+    private class RemotePredictionEntry
+    {
+        public string letter;
+        public float confidence;
+    }
+
+    [Serializable]
+    private class RemotePredictionResponse
+    {
+        public RemotePredictionEntry[] top_predictions;
+    }
+
+    private string BuildRemoteUrl(string path)
+    {
+        if (string.IsNullOrWhiteSpace(remoteClassifierBaseUrl))
+            return path ?? string.Empty;
+        if (string.IsNullOrEmpty(path))
+            return remoteClassifierBaseUrl;
+        return $"{remoteClassifierBaseUrl.TrimEnd('/')}/{path.TrimStart('/')}";
+    }
+
+    private IEnumerator RemotePredictTop3(Texture2D snap, Action<LetterPrediction> onDone)
+    {
+        if (!ShouldUseRemoteGrading)
+        {
+            onDone?.Invoke(null);
+            yield break;
+        }
+
+        if (snap == null)
+        {
+            onDone?.Invoke(null);
+            yield break;
+        }
+
+        byte[] pngBytes = null;
+        try
+        {
+            pngBytes = snap.EncodeToPNG();
+        }
+        catch (Exception ex)
+        {
+            Debug.LogWarning($"[Dictation][Remote] Failed to encode PNG: {ex.Message}");
+        }
+
+        if (pngBytes == null || pngBytes.Length == 0)
+        {
+            onDone?.Invoke(null);
+            yield break;
+        }
+
+        var form = new WWWForm();
+        form.AddBinaryData("file", pngBytes, "capture.png", "image/png");
+
+        string url = BuildRemoteUrl("/predict/top3");
+
+        using (var req = UnityWebRequest.Post(url, form))
+        {
+            req.timeout = Mathf.Clamp(Mathf.RoundToInt(remoteRequestTimeoutSeconds), 1, 120);
+            yield return req.SendWebRequest();
+
+            if (req.result != UnityWebRequest.Result.Success)
+            {
+                Debug.LogWarning($"[Dictation][Remote] Request failed ({req.responseCode}): {req.error}");
+                onDone?.Invoke(null);
+                yield break;
+            }
+
+            string json = req.downloadHandler.text;
+            RemotePredictionResponse response = null;
+            try
+            {
+                response = JsonUtility.FromJson<RemotePredictionResponse>(json);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[Dictation][Remote] Failed to parse response: {ex.Message}");
+            }
+
+            if (response?.top_predictions == null || response.top_predictions.Length == 0)
+            {
+                Debug.LogWarning("[Dictation][Remote] Empty prediction response.");
+                onDone?.Invoke(null);
+                yield break;
+            }
+
+            var ranked = new List<(string letter, float probability)>(response.top_predictions.Length);
+            foreach (var entry in response.top_predictions)
+            {
+                if (entry == null) continue;
+                string letter = entry.letter ?? string.Empty;
+                float confidence = Mathf.Clamp01(entry.confidence);
+                ranked.Add((letter, confidence));
+            }
+
+            if (ranked.Count == 0)
+            {
+                onDone?.Invoke(null);
+                yield break;
+            }
+
+            bool hasWriting = ranked[0].Item2 >= remoteConfidenceThreshold;
+            string topLetter = ranked[0].Item1;
+            float topConfidence = ranked[0].Item2;
+            var prediction = new LetterPrediction(hasWriting, topLetter, topConfidence, ranked);
+            onDone?.Invoke(prediction);
+        }
+    }
+
     // ===== Flow =====
     private IEnumerator GradeFlow()
     {
@@ -644,7 +764,29 @@ public class DictationManager : MonoBehaviour
         UpdateUI();
         SetFeedback("Grading...");
 
-        bool attemptedLocal = ShouldUseLocalGrading;
+        bool attemptedRemote = ShouldUseRemoteGrading;
+        bool remoteFailedHard = false;
+        LetterPrediction remotePrediction = null;
+
+        if (attemptedRemote)
+        {
+            bool receivedResponse = false;
+            yield return StartCoroutine(RemotePredictTop3(snap, p =>
+            {
+                remotePrediction = p;
+                receivedResponse = true;
+            }));
+
+            if (!receivedResponse || remotePrediction == null)
+            {
+                Debug.LogWarning("[Dictation] Remote classifier inference failed or returned empty result.");
+                remoteFailedHard = true;
+                if (fallbackToVisionOnLocalFailure)
+                    attemptedRemote = false;
+            }
+        }
+
+        bool attemptedLocal = !attemptedRemote && ShouldUseLocalGrading;
         bool localFailedHard = false;
         LetterPrediction localPrediction = null;
 
@@ -675,7 +817,7 @@ public class DictationManager : MonoBehaviour
         }
 
         string ocrText = null;
-        if (!attemptedLocal)
+        if (!attemptedRemote && !attemptedLocal)
         {
             yield return StartCoroutine(BeamRecognize(snap, t => ocrText = t));
         }
@@ -687,25 +829,41 @@ public class DictationManager : MonoBehaviour
         string gotRaw;
         string gotNormalized;
         bool correct;
-        bool usedLocal = attemptedLocal;
-        float localConfidence = 0f;
-        bool localHasWriting = true;
-        bool localNormalizedMatch = false;
+        bool usedRemote = attemptedRemote && !remoteFailedHard;
+        bool usedLocal = !usedRemote && attemptedLocal;
+        float primaryConfidence = 0f;
+        bool hasWriting = true;
+        bool normalizedMatch = false;
 
-        if (attemptedLocal)
+        if (usedRemote)
+        {
+            LetterPrediction prediction = remotePrediction ?? LetterPrediction.NoWriting;
+            var eval = EvaluateLocalPrediction(prediction, expected);
+
+            hasWriting = eval.HasWriting;
+            primaryConfidence = eval.Top1Confidence;
+            gotRaw = prediction.TopLetter ?? string.Empty;
+            gotNormalized = NormalizeAsciiStrict(gotRaw);
+            normalizedMatch = eval.Top1Match;
+            correct = eval.Top1Match && eval.Top1Confidence >= remoteConfidenceThreshold && eval.Top1Normalized == expected;
+
+            DebugCodepoint("[Remote] RAW", gotRaw);
+            Debug.Log($"[Remote] NORMALIZED top1='{gotNormalized}' expected='{expected}' conf={primaryConfidence:F3} hasWriting={hasWriting}");
+        }
+        else if (usedLocal)
         {
             LetterPrediction prediction = localFailedHard ? LetterPrediction.NoWriting : localPrediction ?? LetterPrediction.NoWriting;
             var eval = EvaluateLocalPrediction(prediction, expected);
 
-            localHasWriting = eval.HasWriting;
-            localConfidence = eval.Confidence;
+            hasWriting = eval.HasWriting;
+            primaryConfidence = eval.Confidence;
             gotRaw = eval.Raw;
             gotNormalized = eval.Normalized;
-            localNormalizedMatch = eval.NormalizedMatch;
+            normalizedMatch = eval.NormalizedMatch;
             correct = eval.IsSuccess;
 
             DebugCodepoint("[Local] RAW", gotRaw);
-            Debug.Log($"[Local] NORMALIZED got='{gotNormalized}' expected='{expected}' conf={localConfidence:F3} hasWriting={localHasWriting} top3={eval.InTopThree} threshold={eval.MeetsThreshold}");
+            Debug.Log($"[Local] NORMALIZED got='{gotNormalized}' expected='{expected}' conf={primaryConfidence:F3} hasWriting={hasWriting} top3={eval.InTopThree} threshold={eval.MeetsThreshold}");
         }
         else
         {
@@ -723,8 +881,10 @@ public class DictationManager : MonoBehaviour
         {
             OnDictationGraded?.Invoke(100f);
             OnLetterCorrect?.Invoke();
-            if (usedLocal)
-                SetFeedback($"Correct (local '{gotRaw}' @ {Mathf.RoundToInt(localConfidence * 100f)}%)");
+            if (usedRemote)
+                SetFeedback($"Correct (remote '{gotRaw}' @ {Mathf.RoundToInt(primaryConfidence * 100f)}%)");
+            else if (usedLocal)
+                SetFeedback($"Correct (local '{gotRaw}' @ {Mathf.RoundToInt(primaryConfidence * 100f)}%)");
             else
                 SetFeedback($"Correct (saw: '{gotRaw}')");
             ClearBoardVisuals();
@@ -741,12 +901,21 @@ public class DictationManager : MonoBehaviour
                 var hint = FindObjectOfType<Letter3DDisplay>();
                 if (hint != null) hint.ShowHintNow();
                 string retryMsg;
-                if (usedLocal)
+                if (usedRemote)
                 {
-                    if (!localHasWriting)
+                    if (!hasWriting)
                         retryMsg = "No writing detected. Try again.";
-                    else if (localNormalizedMatch)
-                        retryMsg = $"Not quite yet ({Mathf.RoundToInt(localConfidence * 100f)}% confidence). Try again.";
+                    else if (normalizedMatch)
+                        retryMsg = $"Not quite yet ({Mathf.RoundToInt(primaryConfidence * 100f)}% confidence). Try again.";
+                    else
+                        retryMsg = $"Remote saw '{(string.IsNullOrEmpty(gotRaw) ? "?" : gotRaw)}'. Try '{targetLetter}' again.";
+                }
+                else if (usedLocal)
+                {
+                    if (!hasWriting)
+                        retryMsg = "No writing detected. Try again.";
+                    else if (normalizedMatch)
+                        retryMsg = $"Not quite yet ({Mathf.RoundToInt(primaryConfidence * 100f)}% confidence). Try again.";
                     else
                         retryMsg = $"Local saw '{(string.IsNullOrEmpty(gotRaw) ? "?" : gotRaw)}'. Try '{targetLetter}' again.";
                 }
@@ -764,7 +933,7 @@ public class DictationManager : MonoBehaviour
             else
             {
                 // Second mistake: replay with stroke filling + pops, then move on
-                if (usedLocal && !localHasWriting)
+                if ((usedRemote || usedLocal) && !hasWriting)
                     SetFeedback("No writing detected. Watch the demo and try again.");
                 else
                     SetFeedback($"Watch the demo of '{targetLetter}'...");
@@ -781,10 +950,21 @@ public class DictationManager : MonoBehaviour
 
     private IEnumerator AutoGradeRoutine()
     {
-        if (!autoGradeOnIdle || !ShouldUseLocalGrading || localClassifier == null || !localClassifier.HasModelAsset)
+        if (!autoGradeOnIdle)
         {
             _autoGradeRunning = false;
             _autoGradeTriggeredForStroke = false;
+            yield break;
+        }
+
+        bool canRemote = ShouldUseRemoteGrading;
+        bool canLocal = ShouldUseLocalGrading && localClassifier != null && localClassifier.HasModelAsset;
+
+        if (!canRemote && !canLocal)
+        {
+            _autoGradeRunning = false;
+            _autoGradeTriggeredForStroke = false;
+            _lastStrokeChangeTime = Time.time;
             yield break;
         }
 
@@ -806,10 +986,63 @@ public class DictationManager : MonoBehaviour
             yield break;
         }
 
-        LetterPrediction prediction = null;
+        if (canRemote)
+        {
+            LetterPrediction remotePrediction = null;
+            bool received = false;
+            yield return StartCoroutine(RemotePredictTop3(snap, p =>
+            {
+                remotePrediction = p;
+                received = true;
+            }));
+
+            Destroy(snap);
+
+            if (!received || remotePrediction == null)
+            {
+                _autoGradeRunning = false;
+                _autoGradeTriggeredForStroke = false;
+                _lastStrokeChangeTime = Time.time;
+                yield break;
+            }
+
+            string expectedRemote = NormalizeAsciiStrict(lvl != null ? lvl.currentLetter : null);
+            var remoteEval = EvaluateLocalPrediction(remotePrediction, expectedRemote);
+
+            DebugCodepoint("[Auto][Remote] RAW", remotePrediction.TopLetter ?? string.Empty);
+            Debug.Log($"[Dictation][AutoGrade] REMOTE top1='{remoteEval.Top1Normalized}' expected='{expectedRemote}' conf={remoteEval.Top1Confidence:F3} hasWriting={remoteEval.HasWriting} strokes={_lastObservedStrokeTotal}");
+
+            float requiredRemoteConfidence = Mathf.Max(autoGradeMinimumConfidence, remoteConfidenceThreshold);
+            bool remoteEligible = remoteEval.Top1Match && remoteEval.Top1Confidence >= requiredRemoteConfidence && remoteEval.HasWriting;
+
+            if (remoteEligible)
+            {
+                state = State.GradedAccept;
+                UpdateUI();
+                OnDictationGraded?.Invoke(100f);
+                OnLetterCorrect?.Invoke();
+
+                string display = string.IsNullOrEmpty(remotePrediction.TopLetter) ? expectedRemote : remotePrediction.TopLetter;
+                SetFeedback($"Great! ('{display}' @ {Mathf.RoundToInt(remoteEval.Top1Confidence * 100f)}%)");
+                ClearBoardVisuals();
+                yield return new WaitForSeconds(waitAfterCorrect);
+                Advance();
+            }
+            else
+            {
+                _lastStrokeChangeTime = Time.time;
+                _autoGradeTriggeredForStroke = false;
+            }
+
+            _autoGradeRunning = false;
+            yield break;
+        }
+
+        // Local Sentis fallback
+        LetterPrediction localPrediction = null;
         try
         {
-            prediction = localClassifier.Predict(snap);
+            localPrediction = localClassifier.Predict(snap);
         }
         catch (Exception ex)
         {
@@ -818,7 +1051,7 @@ public class DictationManager : MonoBehaviour
 
         Destroy(snap);
 
-        if (prediction == null)
+        if (localPrediction == null)
         {
             _autoGradeRunning = false;
             _autoGradeTriggeredForStroke = false;
@@ -834,24 +1067,24 @@ public class DictationManager : MonoBehaviour
             yield break;
         }
 
-        string expected = NormalizeAsciiStrict(lvl != null ? lvl.currentLetter : null);
-        var eval = EvaluateLocalPrediction(prediction, expected);
+        string expectedLocal = NormalizeAsciiStrict(lvl != null ? lvl.currentLetter : null);
+        var localEval = EvaluateLocalPrediction(localPrediction, expectedLocal);
 
-        DebugCodepoint("[Auto][Local] RAW", eval.Raw);
-        Debug.Log($"[Dictation][AutoGrade] top1='{eval.Top1Normalized}' top1Conf={eval.Top1Confidence:F3} matched='{eval.Normalized}' expected='{expected}' hasWriting={eval.HasWriting} strokes={_lastObservedStrokeTotal}");
+        DebugCodepoint("[Auto][Local] RAW", localEval.Raw);
+        Debug.Log($"[Dictation][AutoGrade] LOCAL top1='{localEval.Top1Normalized}' expected='{expectedLocal}' conf={localEval.Top1Confidence:F3} hasWriting={localEval.HasWriting}");
 
-        float requiredConfidence = Mathf.Max(autoGradeMinimumConfidence, localConfidenceThreshold);
-        bool autoEligible = eval.Top1Match && eval.Top1Confidence >= requiredConfidence && eval.HasWriting;
+        float requiredLocalConfidence = Mathf.Max(autoGradeMinimumConfidence, localConfidenceThreshold);
+        bool localEligible = localEval.Top1Match && localEval.Top1Confidence >= requiredLocalConfidence && localEval.HasWriting;
 
-        if (autoEligible)
+        if (localEligible)
         {
             state = State.GradedAccept;
             UpdateUI();
             OnDictationGraded?.Invoke(100f);
             OnLetterCorrect?.Invoke();
 
-            string display = string.IsNullOrEmpty(eval.Raw) ? expected : eval.Raw;
-            SetFeedback($"Great! ('{display}' @ {Mathf.RoundToInt(eval.Top1Confidence * 100f)}%)");
+            string display = string.IsNullOrEmpty(localEval.Raw) ? expectedLocal : localEval.Raw;
+            SetFeedback($"Great! ('{display}' @ {Mathf.RoundToInt(localEval.Top1Confidence * 100f)}%)");
             ClearBoardVisuals();
             yield return new WaitForSeconds(waitAfterCorrect);
             Advance();
