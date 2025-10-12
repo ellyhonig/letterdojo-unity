@@ -84,7 +84,7 @@ public class DictationManager : MonoBehaviour
     [Header("Auto Grading")]
     [SerializeField] private bool autoGradeOnIdle = true;
     [SerializeField, Range(0.1f, 2f)] private float autoGradeIdleSeconds = 0.7f;
-    [SerializeField, Range(0f, 1f)] private float autoGradeMinimumConfidence = 0.9f;
+    [SerializeField, Range(0f, 1f)] private float autoGradeMinimumConfidence = 0.5f;
 
     [Header("Guide Lines (optional visuals)")]
     public Transform skyLine, planeLine, groundLine;
@@ -567,6 +567,64 @@ public class DictationManager : MonoBehaviour
         public int MatchRank;
     }
 
+    private bool TryResolveRemoteOutcome(LetterPrediction prediction, string expectedNormalized, out string chosenRaw,
+        out string chosenNormalized, out float chosenConfidence, out bool hasWriting, out bool highConfidenceRemoteWrong, out bool topMatch)
+    {
+        chosenRaw = string.Empty;
+        chosenNormalized = string.Empty;
+        chosenConfidence = 0f;
+        highConfidenceRemoteWrong = false;
+        topMatch = false;
+
+        var eval = EvaluateLocalPrediction(prediction, expectedNormalized);
+
+        hasWriting = eval.HasWriting;
+
+        int matchRank = eval.MatchRank;
+        bool hasMatch = matchRank >= 0;
+        bool matchCorrect = hasMatch && eval.Normalized == expectedNormalized;
+        float matchConfidence = eval.Confidence;
+        string matchRaw = hasMatch ? eval.Raw : string.Empty;
+        string matchNormalized = hasMatch ? eval.Normalized : string.Empty;
+
+        string topRaw = prediction.TopLetter ?? string.Empty;
+        string topNormalized = NormalizeAsciiStrict(topRaw);
+        bool topCorrect = eval.Top1Match && topNormalized == expectedNormalized;
+        float topConfidence = eval.Top1Confidence;
+
+        float requiredTopConfidence = Mathf.Max(autoGradeMinimumConfidence, remoteConfidenceThreshold);
+        float requiredSecondConfidence = Mathf.Max(autoGradeMinimumConfidence, remoteSecondRankConfidenceThreshold);
+
+        bool acceptTop1 = topCorrect && topConfidence >= requiredTopConfidence;
+        bool acceptTop2 = hasMatch && matchCorrect && matchRank <= 1 && matchConfidence >= requiredSecondConfidence;
+        bool forceWrong = !topCorrect && topConfidence >= remoteWrongConfidenceThreshold && matchRank < 0;
+
+        if (acceptTop2 && hasMatch && matchCorrect && matchRank <= 1)
+        {
+            chosenRaw = matchRaw;
+            chosenNormalized = matchNormalized;
+            chosenConfidence = matchConfidence;
+            topMatch = true;
+            return true;
+        }
+
+        if (acceptTop1)
+        {
+            chosenRaw = topRaw;
+            chosenNormalized = topNormalized;
+            chosenConfidence = topConfidence;
+            topMatch = true;
+            return true;
+        }
+
+        chosenRaw = topRaw;
+        chosenNormalized = topNormalized;
+        chosenConfidence = topConfidence;
+        highConfidenceRemoteWrong = forceWrong;
+        topMatch = topCorrect;
+        return false;
+    }
+
     private LocalEvaluation EvaluateLocalPrediction(LetterPrediction prediction, string expectedNormalized)
     {
         var result = new LocalEvaluation
@@ -844,61 +902,20 @@ public class DictationManager : MonoBehaviour
         float primaryConfidence = 0f;
         bool hasWriting = true;
         bool normalizedMatch = false;
-
-        bool highConfidenceWrong = false;
+        bool highConfidenceRemoteWrong = false;
 
         if (usedRemote)
         {
             LetterPrediction prediction = remotePrediction ?? LetterPrediction.NoWriting;
-            var eval = EvaluateLocalPrediction(prediction, expected);
+            bool topMatch;
+            bool accepted = TryResolveRemoteOutcome(prediction, expected, out gotRaw, out gotNormalized,
+                out primaryConfidence, out hasWriting, out highConfidenceRemoteWrong, out topMatch);
 
-            hasWriting = eval.HasWriting;
-
-            int matchRank = eval.MatchRank;
-            bool hasMatch = matchRank >= 0;
-            bool matchCorrect = hasMatch && eval.Normalized == expected;
-            float matchConfidence = eval.Confidence;
-            string matchRaw = hasMatch ? eval.Raw : string.Empty;
-            string matchNormalized = hasMatch ? eval.Normalized : string.Empty;
-
-            string topRaw = prediction.TopLetter ?? string.Empty;
-            string topNormalized = NormalizeAsciiStrict(topRaw);
-            bool topCorrect = eval.Top1Match && topNormalized == expected;
-            float topConfidence = eval.Top1Confidence;
-
-            bool acceptedTop1 = topCorrect && topConfidence >= remoteConfidenceThreshold;
-            bool acceptedTop2 = hasMatch && matchCorrect && matchRank <= 1 && matchConfidence >= remoteSecondRankConfidenceThreshold;
-            bool forceWrong = !topCorrect && topConfidence >= remoteWrongConfidenceThreshold && matchRank < 0;
-
-            if (acceptedTop1 || acceptedTop2)
-            {
-                correct = true;
-                if (acceptedTop2 && hasMatch && matchCorrect && matchRank <= 1)
-                {
-                    gotRaw = matchRaw;
-                    gotNormalized = matchNormalized;
-                    primaryConfidence = matchConfidence;
-                }
-                else
-                {
-                    gotRaw = topRaw;
-                    gotNormalized = topNormalized;
-                    primaryConfidence = topConfidence;
-                }
-                normalizedMatch = true;
-            }
-            else
-            {
-                correct = false;
-                gotRaw = topRaw;
-                gotNormalized = topNormalized;
-                primaryConfidence = topConfidence;
-                normalizedMatch = topCorrect;
-                highConfidenceWrong = forceWrong;
-            }
+            correct = accepted;
+            normalizedMatch = topMatch;
 
             DebugCodepoint("[Remote] RAW", gotRaw);
-            Debug.Log($"[Remote] NORMALIZED top1='{topNormalized}' expected='{expected}' confTop1={topConfidence:F3} matchRank={matchRank} matchConf={matchConfidence:F3} hasWriting={hasWriting}");
+            Debug.Log($"[Remote] NORMALIZED got='{gotNormalized}' expected='{expected}' conf={primaryConfidence:F3} accepted={accepted} highWrong={highConfidenceRemoteWrong} hasWriting={hasWriting}");
         }
         else if (usedLocal)
         {
@@ -957,7 +974,7 @@ public class DictationManager : MonoBehaviour
                         retryMsg = "No writing detected. Try again.";
                     else if (normalizedMatch)
                         retryMsg = $"Not quite yet ({Mathf.RoundToInt(primaryConfidence * 100f)}% confidence). Try again.";
-                    else if (highConfidenceWrong)
+                    else if (highConfidenceRemoteWrong)
                         retryMsg = $"Remote is very confident it's '{(string.IsNullOrEmpty(gotRaw) ? "?" : gotRaw)}' ({Mathf.RoundToInt(primaryConfidence * 100f)}%). Watch the demo and retry.";
                     else
                         retryMsg = $"Remote saw '{(string.IsNullOrEmpty(gotRaw) ? "?" : gotRaw)}'. Try '{targetLetter}' again.";
@@ -1061,23 +1078,62 @@ public class DictationManager : MonoBehaviour
             string expectedRemote = NormalizeAsciiStrict(lvl != null ? lvl.currentLetter : null);
             var remoteEval = EvaluateLocalPrediction(remotePrediction, expectedRemote);
 
+            bool topCorrect = remoteEval.Top1Match && remoteEval.Top1Normalized == expectedRemote;
+            float topConfidence = remoteEval.Top1Confidence;
+            int matchRank = remoteEval.MatchRank;
+            bool hasMatch = matchRank >= 0;
+            bool matchCorrect = hasMatch && remoteEval.Normalized == expectedRemote;
+            float matchConfidence = remoteEval.Confidence;
+
+            float requiredTopConfidence = Mathf.Max(autoGradeMinimumConfidence, remoteConfidenceThreshold);
+            float requiredSecondConfidence = Mathf.Max(autoGradeMinimumConfidence, remoteSecondRankConfidenceThreshold);
+
+            bool acceptTop1 = topCorrect && topConfidence >= requiredTopConfidence;
+            bool acceptTop2 = hasMatch && matchCorrect && matchRank <= 1 && matchConfidence >= requiredSecondConfidence;
+            bool forceWrong = !topCorrect && topConfidence >= remoteWrongConfidenceThreshold && matchRank < 0;
+
             DebugCodepoint("[Auto][Remote] RAW", remotePrediction.TopLetter ?? string.Empty);
-            Debug.Log($"[Dictation][AutoGrade] REMOTE top1='{remoteEval.Top1Normalized}' expected='{expectedRemote}' conf={remoteEval.Top1Confidence:F3} hasWriting={remoteEval.HasWriting} strokes={_lastObservedStrokeTotal}");
+            Debug.Log($"[Dictation][AutoGrade] REMOTE top1='{remoteEval.Top1Normalized}' expected='{expectedRemote}' confTop1={topConfidence:F3} matchRank={matchRank} matchConf={matchConfidence:F3} strokes={_lastObservedStrokeTotal}");
 
-            float requiredRemoteConfidence = Mathf.Max(autoGradeMinimumConfidence, remoteConfidenceThreshold);
-            bool remoteEligible = remoteEval.Top1Match && remoteEval.Top1Confidence >= requiredRemoteConfidence && remoteEval.HasWriting;
-
-            if (remoteEligible)
+            if (acceptTop1 || acceptTop2)
             {
                 state = State.GradedAccept;
                 UpdateUI();
                 OnDictationGraded?.Invoke(100f);
                 OnLetterCorrect?.Invoke();
 
-                string display = string.IsNullOrEmpty(remotePrediction.TopLetter) ? expectedRemote : remotePrediction.TopLetter;
-                SetFeedback($"Great! ('{display}' @ {Mathf.RoundToInt(remoteEval.Top1Confidence * 100f)}%)");
+                string display;
+                float displayConfidence;
+                if (acceptTop2 && hasMatch && matchCorrect && matchRank <= 1)
+                {
+                    display = string.IsNullOrEmpty(remoteEval.Raw) ? expectedRemote : remoteEval.Raw;
+                    displayConfidence = matchConfidence;
+                }
+                else
+                {
+                    display = string.IsNullOrEmpty(remotePrediction.TopLetter) ? expectedRemote : remotePrediction.TopLetter;
+                    displayConfidence = topConfidence;
+                }
+
+                SetFeedback($"Great! ('{display}' @ {Mathf.RoundToInt(displayConfidence * 100f)}%)");
                 ClearBoardVisuals();
                 yield return new WaitForSeconds(waitAfterCorrect);
+                Advance();
+            }
+            else if (forceWrong)
+            {
+                state = State.GradedReject;
+                UpdateUI();
+                OnDictationGraded?.Invoke(0f);
+                OnLetterIncorrect?.Invoke();
+                string display = string.IsNullOrEmpty(remotePrediction.TopLetter) ? "?" : remotePrediction.TopLetter;
+                SetFeedback($"Remote is very confident it's '{display}' ({Mathf.RoundToInt(topConfidence * 100f)}%). Watch the demo and retry.");
+                ClearBoardVisuals();
+                yield return new WaitForSeconds(waitBeforeRef);
+                yield return ReplayReference();
+                SetFeedback("Your turn!");
+                yield return new WaitForSeconds(waitAfterReplay);
+                attemptCount = 2;
                 Advance();
             }
             else
