@@ -1,9 +1,10 @@
 import io
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import torch
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from PIL import Image, UnidentifiedImageError
@@ -13,9 +14,15 @@ from app.model_utils import LETTER_CLASSES, load_model, predict
 BASE_DIR = Path(__file__).resolve().parent.parent
 MODEL_PATH = BASE_DIR / 'models' / 'letter_cnn.pt'
 TEMPLATES_DIR = BASE_DIR / 'templates'
+API_KEY = os.environ.get('HANDWRITING_API_KEY')
 
 app = FastAPI(title='Handwriting Letter Endpoint')
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+
+
+def require_api_key(x_api_key: str = Header(default=None)) -> None:
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail='Invalid or missing API key')
 
 
 @app.on_event('startup')
@@ -50,7 +57,7 @@ async def _run_inference(file: UploadFile) -> Tuple[Dict[str, float], List[Tuple
     return probabilities, sorted_predictions
 
 
-@app.post('/predict')
+@app.post('/predict', dependencies=[Depends(require_api_key)])
 async def predict_endpoint(file: UploadFile = File(...)) -> Dict[str, Any]:
     probabilities, sorted_predictions = await _run_inference(file)
     top_letter, top_confidence = sorted_predictions[0]
@@ -66,7 +73,7 @@ async def predict_endpoint(file: UploadFile = File(...)) -> Dict[str, Any]:
     }
 
 
-@app.post('/predict/top3')
+@app.post('/predict/top3', dependencies=[Depends(require_api_key)])
 async def predict_top3_endpoint(file: UploadFile = File(...)) -> Dict[str, Any]:
     _, sorted_predictions = await _run_inference(file)
     top_predictions = [

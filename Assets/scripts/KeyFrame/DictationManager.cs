@@ -74,7 +74,8 @@ public class DictationManager : MonoBehaviour
 
     [Header("Remote Classifier")]
     [SerializeField] private bool useRemoteClassifier = true;
-    [SerializeField] private string remoteClassifierBaseUrl = "http://127.0.0.1:8000";
+    [SerializeField] private string remoteClassifierBaseUrl = "http://108.46.76.56:8080";
+    [SerializeField] private string remoteApiKey = "super-secret-key";
     [SerializeField, Range(0f, 1f)] private float remoteConfidenceThreshold = 0.9f;
     [SerializeField, Range(1f, 60f)] private float remoteRequestTimeoutSeconds = 10f;
 
@@ -689,6 +690,8 @@ public class DictationManager : MonoBehaviour
         using (var req = UnityWebRequest.Post(url, form))
         {
             req.timeout = Mathf.Clamp(Mathf.RoundToInt(remoteRequestTimeoutSeconds), 1, 120);
+            if (!string.IsNullOrWhiteSpace(remoteApiKey))
+                req.SetRequestHeader("x-api-key", remoteApiKey);
             yield return req.SendWebRequest();
 
             if (req.result != UnityWebRequest.Result.Success)

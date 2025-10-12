@@ -1,48 +1,73 @@
 # Remote Handwriting Endpoint
 
-This folder contains a self-contained copy of the desktop handwriting classifier
-that powers the on-device experiments. Run it on your PC and point the Quest
-client at it to get the “perfect endpoint” results.
+This directory contains the “perfect endpoint” classifier. Run it on your PC (or
+host it on a VM) and point the Quest client at it for remote grading.
 
 ## Prerequisites
 
-- Python 3.10+ on the host machine
-- (Optional but recommended) a virtual environment so packages do not leak into
-  the system Python
+- Python 3.10+ installed
+- (Optional) a virtual environment so dependencies stay isolated
 
 ## Setup
 
 ```powershell
 cd remote_handwriting_endpoint
-# Optional: create / activate a venv
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+python -m venv .venv         # optional
+.\.venv\Scripts\Activate.ps1 # only if you created the venv
 
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-## Running the server
+## Launching the server
+
+Use the included script so you can supply an API key:
 
 ```powershell
-# From remote_handwriting_endpoint (and with the venv activated if you use one)
-python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+.\run_server.ps1 -Host 0.0.0.0 -Port 8000 -ApiKey "super-secret-key"
 ```
 
-This exposes two FastAPI endpoints:
+If you omit `-ApiKey`, the endpoint accepts unauthenticated requests—fine for
+localhost, but not recommended once you expose it beyond your machine.
+
+This exposes two FastAPI routes:
 
 - `POST /predict` – full probability dictionary
-- `POST /predict/top3` – top three predictions (used by Unity)
+- `POST /predict/top3` – top three predictions (Unity uses this)
 
-Both expect a multipart form field named `file` containing a PNG (or JPG).
+Both expect a multipart form field named `file` with a PNG or JPG. When an API
+key is set, clients must include an `x-api-key` header.
 
-## Quick test (PowerShell / curl)
+## Quick local test
 
 ```powershell
 $png = "$env:USERPROFILE\Downloads\d.png"
-curl -X POST http://127.0.0.1:8000/predict/top3 -F "file=@$png"
+curl -H "x-api-key: super-secret-key" `
+     -X POST http://127.0.0.1:8000/predict/top3 `
+     -F "file=@$png"
 ```
 
-You should see a JSON payload with the top guesses. The Unity client now points
-at `http://127.0.0.1:8000` by default; change the serialized `remoteClassifierBaseUrl`
-in `DictationManager` if you host it elsewhere or want a different port.
+Replace the API key string with whatever you passed to `run_server.ps1`.
+
+## Making it reachable from the Quest/off-network
+
+1. **Static LAN IP** – reserve one for this PC on your router.
+2. **Windows firewall** – allow inbound TCP on the chosen port (e.g. 8000).
+3. **Router port forwarding** – forward an external port (e.g. 8080) to
+   `<LAN_IP>:8000`.
+4. **Dynamic DNS** – optional but useful if your public IP changes.
+5. **TLS / reverse proxy** – wrap behind IIS/Nginx or use a tunnel (Cloudflare,
+   Tailscale, WireGuard) before exposing it broadly.
+
+## Unity configuration
+
+In `DictationManager`:
+
+- `Use Remote Classifier` = true
+- `Remote Classifier Base Url` = `http://<public-host>:<port>` (or your DNS name)
+- `Remote API Key` = the same string passed to the server
+- (Optional) disable the local Sentis toggle if you want remote-only grading
+
+Rebuild/deploy to Quest. The Quest will now POST to your remote server when the
+user idles after drawing. Watch the server console (`run_server.ps1`) to confirm
+requests are coming through.
