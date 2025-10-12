@@ -76,7 +76,9 @@ public class DictationManager : MonoBehaviour
     [SerializeField] private bool useRemoteClassifier = true;
     [SerializeField] private string remoteClassifierBaseUrl = "http://108.46.76.56:8080";
     [SerializeField] private string remoteApiKey = "super-secret-key";
-    [SerializeField, Range(0f, 1f)] private float remoteConfidenceThreshold = 0.9f;
+    [SerializeField, Range(0f, 1f)] private float remoteConfidenceThreshold = 0.6f;
+    [SerializeField, Range(0f, 1f)] private float remoteSecondRankConfidenceThreshold = 0.4f;
+    [SerializeField, Range(0f, 1f)] private float remoteWrongConfidenceThreshold = 0.9f;
     [SerializeField, Range(1f, 60f)] private float remoteRequestTimeoutSeconds = 10f;
 
     [Header("Auto Grading")]
@@ -562,6 +564,7 @@ public class DictationManager : MonoBehaviour
         public bool Top1Match;
         public string Top1Normalized;
         public float Top1Confidence;
+        public int MatchRank;
     }
 
     private LocalEvaluation EvaluateLocalPrediction(LetterPrediction prediction, string expectedNormalized)
@@ -578,7 +581,8 @@ public class DictationManager : MonoBehaviour
             IsSuccess = false,
             Top1Match = false,
             Top1Normalized = string.Empty,
-            Top1Confidence = 0f
+            Top1Confidence = 0f,
+            MatchRank = -1
         };
 
         if (prediction == null)
@@ -593,6 +597,7 @@ public class DictationManager : MonoBehaviour
         float matchedConfidence = topConfidence;
         string matchedNormalized = topNormalized;
         bool inTopThreeMatch = top1Match;
+        int matchRank = top1Match ? 0 : -1;
 
         if (!top1Match && prediction.Ranked != null)
         {
@@ -607,6 +612,7 @@ public class DictationManager : MonoBehaviour
                     matchedConfidence = candidate.probability;
                     matchedNormalized = candidateNorm;
                     inTopThreeMatch = true;
+                    matchRank = i;
                     break;
                 }
             }
@@ -627,6 +633,7 @@ public class DictationManager : MonoBehaviour
         result.Top1Match = top1Match;
         result.Top1Normalized = topNormalized ?? string.Empty;
         result.Top1Confidence = topConfidence;
+        result.MatchRank = matchRank;
         return result;
     }
 
@@ -838,20 +845,60 @@ public class DictationManager : MonoBehaviour
         bool hasWriting = true;
         bool normalizedMatch = false;
 
+        bool highConfidenceWrong = false;
+
         if (usedRemote)
         {
             LetterPrediction prediction = remotePrediction ?? LetterPrediction.NoWriting;
             var eval = EvaluateLocalPrediction(prediction, expected);
 
             hasWriting = eval.HasWriting;
-            primaryConfidence = eval.Top1Confidence;
-            gotRaw = prediction.TopLetter ?? string.Empty;
-            gotNormalized = NormalizeAsciiStrict(gotRaw);
-            normalizedMatch = eval.Top1Match;
-            correct = eval.Top1Match && eval.Top1Confidence >= remoteConfidenceThreshold && eval.Top1Normalized == expected;
+
+            int matchRank = eval.MatchRank;
+            bool hasMatch = matchRank >= 0;
+            bool matchCorrect = hasMatch && eval.Normalized == expected;
+            float matchConfidence = eval.Confidence;
+            string matchRaw = hasMatch ? eval.Raw : string.Empty;
+            string matchNormalized = hasMatch ? eval.Normalized : string.Empty;
+
+            string topRaw = prediction.TopLetter ?? string.Empty;
+            string topNormalized = NormalizeAsciiStrict(topRaw);
+            bool topCorrect = eval.Top1Match && topNormalized == expected;
+            float topConfidence = eval.Top1Confidence;
+
+            bool acceptedTop1 = topCorrect && topConfidence >= remoteConfidenceThreshold;
+            bool acceptedTop2 = hasMatch && matchCorrect && matchRank <= 1 && matchConfidence >= remoteSecondRankConfidenceThreshold;
+            bool forceWrong = !topCorrect && topConfidence >= remoteWrongConfidenceThreshold && matchRank < 0;
+
+            if (acceptedTop1 || acceptedTop2)
+            {
+                correct = true;
+                if (acceptedTop2 && hasMatch && matchCorrect && matchRank <= 1)
+                {
+                    gotRaw = matchRaw;
+                    gotNormalized = matchNormalized;
+                    primaryConfidence = matchConfidence;
+                }
+                else
+                {
+                    gotRaw = topRaw;
+                    gotNormalized = topNormalized;
+                    primaryConfidence = topConfidence;
+                }
+                normalizedMatch = true;
+            }
+            else
+            {
+                correct = false;
+                gotRaw = topRaw;
+                gotNormalized = topNormalized;
+                primaryConfidence = topConfidence;
+                normalizedMatch = topCorrect;
+                highConfidenceWrong = forceWrong;
+            }
 
             DebugCodepoint("[Remote] RAW", gotRaw);
-            Debug.Log($"[Remote] NORMALIZED top1='{gotNormalized}' expected='{expected}' conf={primaryConfidence:F3} hasWriting={hasWriting}");
+            Debug.Log($"[Remote] NORMALIZED top1='{topNormalized}' expected='{expected}' confTop1={topConfidence:F3} matchRank={matchRank} matchConf={matchConfidence:F3} hasWriting={hasWriting}");
         }
         else if (usedLocal)
         {
@@ -910,6 +957,8 @@ public class DictationManager : MonoBehaviour
                         retryMsg = "No writing detected. Try again.";
                     else if (normalizedMatch)
                         retryMsg = $"Not quite yet ({Mathf.RoundToInt(primaryConfidence * 100f)}% confidence). Try again.";
+                    else if (highConfidenceWrong)
+                        retryMsg = $"Remote is very confident it's '{(string.IsNullOrEmpty(gotRaw) ? "?" : gotRaw)}' ({Mathf.RoundToInt(primaryConfidence * 100f)}%). Watch the demo and retry.";
                     else
                         retryMsg = $"Remote saw '{(string.IsNullOrEmpty(gotRaw) ? "?" : gotRaw)}'. Try '{targetLetter}' again.";
                 }
