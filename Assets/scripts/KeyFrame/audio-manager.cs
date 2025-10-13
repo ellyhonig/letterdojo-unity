@@ -240,6 +240,11 @@ public class AudioManager : MonoBehaviour
 
     private void OnDictationStart_Char(char letter) => PlayLetterClip(letter);
 
+    public void PlayCurrentLetterPronunciation()
+    {
+        OnDictationStart_NoArgs();
+    }
+
     private void PlayLetterClip(char letter)
     {
         var clip = GetClipForLetter(letter);
@@ -271,7 +276,7 @@ public class AudioManager : MonoBehaviour
     {
         if (obj == null) return null;
 
-        // Try common field/property names youâ€™ve used before
+        // Try common field/property names youGÇÖve used before
         string[] candidates = {
             "currentSound","CurrentSound",
             "currentLetter","CurrentLetter",
