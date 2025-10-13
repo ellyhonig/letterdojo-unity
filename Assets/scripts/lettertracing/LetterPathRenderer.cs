@@ -244,6 +244,23 @@ public class LetterPathRenderer : MonoBehaviour
         SetVisualizationVisible(false);
     }
 
+    [ContextMenu("Regenerate Anchors")]
+    public void RegenerateAnchors()
+    {
+        if (string.IsNullOrWhiteSpace(letterId))
+        {
+            Debug.LogWarning("[LetterPathRenderer] Cannot regenerate anchors because letterId is empty.", this);
+            return;
+        }
+
+        Debug.Log("[LetterPathRenderer] Regenerating anchors for '" + letterId + "'.", this);
+
+        ClearActive();
+        RenderLetter(letterId);
+        SetVisualizationVisible(true);
+        SetStrokeLinesVisible(true);
+    }
+
     public void SetStrokeLinesVisible(bool visible)
     {
         for (int i = 0; i < activeLines.Count; i++)
@@ -660,27 +677,100 @@ QuantizeFactor));
             return cached;
         }
 
+        Stroke[] resolved = Array.Empty<Stroke>();
         string resourcePath = ResourcePrefix + normalized;
         TextAsset asset = Resources.Load<TextAsset>(resourcePath);
-        if (asset == null)
+
+        if (asset != null)
         {
-            Debug.LogWarning($"LetterPathRenderer: Missing letter data asset at Resources/{resourcePath}");
-            Cache[normalized] = Array.Empty<Stroke>();
-            return Cache[normalized];
+            try
+            {
+                resolved = ParseLetterJson(asset.text) ?? Array.Empty<Stroke>();
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"LetterPathRenderer: Failed to parse letter {normalized}: {ex.Message}");
+                resolved = Array.Empty<Stroke>();
+            }
+        }
+
+        if (resolved.Length == 0)
+        {
+            Stroke[] fallback = LoadFromSimpleRecording(normalized);
+            if (fallback.Length > 0)
+            {
+                Debug.Log("LetterPathRenderer: Using simple recording fallback for '" + normalized + "' with " + fallback.Length + " stroke(s).");
+                resolved = fallback;
+            }
+            else if (asset == null)
+            {
+                Debug.LogWarning($"LetterPathRenderer: No 2D or simple recording data found for letter '{normalized}'.");
+            }
+        }
+
+        Cache[normalized] = resolved;
+        return resolved;
+    }
+
+    private Stroke[] LoadFromSimpleRecording(string normalized)
+    {
+        string resourcePath = $"letter3Dpathdata/simple_recording_{normalized.ToUpperInvariant()}";
+        TextAsset asset = Resources.Load<TextAsset>(resourcePath);
+        if (asset == null || string.IsNullOrWhiteSpace(asset.text))
+        {
+            return Array.Empty<Stroke>();
         }
 
         try
         {
-            Stroke[] parsed = ParseLetterJson(asset.text);
-            Cache[normalized] = parsed ?? Array.Empty<Stroke>();
+            var record = JsonUtility.FromJson<SimpleRecordingDto>(asset.text);
+            if (record == null || record.frames == null || record.frames.Length < 2)
+            {
+                return Array.Empty<Stroke>();
+            }
+
+            Debug.Log("LetterPathRenderer: Loaded simple recording '" + normalized + "' frames=" + record.frames.Length);
+
+            Vector3 origin = Vector3.zero;
+            Quaternion rotation = Quaternion.identity;
+            if (record.canvasTransform != null)
+            {
+                origin = record.canvasTransform.position;
+                rotation = record.canvasTransform.rotation;
+            }
+
+            Vector3 right = rotation * Vector3.right;
+            Vector3 up = rotation * Vector3.up;
+
+            var segments = new Segment[record.frames.Length - 1];
+            for (int i = 1; i < record.frames.Length; i++)
+            {
+                Vector3 relPrev = record.frames[i - 1].position - origin;
+                Vector3 relCurr = record.frames[i].position - origin;
+
+                Vector2 a = new Vector2(Vector3.Dot(relPrev, right), Vector3.Dot(relPrev, up));
+                Vector2 b = new Vector2(Vector3.Dot(relCurr, right), Vector3.Dot(relCurr, up));
+                Vector2 ctrl = (a + b) * 0.5f;
+
+                segments[i - 1] = new Segment
+                {
+                    a = a,
+                    b = b,
+                    ctrl = ctrl
+                };
+            }
+
+            Debug.Log("LetterPathRenderer: simple recording generated " + segments.Length + " segments for letter '" + normalized + "'.");
+            var stroke = new Stroke { segments = segments };
+            var strokes = new[] { stroke };
+            Normalize(strokes);
+            return strokes;
         }
         catch (Exception ex)
         {
-            Debug.LogError($"LetterPathRenderer: Failed to parse letter {normalized}: {ex.Message}");
-            Cache[normalized] = Array.Empty<Stroke>();
+            Debug.LogWarning($"LetterPathRenderer: Failed to parse simple recording fallback for '{normalized}': {ex.Message}");
+            return Array.Empty<Stroke>();
         }
-
-        return Cache[normalized];
     }
 
     private static Stroke[] ParseLetterJson(string json)
@@ -908,5 +998,26 @@ Shader.Find("Sprites/Default");
         }
 
         material = null;
+    }
+
+    [Serializable]
+    private class SimpleRecordingDto
+    {
+        public SimpleFrameDto[] frames;
+        public SimpleCanvasTransformDto canvasTransform;
+    }
+
+    [Serializable]
+    private class SimpleFrameDto
+    {
+        public Vector3 position;
+    }
+
+    [Serializable]
+    private class SimpleCanvasTransformDto
+    {
+        public Vector3 position;
+        public Quaternion rotation;
+        public Vector3 scale;
     }
 }

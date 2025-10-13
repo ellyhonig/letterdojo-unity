@@ -19,6 +19,7 @@ public class CanvasManager : MonoBehaviour
     [SerializeField] private int initialPoolSize = 2000;
     [SerializeField] private GameObject spherePrefab; // kept; not used to avoid asset dependency
     [SerializeField] private float enterThreshold = 0.01f;
+    [SerializeField] private bool useCanvasTraceDots = false;
 
 
     [Header("Motion Smoothener")]
@@ -86,6 +87,7 @@ public class CanvasManager : MonoBehaviour
     private List<GameObject> strokeSpheres = new List<GameObject>();
 
     private bool lastConstrainedVisual = false; // to avoid per-frame material writes
+    private bool pendingTraceRebuild = false;
 
     private void Start()
     {
@@ -95,6 +97,7 @@ public class CanvasManager : MonoBehaviour
     private void Initialize()
     {
         if (!levelManager) levelManager = GetComponent<LevelManager>();
+        if (levelManager) levelManager.OnGameModeChanged += HandleGameModeChanged;
         if (canvasPlane == null || recorder == null || recorder.playerToRecord == null)
         {
             Debug.LogError("CanvasManager: Missing required references!");
@@ -109,7 +112,7 @@ public class CanvasManager : MonoBehaviour
             recorder.OnRecordingStarted += StartProcessing;
             recorder.OnRecordingStopped += StopProcessing;
             recorder.OnRecordingStopped += currentRecordProcessor;
-            recorder.OnRecordingLoaded += CreateVisualizationForAllPoints;
+            recorder.OnRecordingLoaded += HandleRecordingLoaded;
             recorder.OnRecordingLoaded += UpdateCanvas; // keep behavior
         }
         else
@@ -128,6 +131,84 @@ public class CanvasManager : MonoBehaviour
         lastTargetRot = canvasPlane.transform.rotation;
 
         isInitialized = true;
+
+        if (IsTraceMode())
+        {
+            pendingTraceRebuild = true;
+            TrySpawnTraceDots("Initialize");
+        }
+    }
+
+    private void HandleRecordingLoaded()
+    {
+        Debug.Log("[CanvasManager] HandleRecordingLoaded");
+        pendingTraceRebuild = true;
+        TrySpawnTraceDots("RecordingLoaded");
+    }
+
+    private void HandleGameModeChanged(LevelManager.GameMode mode)
+    {
+        Debug.Log("[CanvasManager] HandleGameModeChanged -> " + mode);
+        if (mode == LevelManager.GameMode.TraceChecking)
+        {
+            pendingTraceRebuild = true;
+            TrySpawnTraceDots("ModeChangedToTrace");
+        }
+        else
+        {
+            ClearVisualization();
+            pendingTraceRebuild = false;
+        }
+    }
+
+    private bool IsTraceMode()
+    {
+        return levelManager != null && levelManager.currentMode == LevelManager.GameMode.TraceChecking;
+    }
+
+    private void TrySpawnTraceDots(string reason)
+    {
+        bool isTrace = IsTraceMode();
+        int frameCount = recorder?.currentRecord?.frames?.Count ?? -1;
+        Debug.Log("[CanvasManager] TrySpawnTraceDots reason=" + reason +
+                  ", isTrace=" + isTrace +
+                  ", frames=" + frameCount +
+                  ", local=" + (recorder?.currentRecord?.isLocalSpace ?? false) +
+                  ", pending=" + pendingTraceRebuild);
+
+        if (recorder == null || recorder.currentRecord == null || recorder.currentRecord.frames == null || recorder.currentRecord.frames.Count == 0)
+        {
+            if (recorder != null && levelManager != null && recorder.EnsureFallbackLoaded(levelManager.currentLetter, invokeLoaded: false))
+            {
+                frameCount = recorder.currentRecord.frames.Count;
+                Debug.Log($"[CanvasManager] Fallback recording loaded for {levelManager.currentLetter} (frames={frameCount})");
+            }
+        }
+
+        if (recorder == null || recorder.currentRecord == null || recorder.currentRecord.frames == null || recorder.currentRecord.frames.Count == 0)
+        {
+            pendingTraceRebuild = true;
+            Debug.Log($"[CanvasManager] Trace dots deferred (no frames) reason={reason}");
+            return;
+        }
+
+        if (!useCanvasTraceDots)
+        {
+            if (activeSpheres.Count > 0)
+                ClearVisualization();
+            pendingTraceRebuild = false;
+            return;
+        }
+
+        if (!isTrace)
+        {
+            pendingTraceRebuild = true;
+            return;
+        }
+
+        pendingTraceRebuild = false;
+        CreateVisualizationForAllPoints();
+        Debug.Log($"[CanvasManager] Spawned trace dots ({activeSpheres.Count}) reason={reason}");
     }
 
     public void currentRecordProcessor()
@@ -451,18 +532,27 @@ public class CanvasManager : MonoBehaviour
 
     public void CreateVisualizationForAllPoints()
     {
-        // Skip auto-creating reference spheres while in Dictation mode
-        if (levelManager != null && levelManager.currentMode == LevelManager.GameMode.Dictation)
+        if (!IsTraceMode())
+        {
+            ClearVisualization();
             return;
+        }
+
         ClearVisualization();
 
-        if (recorder.currentRecord != null && recorder.currentRecord.frames != null)
+        if (recorder != null && recorder.currentRecord != null && recorder.currentRecord.frames != null)
         {
+            bool treatLocal = recorder.currentRecord.isLocalSpace;
             foreach (var frame in recorder.currentRecord.frames)
             {
-                CreateVisualizationSphere(frame.position); // *** DO NOT TOUCH POSITION LOGIC ***
+                Vector3 world = (treatLocal && canvasPlane != null)
+                    ? canvasPlane.transform.TransformPoint(frame.position)
+                    : frame.position;
+                CreateVisualizationSphere(world); // *** DO NOT TOUCH POSITION LOGIC ***
             }
         }
+
+        Debug.Log("[CanvasManager] CreateVisualizationForAllPoints activeSpheres=" + activeSpheres.Count);
     }
 
     // Force-create spheres regardless of current mode (used by Dictation replay)
@@ -472,11 +562,16 @@ public class CanvasManager : MonoBehaviour
 
         if (recorder != null && recorder.currentRecord != null && recorder.currentRecord.frames != null)
         {
+            bool treatLocal = recorder.currentRecord.isLocalSpace;
             foreach (var frame in recorder.currentRecord.frames)
             {
-                CreateVisualizationSphere(frame.position); // keep identical behavior
+                Vector3 world = (treatLocal && canvasPlane != null)
+                    ? canvasPlane.transform.TransformPoint(frame.position)
+                    : frame.position;
+                CreateVisualizationSphere(world); // keep identical behavior
             }
         }
+
     }
 
     // Force-create spheres from frames interpreted as LOCAL positions (convert to world first)
@@ -494,6 +589,7 @@ public class CanvasManager : MonoBehaviour
                 : frame.position;
             CreateVisualizationSphere(world);
         }
+
     }
 
     // *** DO NOT TOUCH POSITION LOGIC ***
@@ -519,6 +615,11 @@ public class CanvasManager : MonoBehaviour
 
     public void ClearVisualization()
     {
+        if (activeSpheres.Count > 0)
+        {
+            Debug.Log("[CanvasManager] ClearVisualization releasing " + activeSpheres.Count + " spheres");
+        }
+
         foreach (var sphere in activeSpheres)
         {
             sphere.SetActive(false);
@@ -608,7 +709,19 @@ public class CanvasManager : MonoBehaviour
 
     private void OnDestroy()
     {
-        // Do NOT destroy canvasPlane (visualizationParent == canvasPlane).
-        // If you need cleanup, disable pooled children instead (already handled).
+        if (levelManager)
+            levelManager.OnGameModeChanged -= HandleGameModeChanged;
+
+        if (recorder != null)
+        {
+            recorder.OnRecordingStarted -= StartProcessing;
+            recorder.OnRecordingStopped -= StopProcessing;
+            recorder.OnRecordingStopped -= currentRecordProcessor;
+            recorder.OnRecordingLoaded -= HandleRecordingLoaded;
+            recorder.OnRecordingLoaded -= UpdateCanvas;
+        }
     }
 }
+
+
+

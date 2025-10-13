@@ -1,4 +1,5 @@
 using UnityEngine;
+using System;
 using System.Collections.Generic;
 using System.Reflection;
 
@@ -8,6 +9,7 @@ public class VisualEffectManager : MonoBehaviour, IMemoryBudgetConsumer
     [SerializeField] private SimpleRecorder recorder;
     [SerializeField] private CanvasManager canvasManager;
     [SerializeField] private LevelManager levelManager;
+    [SerializeField] private bool legacyMode = false;
 
     [Header("Parenting")]
     [Tooltip("Parent for visuals (use the board/canvas root that holds the spheres). If null, auto = activeSpheres[0].parent or canvasManager.transform.")]
@@ -46,7 +48,23 @@ public class VisualEffectManager : MonoBehaviour, IMemoryBudgetConsumer
 
     // change-detect caches
     private string _lastModeName = "";
+    private string _lastDrillName = "";
     private int _lastSpheresSig = 0;
+    private bool _dotsActive = true;
+    private bool tracingCallbacksHooked;
+    private bool recorderCallbacksHooked;
+    private int lastLoggedHitIndex = -1;
+
+    private void Awake()
+    {
+        if (!legacyMode)
+        {
+            enabled = false;
+            return;
+        }
+
+        EnsureCoreReferences();
+    }
 
     private Transform GetVisualsRoot()
     {
@@ -64,40 +82,160 @@ public class VisualEffectManager : MonoBehaviour, IMemoryBudgetConsumer
         return cachedRoot;
     }
 
-    private void Start()
+    private void EnsureCoreReferences()
     {
         if (!tracingSystem) tracingSystem = GetComponent<LetterTracingSystem>();
         if (!recorder)      recorder      = GetComponent<SimpleRecorder>();
         if (!canvasManager) canvasManager = GetComponent<CanvasManager>();
         if (!levelManager)  levelManager  = GetComponent<LevelManager>();
+    }
+
+    private void RegisterTracingCallbacks()
+    {
+        EnsureCoreReferences();
+        if (!tracingSystem)
+        {
+            Debug.LogWarning("[VisualEffectManager] Missing LetterTracingSystem; tracing visuals disabled.", this);
+            return;
+        }
+
+        if (tracingCallbacksHooked)
+        {
+            return;
+        }
 
         tracingSystem.OnTraceStarted    += InitializeVisuals;
         tracingSystem.OnKeyframeReached += UpdateVisuals;
         tracingSystem.OnTraceCompleted  += FinalizeVisuals;
+        tracingCallbacksHooked = true;
+        Debug.Log("[VisualEffectManager] Tracing callbacks registered.");
+    }
 
-        // New letter load → clear & maybe pre-draw
-        recorder.OnRecordingLoaded      += OnLetterReloaded;
+    private void RegisterRecorderCallbacks()
+    {
+        EnsureCoreReferences();
+        if (!recorder)
+        {
+            Debug.LogWarning("[VisualEffectManager] Missing SimpleRecorder; recorder callbacks not registered.", this);
+            return;
+        }
+
+        if (recorderCallbacksHooked)
+        {
+            return;
+        }
+
+        recorder.OnRecordingLoaded += OnLetterReloaded;
+        recorderCallbacksHooked = true;
+    }
+
+    private void UnregisterTracingCallbacks()
+    {
+        if (!tracingCallbacksHooked || !tracingSystem)
+        {
+            tracingCallbacksHooked = false;
+            return;
+        }
+
+        tracingSystem.OnTraceStarted    -= InitializeVisuals;
+        tracingSystem.OnKeyframeReached -= UpdateVisuals;
+        tracingSystem.OnTraceCompleted  -= FinalizeVisuals;
+        tracingCallbacksHooked = false;
+        Debug.Log("[VisualEffectManager] Tracing callbacks unregistered.");
+    }
+
+    private void UnregisterRecorderCallbacks()
+    {
+        if (!recorderCallbacksHooked || !recorder)
+        {
+            recorderCallbacksHooked = false;
+            return;
+        }
+
+        recorder.OnRecordingLoaded -= OnLetterReloaded;
+        recorderCallbacksHooked = false;
+    }
+
+    private void OnEnable()
+    {
+        if (!legacyMode)
+        {
+            return;
+        }
+
+        RegisterTracingCallbacks();
+        RegisterRecorderCallbacks();
 
         _lastModeName = GetModeName();
+        _lastDrillName = GetCurrentDrill();
         _lastSpheresSig = ComputeSpheresSignature();
-        MaybeBuildPhonemeSegments();
-        if (canvasManager && (canvasManager.activeSpheres == null || canvasManager.activeSpheres.Count == 0))
-            canvasManager.CreateVisualizationForAllPointsEvenInDictation();
+        UpdateReferenceDotsState(force: true);
+        if (_dotsActive)
+            MaybeBuildPhonemeSegments();
+        lastLoggedHitIndex = -1;
+    }
+
+    private void Start()
+    {
+        if (!legacyMode)
+        {
+            return;
+        }
+
+        EnsureCoreReferences();
+        RegisterTracingCallbacks();
+        RegisterRecorderCallbacks();
     }
 
     private void OnDisable()
     {
-        tracingSystem.OnTraceStarted    -= InitializeVisuals;
-        tracingSystem.OnKeyframeReached -= UpdateVisuals;
-        tracingSystem.OnTraceCompleted  -= FinalizeVisuals;
-        recorder.OnRecordingLoaded      -= OnLetterReloaded;
+        if (!legacyMode)
+        {
+            return;
+        }
+
+        UnregisterTracingCallbacks();
+        UnregisterRecorderCallbacks();
 
         ClearAllVisuals();
+        lastLoggedHitIndex = -1;
     }
 
     // ---- Trace lifecycle
     private void InitializeVisuals()
     {
+        if (!_dotsActive)
+        {
+            ClearAllVisuals();
+            return;
+        }
+
+        if (!canvasManager)
+        {
+            Debug.LogWarning("[VisualEffectManager] InitializeVisuals aborted - CanvasManager missing.", this);
+            return;
+        }
+
+        if (canvasManager.activeSpheres == null)
+        {
+            Debug.LogWarning("[VisualEffectManager] InitializeVisuals aborted - no active spheres list.", this);
+            return;
+        }
+
+        if (canvasManager.activeSpheres.Count == 0)
+        {
+            canvasManager.CreateVisualizationForAllPoints();
+        }
+
+        if (canvasManager.activeSpheres.Count == 0)
+        {
+            Debug.LogWarning("[VisualEffectManager] InitializeVisuals aborted - no spheres available after rebuild.", this);
+            return;
+        }
+
+        lastLoggedHitIndex = -1;
+        Debug.Log("[VisualEffectManager] InitializeVisuals with " + canvasManager.activeSpheres.Count + " spheres.");
+
         // do NOT clear cylinders here (we want them to persist)
         oneRunCreatedForIndex.Clear();
         lastHitSphere = null;
@@ -124,11 +262,32 @@ public class VisualEffectManager : MonoBehaviour, IMemoryBudgetConsumer
 
     private void UpdateVisuals()
     {
-        int hitIndex  = tracingSystem.CurrentKeyframeIndex;
+        if (!_dotsActive) return;
+
+        if (!canvasManager || canvasManager.activeSpheres == null || canvasManager.activeSpheres.Count == 0)
+        {
+            Debug.LogWarning("[VisualEffectManager] UpdateVisuals skipped - no active spheres.", this);
+            return;
+        }
+
+        int sphereCount = canvasManager.activeSpheres.Count;
+        int rawHitIndex = tracingSystem != null ? tracingSystem.CurrentKeyframeIndex : 0;
+        int hitIndex = Mathf.Clamp(rawHitIndex, 0, sphereCount - 1);
         int nextIndex = hitIndex + 1;
 
+        if (rawHitIndex != hitIndex)
+        {
+            Debug.LogWarning($"[VisualEffectManager] UpdateVisuals clamped keyframe index from {rawHitIndex} to {hitIndex} (spheres={sphereCount}).", this);
+        }
+
+        if (lastLoggedHitIndex != rawHitIndex)
+        {
+            Debug.Log($"[VisualEffectManager] UpdateVisuals processing keyframe {rawHitIndex} (clamped {hitIndex}) over {sphereCount} spheres.");
+            lastLoggedHitIndex = rawHitIndex;
+        }
+
         // TRACE mode behavior (unchanged): create segment only once when (hitIndex-1)->(hitIndex) is reached
-        if (hitIndex > 0 && !oneRunCreatedForIndex.Contains(hitIndex))
+        if (hitIndex > 0 && hitIndex < sphereCount && !oneRunCreatedForIndex.Contains(hitIndex))
         {
             var prev = canvasManager.activeSpheres[hitIndex - 1];
             var cur  = canvasManager.activeSpheres[hitIndex];
@@ -136,7 +295,7 @@ public class VisualEffectManager : MonoBehaviour, IMemoryBudgetConsumer
             oneRunCreatedForIndex.Add(hitIndex);
         }
 
-        for (int i = 0; i < canvasManager.activeSpheres.Count; i++)
+        for (int i = 0; i < sphereCount; i++)
         {
             var s = canvasManager.activeSpheres[i];
             if (i <= hitIndex)       SetSphereProps(s, hitColor,    normalScale);
@@ -144,11 +303,17 @@ public class VisualEffectManager : MonoBehaviour, IMemoryBudgetConsumer
             else                     SetSphereProps(s, unhitColor,  normalScale);
         }
 
-        lastHitSphere = canvasManager.activeSpheres[hitIndex];
+        if (hitIndex >= 0 && hitIndex < sphereCount)
+            lastHitSphere = canvasManager.activeSpheres[hitIndex];
     }
 
     private void FinalizeVisuals()
     {
+        if (!_dotsActive) return;
+
+        Debug.Log("[VisualEffectManager] FinalizeVisuals invoked.");
+        lastLoggedHitIndex = -1;
+
         // keep cylinders; only tidy ephemeral lines
         foreach (var s in canvasManager.activeSpheres)
             SetSphereProps(s, hitColor, normalScale);
@@ -159,17 +324,25 @@ public class VisualEffectManager : MonoBehaviour, IMemoryBudgetConsumer
 
     private void Update()
     {
-        // Detect mode or letter change without relying on specific LevelManager APIs
         string modeNow = GetModeName();
+        string drillNow = GetCurrentDrill();
         int sigNow = ComputeSpheresSignature();
-        if (modeNow != _lastModeName || sigNow != _lastSpheresSig)
+
+        if (modeNow != _lastModeName || drillNow != _lastDrillName || sigNow != _lastSpheresSig)
         {
             _lastModeName = modeNow;
+            _lastDrillName = drillNow;
             _lastSpheresSig = sigNow;
-            ClearAllVisuals();
-            MaybeBuildPhonemeSegments();
-            if (canvasManager && (canvasManager.activeSpheres == null || canvasManager.activeSpheres.Count == 0))
-                canvasManager.CreateVisualizationForAllPointsEvenInDictation();
+            UpdateReferenceDotsState(force: true);
+            if (_dotsActive)
+                MaybeBuildPhonemeSegments();
+        }
+
+        if (!_dotsActive)
+        {
+            DestroyTrackingLine();
+            DestroyVoiceTrackingLine();
+            return;
         }
 
         HandleProximityEffects();
@@ -180,6 +353,8 @@ public class VisualEffectManager : MonoBehaviour, IMemoryBudgetConsumer
     // ---- Helpers
     private void HandleProximityEffects()
     {
+        if (!_dotsActive) return;
+
         int hitIndex  = tracingSystem.CurrentKeyframeIndex;
         int nextIndex = hitIndex + 1;
         Vector3 handPos = recorder.playerToRecord.righthand.transform.position;
@@ -211,6 +386,7 @@ public class VisualEffectManager : MonoBehaviour, IMemoryBudgetConsumer
 
     private void EnsureTrackingLine()
     {
+        if (!_dotsActive) return;
         if (trackingLine != null) return;
         trackingLine = new GameObject("TrackingLine").AddComponent<LineRenderer>();
         trackingLine.material = dottedLineMaterial;
@@ -224,6 +400,11 @@ public class VisualEffectManager : MonoBehaviour, IMemoryBudgetConsumer
 
     private void UpdateTrackingLine()
     {
+        if (!_dotsActive)
+        {
+            if (trackingLine != null) trackingLine.enabled = false;
+            return;
+        }
         if (trackingLine == null) return;
 
         Vector3 handPos = recorder.playerToRecord.righthand.transform.position;
@@ -255,6 +436,7 @@ public class VisualEffectManager : MonoBehaviour, IMemoryBudgetConsumer
 
     private void CreateCylinderSegment(GameObject start, GameObject end)
     {
+        if (!_dotsActive) return;
         if (!start || !end) return;
 
         float distance = Vector3.Distance(start.transform.position, end.transform.position);
@@ -324,16 +506,17 @@ public class VisualEffectManager : MonoBehaviour, IMemoryBudgetConsumer
     private void OnLetterReloaded()
     {
         ClearAllVisuals();
+        _lastModeName = GetModeName();
+        _lastDrillName = GetCurrentDrill();
         _lastSpheresSig = ComputeSpheresSignature();
-        MaybeBuildPhonemeSegments();
-        if (canvasManager && (canvasManager.activeSpheres == null || canvasManager.activeSpheres.Count == 0))
-            canvasManager.CreateVisualizationForAllPointsEvenInDictation();
-        if (canvasManager && (canvasManager.activeSpheres == null || canvasManager.activeSpheres.Count == 0))
-            canvasManager.CreateVisualizationForAllPointsEvenInDictation();
+        UpdateReferenceDotsState(force: true);
+        if (_dotsActive)
+            MaybeBuildPhonemeSegments();
     }
 
     private void MaybeBuildPhonemeSegments()
     {
+        if (!_dotsActive) return;
         if (!showSegmentsInPhonemeChecking) return;
         if (!canvasManager || canvasManager.activeSpheres == null) return;
         if (canvasManager.activeSpheres.Count < 2) return;
@@ -396,6 +579,49 @@ public class VisualEffectManager : MonoBehaviour, IMemoryBudgetConsumer
             if (s) sig ^= s.GetInstanceID() * 19349663;
         }
         return sig;
+    }
+
+    private void UpdateReferenceDotsState(bool force = false)
+    {
+        bool shouldShow = ShouldShowReferenceDots();
+        Debug.Log("[VisualEffectManager] UpdateReferenceDotsState force=" + force +
+                  " shouldShow=" + shouldShow +
+                  " dotsActive=" + _dotsActive +
+                  " mode=" + GetModeName() +
+                  " drill=" + GetCurrentDrill());
+        if (!force && shouldShow == _dotsActive) return;
+
+        _dotsActive = shouldShow;
+
+        if (_dotsActive)
+        {
+            if (canvasManager && (canvasManager.activeSpheres == null || canvasManager.activeSpheres.Count == 0))
+                canvasManager.CreateVisualizationForAllPoints();
+        }
+        else
+        {
+            if (canvasManager) canvasManager.ClearVisualization();
+            ClearAllVisuals();
+        }
+    }
+
+    private bool ShouldShowReferenceDots()
+    {
+        if (!levelManager) return true;
+        bool isTrace = levelManager.currentMode == LevelManager.GameMode.TraceChecking;
+        if (!isTrace) return false;
+
+        string drill = levelManager.currentDrill ?? string.Empty;
+        if (drill.IndexOf("Visual", StringComparison.OrdinalIgnoreCase) >= 0)
+            return false;
+
+        return true;
+    }
+
+    private string GetCurrentDrill()
+    {
+        if (!levelManager) return string.Empty;
+        return levelManager.currentDrill ?? string.Empty;
     }
 }
 

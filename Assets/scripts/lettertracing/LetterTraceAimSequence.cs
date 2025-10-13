@@ -16,6 +16,8 @@ public class LetterTraceAimSequence : MonoBehaviour
     [Header("References")]
     [SerializeField] private LetterPathRenderer pathRenderer;
     [SerializeField] private simplePlayer player;
+    [SerializeField] private SimpleRecorder recorder;
+    [SerializeField] private CanvasManager canvasManager;
     [SerializeField] private ControllerHand controllerHand = ControllerHand.Right;
 
     [Header("Point Visuals")]
@@ -23,8 +25,9 @@ public class LetterTraceAimSequence : MonoBehaviour
     [SerializeField, Range(1f, 3f)] private float activeScaleMultiplier = 1.4f;
     [SerializeField] private Color pendingColor = new(0.85f, 0.1f, 0.1f, 1f);
     [SerializeField] private Color activeColor = new(0.2f, 0.95f, 0.2f, 1f);
-    [SerializeField] private Color completedColor = Color.black;
-    [SerializeField, Range(0.05f, 1f)] private float segmentThicknessRatio = 0.25f;
+    [SerializeField] private Color completedColor = new(0.2f, 0.8f, 0.2f, 1f);
+    [SerializeField, Range(0.5f, 2f)] private float completedScaleMultiplier = 1f;
+    [SerializeField, Range(0.05f, 1f)] private float segmentThicknessRatio = 0.12f;
 
     [Header("Laser Visuals")]
     [SerializeField] private float laserLag = 0.08f;
@@ -36,9 +39,19 @@ public class LetterTraceAimSequence : MonoBehaviour
     [SerializeField] private float hmdDownOffset = 0.20f;
     [SerializeField, Min(0f)] private float extendDistanceThreshold = 0.18f;
     [SerializeField] private bool useControllerLaserOrigin = true;
+    [SerializeField, Range(1f, 3f)] private float hitRadiusMultiplier = 1.4f;
+
+    [Header("Generated Markers")]
+    [SerializeField] private GameObject markerPrefab;
+    [SerializeField] private Material markerMaterialOverride;
+    [SerializeField] private Transform markerParentOverride;
+    [SerializeField, Range(0.001f, 0.05f)] private float markerScale = 0.02f;
+    [SerializeField, Range(0.001f, 0.05f)] private float minPointSpacing = 0.01f;
+    [SerializeField, Range(8, 256)] private int maxPointCount = 128;
 
     [Header("Events")]
     [SerializeField] private UnityEvent onTraceCompleted;
+    [SerializeField] private bool logSequenceEvents = false;
 
     public event Action TraceCompleted;
     public event Action SequenceStarted;
@@ -51,8 +64,11 @@ public class LetterTraceAimSequence : MonoBehaviour
     private readonly Dictionary<SegmentKey, LetterPathRenderer.SegmentLink> segmentLookup = new();
     private readonly Dictionary<SegmentKey, GameObject> cylinderLookup = new();
     private readonly List<GameObject> spawnedCylinders = new();
+    private readonly List<GameObject> generatedMarkers = new();
     private readonly Stack<GameObject> cylinderPool = new();
     private MaterialPropertyBlock cylinderPropertyBlock;
+    private static Mesh sharedMarkerMesh;
+    private static Material sharedMarkerMaterial;
 
     private static readonly int BaseColorId = Shader.PropertyToID("_BaseColor");
     private static readonly int ColorId = Shader.PropertyToID("_Color");
@@ -112,6 +128,14 @@ private class PointState
         {
             player = FindObjectOfType<simplePlayer>();
         }
+        if (!recorder)
+        {
+            recorder = FindObjectOfType<SimpleRecorder>();
+        }
+        if (!canvasManager)
+        {
+            canvasManager = FindObjectOfType<CanvasManager>();
+        }
         // Create Unity objects here (avoid constructor/field-init usage that calls into engine)
         cylinderPropertyBlock = new MaterialPropertyBlock();
     }
@@ -119,6 +143,7 @@ private class PointState
     private void OnEnable()
     {
         pathRenderer.LetterRendered += HandleLetterRendered;
+        if (recorder) recorder.OnRecordingLoaded += HandleRecorderLoaded;
         TryBuildSequence();
     }
 private void ApplyPointColor(PointState state, Color color)
@@ -157,8 +182,15 @@ private void ApplyVisual(PointState state, Color color, float scaleMultiplier)
     private void OnDisable()
     {
         pathRenderer.LetterRendered -= HandleLetterRendered;
+        if (recorder) recorder.OnRecordingLoaded -= HandleRecorderLoaded;
         ResetSequence();
         ResetLaser();
+    }
+
+    private void OnDestroy()
+    {
+        if (recorder) recorder.OnRecordingLoaded -= HandleRecorderLoaded;
+        if (pathRenderer) pathRenderer.LetterRendered -= HandleLetterRendered;
     }
 
     private void Update()
@@ -212,6 +244,11 @@ private void ApplyVisual(PointState state, Color color, float scaleMultiplier)
         return TryBuildSequence();
     }
 
+    private void HandleRecorderLoaded()
+    {
+        TryBuildSequence();
+    }
+
     public bool StartRun()
     {
         bool ready = TryBuildSequence();
@@ -223,6 +260,8 @@ private void ApplyVisual(PointState state, Color color, float scaleMultiplier)
 
         ResetLaser();
         laserEnabled = true;
+        if (visualsVisible && pathRenderer != null)
+            pathRenderer.SetVisualizationVisible(true);
         SequenceStarted?.Invoke();
         return true;
     }
@@ -234,22 +273,25 @@ private void ApplyVisual(PointState state, Color color, float scaleMultiplier)
 
         ResetSequence();
 
-        if (pathRenderer.AnchorMarkers.Count == 0)
-        {
-            isReady = false;
-            return false;
-        }
-
         BuildPoints();
         BuildSegmentLookup();
-        if (visualsVisible)
-            pathRenderer.SetStrokeLinesVisible(false);
+        if (pathRenderer != null)
+            pathRenderer.SetVisualizationVisible(false);
 
         if (points.Count == 0)
         {
             isReady = false;
             return false;
         }
+
+        if (visualsVisible && pathRenderer != null)
+            pathRenderer.SetVisualizationVisible(true);
+        if (logSequenceEvents)
+        {
+            Debug.Log($"[LetterTraceAimSequence] Prepared {points.Count} point(s) with {segmentLookup.Count} cached segment link(s).");
+        }
+        if (visualsVisible)
+            pathRenderer.SetStrokeLinesVisible(false);
 
         isReady = true;
         isCompleted = false;
@@ -260,35 +302,189 @@ private void ApplyVisual(PointState state, Color color, float scaleMultiplier)
 
     private void BuildPoints()
     {
+        if (TryBuildPointsFromRecorder())
+            return;
+
         IReadOnlyList<GameObject> markers = pathRenderer.AnchorMarkers;
         IReadOnlyList<Vector3> positions = pathRenderer.AnchorPositions;
+        Transform root = pathRenderer.ContentRoot != null ? pathRenderer.ContentRoot : pathRenderer.transform;
 
-        for (int i = 0; i < markers.Count; i++)
+        int count = Mathf.Max(markers.Count, positions.Count);
+        if (count == 0)
         {
-            GameObject marker = markers[i];
-            Renderer renderer = null;
-        Vector3 baseScale = Vector3.one * pathRenderer.MarkerBaseScale;
-        Vector3 localPosition = positions.Count > i ? positions[i] : Vector3.zero;
-
-        if (marker != null)
-        {
-            renderer = marker.GetComponent<Renderer>() ?? marker.GetComponentInChildren<Renderer>();
-            baseScale = marker.transform.localScale;
-            localPosition = marker.transform.localPosition;
+            if (!TryBuildPointsFromRecorder())
+            {
+                Debug.LogWarning("[LetterTraceAimSequence] No anchor data available to build points.", this);
+            }
+            return;
         }
 
-        PointState state = new PointState
-        {
-            marker = marker,
-            renderer = renderer,
-            baseScale = baseScale,
-            localPosition = localPosition,
-            hit = false
-        };
+        float minSpacingSqr = Mathf.Max(0.000001f, minPointSpacing * minPointSpacing);
 
-        ApplyPointColor(state, pendingColor);
-        points.Add(state);
+        for (int i = 0; i < count; i++)
+        {
+            if (points.Count >= maxPointCount)
+                break;
+
+            Vector3 local = Vector3.zero;
+            if (positions.Count > i)
+                local = positions[i];
+            else if (i < markers.Count && markers[i])
+                local = markers[i].transform.localPosition;
+
+            Vector3 world = root.TransformPoint(local);
+
+            if (points.Count > 0)
+            {
+                Vector3 prev = points[points.Count - 1].marker.transform.position;
+                if ((world - prev).sqrMagnitude < minSpacingSqr)
+                    continue;
+            }
+
+            GameObject marker = CreateGeneratedMarker(world);
+            Renderer renderer = marker.GetComponent<Renderer>() ?? marker.GetComponentInChildren<Renderer>();
+            Vector3 baseScale = marker.transform.localScale;
+
+            PointState state = new PointState
+            {
+                marker = marker,
+                renderer = renderer,
+                baseScale = baseScale,
+                localPosition = transform.InverseTransformPoint(world),
+                hit = false
+            };
+
+            ApplyPointColor(state, pendingColor);
+            marker.transform.localScale = baseScale;
+            marker.SetActive(visualsVisible);
+            points.Add(state);
+        }
+
+        if (logSequenceEvents)
+        {
+            Debug.Log($"[LetterTraceAimSequence] Built {points.Count} point(s) from LetterPathRenderer anchors.", this);
+        }
     }
+
+    private GameObject CreateGeneratedMarker(Vector3 worldPosition)
+    {
+        Transform parent = markerParentOverride != null
+            ? markerParentOverride
+            : ((canvasManager != null && canvasManager.canvasPlane != null) ? canvasManager.canvasPlane.transform : transform);
+
+        GameObject marker;
+        if (markerPrefab)
+        {
+            marker = Instantiate(markerPrefab, parent, false);
+            marker.transform.localScale = markerPrefab.transform.localScale * markerScale;
+            RemoveCollider(marker);
+        }
+        else
+        {
+            marker = CreateDefaultMarker(parent);
+            marker.transform.localScale = Vector3.one * markerScale;
+        }
+
+        marker.name = "TraceAnchor";
+        marker.transform.position = worldPosition;
+        generatedMarkers.Add(marker);
+        return marker;
+    }
+
+    private GameObject CreateDefaultMarker(Transform parent)
+    {
+        EnsureSharedMarkerResources();
+        GameObject marker = new GameObject("TraceAnchor");
+        marker.transform.SetParent(parent, false);
+        marker.layer = parent.gameObject.layer;
+        var filter = marker.AddComponent<MeshFilter>();
+        filter.sharedMesh = sharedMarkerMesh;
+        var renderer = marker.AddComponent<MeshRenderer>();
+        renderer.sharedMaterial = markerMaterialOverride ? markerMaterialOverride : sharedMarkerMaterial;
+        return marker;
+    }
+
+    private void EnsureSharedMarkerResources()
+    {
+        if (sharedMarkerMesh != null && sharedMarkerMaterial != null)
+            return;
+
+        GameObject temp = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+        RemoveCollider(temp);
+        var filter = temp.GetComponent<MeshFilter>();
+        var renderer = temp.GetComponent<MeshRenderer>();
+        sharedMarkerMesh = filter.sharedMesh;
+        sharedMarkerMaterial = new Material(renderer.sharedMaterial)
+        {
+            hideFlags = HideFlags.HideAndDontSave
+        };
+        if (Application.isPlaying)
+            Destroy(temp);
+        else
+            DestroyImmediate(temp);
+    }
+
+    private bool TryBuildPointsFromRecorder()
+    {
+        if (!recorder || recorder.currentRecord == null ||
+            recorder.currentRecord.frames == null || recorder.currentRecord.frames.Count == 0)
+        {
+            return false;
+        }
+
+        Transform canvasPlane = null;
+        if (canvasManager != null && canvasManager.canvasPlane != null != null)
+        {
+            canvasPlane = canvasManager.canvasPlane.transform;
+        }
+
+        bool created = false;
+        bool treatLocal = recorder.currentRecord.isLocalSpace;
+        float minSpacingSqr = Mathf.Max(0.000001f, minPointSpacing * minPointSpacing);
+
+        for (int i = 0; i < recorder.currentRecord.frames.Count; i++)
+        {
+            if (points.Count >= maxPointCount)
+                break;
+
+            Vector3 framePos = recorder.currentRecord.frames[i].position;
+            Vector3 worldPos = (treatLocal && canvasPlane != null)
+                ? canvasPlane.TransformPoint(framePos)
+                : framePos;
+
+            if (points.Count > 0)
+            {
+                Vector3 prev = points[points.Count - 1].marker.transform.position;
+                if ((worldPos - prev).sqrMagnitude < minSpacingSqr)
+                    continue;
+            }
+
+            GameObject marker = CreateGeneratedMarker(worldPos);
+            Renderer renderer = marker.GetComponent<Renderer>() ?? marker.GetComponentInChildren<Renderer>();
+            Vector3 baseScale = marker.transform.localScale;
+
+            PointState state = new PointState
+            {
+                marker = marker,
+                renderer = renderer,
+                baseScale = baseScale,
+                localPosition = transform.InverseTransformPoint(worldPos),
+                hit = false
+            };
+
+            ApplyPointColor(state, pendingColor);
+            marker.transform.localScale = baseScale;
+            marker.SetActive(visualsVisible);
+            points.Add(state);
+            created = true;
+        }
+
+        if (created && logSequenceEvents)
+        {
+            Debug.Log($"[LetterTraceAimSequence] Built {points.Count} point(s) from SimpleRecorder fallback.", this);
+        }
+
+        return created;
     }
 
     private void BuildSegmentLookup()
@@ -373,6 +569,20 @@ private void ApplyVisual(PointState state, Color color, float scaleMultiplier)
         }
 
         points.Clear();
+        if (generatedMarkers.Count > 0)
+        {
+            for (int i = 0; i < generatedMarkers.Count; i++)
+            {
+                var marker = generatedMarkers[i];
+                if (!marker) continue;
+
+                if (Application.isPlaying)
+                    Destroy(marker);
+                else
+                    DestroyImmediate(marker);
+            }
+            generatedMarkers.Clear();
+        }
     }
 
     public void SetVisualizationVisible(bool visible)
@@ -404,6 +614,11 @@ private void ApplyVisual(PointState state, Color color, float scaleMultiplier)
             return;
         }
 
+        if (logSequenceEvents)
+        {
+            Debug.Log($"[LetterTraceAimSequence] Activating point {currentIndex + 1}/{points.Count}.");
+        }
+
         ApplyVisual(points[currentIndex], activeColor, activeScaleMultiplier);
     }
 
@@ -420,8 +635,13 @@ private void ApplyVisual(PointState state, Color color, float scaleMultiplier)
             return;
         }
 
+        if (logSequenceEvents)
+        {
+            Debug.Log($"[LetterTraceAimSequence] Completing point {currentIndex + 1}/{points.Count}.");
+        }
+
         state.hit = true;
-        ApplyVisual(state, completedColor, 1f);
+        ApplyVisual(state, completedColor, completedScaleMultiplier);
 
         int previousIndex = currentIndex - 1;
         if (previousIndex >= 0 && previousIndex < points.Count)
@@ -452,7 +672,10 @@ private void ApplyVisual(PointState state, Color color, float scaleMultiplier)
         isCompleted = true;
         laserEnabled = false;
         UpdateLaser(false, Vector3.zero, Vector3.forward);
-        Debug.Log("finished tracing");
+        if (logSequenceEvents)
+        {
+            Debug.Log("[LetterTraceAimSequence] Trace completed.");
+        }
         onTraceCompleted?.Invoke();
         TraceCompleted?.Invoke();
     }
@@ -472,6 +695,11 @@ private void ApplyVisual(PointState state, Color color, float scaleMultiplier)
         }
 
         PositionCylinder(cylinder, link);
+
+        if (logSequenceEvents)
+        {
+            Debug.Log($"[LetterTraceAimSequence] Revealed segment {startIndex}->{endIndex}.");
+        }
     }
 
     private GameObject CreateSegmentCylinder()
@@ -576,8 +804,9 @@ anchors.Count)
             return false;
         }
 
-        Transform root = pathRenderer.ContentRoot != null ? pathRenderer.ContentRoot : transform;
-        Vector3 center = root.TransformPoint(state.localPosition);
+        Vector3 center = state.marker != null
+            ? state.marker.transform.position
+            : transform.TransformPoint(state.localPosition);
         float radius = GetPointRadius(state);
 
         Vector3 oc = origin - center;
@@ -621,8 +850,9 @@ anchors.Count)
             return false;
         }
 
-        Transform root = pathRenderer.ContentRoot != null ? pathRenderer.ContentRoot : transform;
-        worldCenter = root.TransformPoint(state.localPosition);
+        worldCenter = state.marker != null
+            ? state.marker.transform.position
+            : transform.TransformPoint(state.localPosition);
         radius = GetPointRadius(state);
         return radius > 0f;
     }
@@ -636,7 +866,8 @@ anchors.Count)
 
         Vector3 scale = state.marker != null ? state.marker.transform.lossyScale : (Vector3.one *
 pathRenderer.MarkerBaseScale);
-        return Mathf.Max(0.001f, Mathf.Max(scale.x, Mathf.Max(scale.y, scale.z)) * 0.5f);
+        float radius = Mathf.Max(0.001f, Mathf.Max(scale.x, Mathf.Max(scale.y, scale.z)) * 0.5f);
+        return radius * Mathf.Max(1f, hitRadiusMultiplier);
     }
 
     private void UpdateLaser(bool hasRay, Vector3 origin, Vector3 direction)

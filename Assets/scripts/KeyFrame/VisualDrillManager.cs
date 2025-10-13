@@ -45,6 +45,7 @@ public class VisualDrillManager : MonoBehaviour
 
     [Header("Optional Refs")]
     [SerializeField] private GameObject drawerHost;
+    [SerializeField] private LevelManager levelManager;
 
     public event Action<string> OnLetterStarted;
     public event Action<string, bool> OnLetterCompleted;
@@ -84,6 +85,58 @@ public class VisualDrillManager : MonoBehaviour
 
     private VisionRequestWrapper _visionPrimary;
     private VisionRequestWrapper _visionFallback;
+    private string _cachedPromptBeforeTrace = string.Empty;
+    private bool _promptHiddenForTrace;
+
+    private void ResolveLevelManager()
+    {
+        if (levelManager) return;
+        levelManager = GetComponent<LevelManager>() ?? GetComponentInParent<LevelManager>();
+        if (!levelManager)
+            levelManager = FindObjectOfType<LevelManager>();
+    }
+
+    private void LateUpdate()
+    {
+        if (!promptText || !levelManager) return;
+
+        bool isTrace = levelManager.currentMode == LevelManager.GameMode.TraceChecking;
+        if (isTrace)
+        {
+            if (!_promptHiddenForTrace)
+            {
+                _cachedPromptBeforeTrace = promptText.text;
+                promptText.gameObject.SetActive(false);
+                promptText.text = string.Empty;
+                _promptHiddenForTrace = true;
+            }
+        }
+        else if (_promptHiddenForTrace)
+        {
+            promptText.gameObject.SetActive(true);
+            string restore = !string.IsNullOrEmpty(_currentExpected)
+                ? _currentExpected.ToUpperInvariant()
+                : _cachedPromptBeforeTrace;
+            promptText.text = restore ?? string.Empty;
+            _promptHiddenForTrace = false;
+        }
+    }
+
+    private void HookLevelManager()
+    {
+        ResolveLevelManager();
+        if (!levelManager) return;
+
+        levelManager.OnGameModeChanged -= HandleGameModeChanged;
+        levelManager.OnGameModeChanged += HandleGameModeChanged;
+        HandleGameModeChanged(levelManager.currentMode);
+    }
+
+    private void UnhookLevelManager()
+    {
+        if (!levelManager) return;
+        levelManager.OnGameModeChanged -= HandleGameModeChanged;
+    }
 
     private static readonly Gradient sBlackGradient = BuildSolidGradient(Color.black);
     private static readonly string[] sDefaultLanguageHints = new[] { "en" };
@@ -203,6 +256,7 @@ public class VisualDrillManager : MonoBehaviour
         {
             drawerHost = planeDrawer.gameObject;
         }
+        ResolveLevelManager();
 
         CacheWaits();
         SetupVisionPayloads();
@@ -216,6 +270,11 @@ public class VisualDrillManager : MonoBehaviour
         SetDrawerEnabled(false);
     }
 
+    private void OnEnable()
+    {
+        HookLevelManager();
+    }
+
     private void Start()
     {
         LoadPlan();
@@ -225,10 +284,42 @@ public class VisualDrillManager : MonoBehaviour
         }
     }
 
+    private void OnDisable()
+    {
+        UnhookLevelManager();
+    }
+
     private void OnDestroy()
     {
+        UnhookLevelManager();
         ReleaseCaptureTargets();
         HideHintImmediate();
+    }
+
+    private void HandleGameModeChanged(LevelManager.GameMode mode)
+    {
+        if (!promptText) return;
+
+        if (mode == LevelManager.GameMode.TraceChecking)
+        {
+            if (_promptHiddenForTrace) return;
+
+            _cachedPromptBeforeTrace = promptText.text;
+            promptText.text = string.Empty;
+            promptText.gameObject.SetActive(false);
+            _promptHiddenForTrace = true;
+        }
+        else
+        {
+            if (!_promptHiddenForTrace) return;
+
+            promptText.gameObject.SetActive(true);
+            string restore = !string.IsNullOrEmpty(_currentExpected)
+                ? _currentExpected.ToUpperInvariant()
+                : _cachedPromptBeforeTrace;
+            promptText.text = restore ?? string.Empty;
+            _promptHiddenForTrace = false;
+        }
     }
 
 #if UNITY_EDITOR
