@@ -6,6 +6,7 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Text;
 using System.Linq;
+using System.Globalization;
 
 [RequireComponent(typeof(LevelManager))]
 public class PhonemeManager : MonoBehaviour
@@ -93,6 +94,8 @@ public class PhonemeManager : MonoBehaviour
     private AudioClip micClip;          // looping mic buffer
     private int startSample;
     private string micDevice;
+    private Coroutine warmMicRoutine;
+    private bool isMicWarming;
 
     private PhonemeCheckState state = PhonemeCheckState.Idle;
     public PhonemeCheckState currentState => state;
@@ -151,7 +154,7 @@ public class PhonemeManager : MonoBehaviour
                     uint sSeq = speakSeq.Values.Max();
                     uint wSeq = waitSeq.Values.Max();
                     if (sSeq != wSeq) finalSpeak = sSeq > wSeq;
-                    else finalSpeak = true; // tie ‚Üí Speak
+                    else finalSpeak = true; // tie GÂ∆ Speak
                 }
                 finalWait = !finalSpeak;
             }
@@ -198,35 +201,72 @@ public class PhonemeManager : MonoBehaviour
         prevWait  = waitIndicator  && waitIndicator.activeSelf;
     }
 
+    private static readonly Dictionary<char, string> phonemeCharFold = new()
+    {
+        { '+™', "ae" },
+        { '+Ê', "a" },
+        { '+∆', "o" },
+        { '+…', "a" },
+        { '-Ó', "u" },
+        { '+÷', "e" },
+        { '+¢', "e" },
+        { '+£', "e" },
+        { '+P', "e" },
+        { '+‹', "er" },
+        { '+•', "er" },
+        { '+¨', "i" },
+        { '+ª', "i" },
+        { '-¶', "i" },
+        { '-≈', "y" },
+        { '-Ë', "u" },
+        { '+Ù', "oe" },
+        { '++', "oe" },
+        { '+ˆ', "o" },
+        { '+Ì', "g" },
+        { '++', "th" },
+        { '+¶', "th" },
+        { '-‚', "sh" },
+        { '-∆', "zh" },
+        { '+Ô', "ng" },
+        { '+∫', "sh" },
+        { '-Ò', "j" },
+        { '-∫', "ch" },
+        { '-…', "" },
+        { '-Í', "" },
+        { '-Ó', "" },
+        { '?', "" },
+        { 'n++', "" }
+    };
+
     /* ultra-lenient IPA map */
     private readonly Dictionary<string,List<string>> letterToIPA = new()
     {
-        { "A", new(){ "a","…ë","√¶","…í"," å","…ô","e…™","a…™","…õ","e","…ê","aÀê","…ëÀê","√¶Àê","…ú","…ò","…ôÃü","e …™" }},
-        { "B", new(){ "b","b …ô","b …ë","b …î","b …õ","p","p …ô","p …ë","p …î","p …õ","bi","biÀê","b i","b iÀê","b …™","b…™" }},
-        { "C", new(){ "k","k …ô","k …ë","k  å","k …î","s","s …ô","s …ë","s  å","s …î","si","siÀê","s i","s iÀê","t É","t  É"," É","ts","t s" }},
-        { "D", new(){ "d","d …ô","d …ë","d …õ","t","t …ô","t …ë","t  å","t …î","di","diÀê","d i","d iÀê","√∞","…æ" }},
-        { "E", new(){ "…õ","e","i","e…™","…ú","…™","…õ…ô","e…ô","iÀê","…™…ô","eÀê","e …™","…ò","…ô" }},
-        { "F", new(){ "f","f …ô","f …ë","v","v …ô","v …ë","…õf","e f","…õ f","ef" }},
-        { "G", new(){ "…°","g","…° …ô","…° …ë","k","k …ô","k …ë","k  å","k …î","d í","d í …ô","d í …ë","d í  å"," í","d íi","d íiÀê","d  í i","d  í iÀê" }},
-        { "H", new(){ "h","h …ô","h …ë","h  å","h …î","e…™t É","e …™ t É","e…™ t É","he…™t É","h e…™ t É" }},
-        { "I", new(){ "…™","i","a…™","e"," å","…ô","…™…ô","iÀê","a i","aj","…™Àê" }},
-        { "J", new(){ "d í","d í …ô","d í …ë","d í  å","t É","t É …ô","t É …ë","d íe…™","d í e…™"," í" }},
-        { "K", new(){ "k","k …ô","k …ë","k  å","…°","g","…° …ô","…° …ë","ke…™","k e…™" }},
-        { "L", new(){ "l","l …ô","l …ë","…´","lÃ©","…ôl","…õl","e l","…õ l","el" }},
-        { "M", new(){ "m","m …ô","m …ë","mÃ©","…ôm","…õm","e m","…õ m","em","n" }},
-        { "N", new(){ "n","n …ô","n …ë","≈ã","nÃ©","…ôn","…õn","e n","…õ n","en" }},
-        { "O", new(){ "o ä","…í","…î","…ë","…ô ä","o","…ú"," å","a","…î ä","oÀê","…îÀê","ow" }},
-        { "P", new(){ "p","p …ô","p …ë","p …î","b","b …ô","b …ë","b …î","b …õ","pi","piÀê","p i","p iÀê","p…™","p …™" }},
-        { "Q", new(){ "k w","k w …ô","k w …ë","…° w","…° w …ô","…° w …ë","kw","…°w","kju","kjuÀê","k ju","k j u","k" }},
-        { "R", new(){ "…π","r","…π …ô","…π …ë","…π  å","…ö","…ù","…ëÀê","…ë…π","…æ","…ª","…ë …π","ar","rÃ©","…πÃ©" }},
-        { "S", new(){ "s","s …ô","s …ë","z","z …ô","z …ë","…õs","e s","…õ s","es"," É","Œ∏" }},
-        { "T", new(){ "t","t …ô","t …ë","t  å","d","d …ô","d …ë","d …õ","ti","tiÀê","t i","t iÀê","t É","t  É","ts","t s","…æ","Œ∏" }},
-        { "U", new(){ " å","u","ju","…ô"," ä","uÀê","a","juÀê","j u","…Ø"," â" }},
-        { "V", new(){ "v","v …ô","v …ë","f","f …ô","f …ë","w","vi","viÀê","v i","v iÀê","v…™","v …™" }},
-        { "W", new(){ "w","w …ô","w …ë"," ä","u","Ààd åb…ôlju","d åb…ôlju","d  å b …ô l j u","w ä","v" }},
-        { "X", new(){ "k s","k s …ô","k s …ë","…õ ks","…õ k","…° z","…° z …ô","…° z …ë","k","…õ","…° s","g z","…õ gz","e gz","egz","…™ ks","i ks","…™ k s","eks" }},
-        { "Y", new(){ "j","j …ô","j …ë","wa…™","i","ja…™","w a…™","j i","ji","…™","iÀê" }},
-        { "Z", new(){ "z","z …ô","z …ë","s","s …ô","s …ë","zi","ziÀê","z i","z iÀê","z…™","z …™","z…õd","z …õ d"," í" }},
+        { "A", new(){ "a","+Ê","+™","+∆","-Ó","+÷","e+¨","a+¨","+¢","e","+…","a-…","+Ê-…","+™-…","+£","+ˇ","+÷¶É","e +¨" }},
+        { "B", new(){ "b","b +÷","b +Ê","b +ˆ","b +¢","p","p +÷","p +Ê","p +ˆ","p +¢","bi","bi-…","b i","b i-…","b +¨","b+¨" }},
+        { "C", new(){ "k","k +÷","k +Ê","k -Ó","k +ˆ","s","s +÷","s +Ê","s -Ó","s +ˆ","si","si-…","s i","s i-…","t-‚","t -‚","-‚","ts","t s" }},
+        { "D", new(){ "d","d +÷","d +Ê","d +¢","t","t +÷","t +Ê","t -Ó","t +ˆ","di","di-…","d i","d i-…","+¶","++" }},
+        { "E", new(){ "+¢","e","i","e+¨","+£","+¨","+¢+÷","e+÷","i-…","+¨+÷","e-…","e +¨","+ˇ","+÷" }},
+        { "F", new(){ "f","f +÷","f +Ê","v","v +÷","v +Ê","+¢f","e f","+¢ f","ef" }},
+        { "G", new(){ "+Ì","g","+Ì +÷","+Ì +Ê","k","k +÷","k +Ê","k -Ó","k +ˆ","d-∆","d-∆ +÷","d-∆ +Ê","d-∆ -Ó","-∆","d-∆i","d-∆i-…","d -∆ i","d -∆ i-…" }},
+        { "H", new(){ "h","h +÷","h +Ê","h -Ó","h +ˆ","e+¨t-‚","e +¨ t-‚","e+¨ t-‚","he+¨t-‚","h e+¨ t-‚" }},
+        { "I", new(){ "+¨","i","a+¨","e","-Ó","+÷","+¨+÷","i-…","a i","aj","+¨-…" }},
+        { "J", new(){ "d-∆","d-∆ +÷","d-∆ +Ê","d-∆ -Ó","t-‚","t-‚ +÷","t-‚ +Ê","d-∆e+¨","d-∆ e+¨","-∆" }},
+        { "K", new(){ "k","k +÷","k +Ê","k -Ó","+Ì","g","+Ì +÷","+Ì +Ê","ke+¨","k e+¨" }},
+        { "L", new(){ "l","l +÷","l +Ê","+Ω","l¶¨","+÷l","+¢l","e l","+¢ l","el" }},
+        { "M", new(){ "m","m +÷","m +Ê","m¶¨","+÷m","+¢m","e m","+¢ m","em","n" }},
+        { "N", new(){ "n","n +÷","n +Ê","+Ô","n¶¨","+÷n","+¢n","e n","+¢ n","en" }},
+        { "O", new(){ "o-Ë","+∆","+ˆ","+Ê","+÷-Ë","o","+£","-Ó","a","+ˆ-Ë","o-…","+ˆ-…","ow" }},
+        { "P", new(){ "p","p +÷","p +Ê","p +ˆ","b","b +÷","b +Ê","b +ˆ","b +¢","pi","pi-…","p i","p i-…","p+¨","p +¨" }},
+        { "Q", new(){ "k w","k w +÷","k w +Ê","+Ì w","+Ì w +÷","+Ì w +Ê","kw","+Ìw","kju","kju-…","k ju","k j u","k" }},
+        { "R", new(){ "+¶","r","+¶ +÷","+¶ +Ê","+¶ -Ó","+‹","+•","+Ê-…","+Ê+¶","++","++","+Ê +¶","ar","r¶¨","+¶¶¨" }},
+        { "S", new(){ "s","s +÷","s +Ê","z","z +÷","z +Ê","+¢s","e s","+¢ s","es","-‚","++" }},
+        { "T", new(){ "t","t +÷","t +Ê","t -Ó","d","d +÷","d +Ê","d +¢","ti","ti-…","t i","t i-…","t-‚","t -‚","ts","t s","++","++" }},
+        { "U", new(){ "-Ó","u","ju","+÷","-Ë","u-…","a","ju-…","j u","+ª","-Î" }},
+        { "V", new(){ "v","v +÷","v +Ê","f","f +÷","f +Ê","w","vi","vi-…","v i","v i-…","v+¨","v +¨" }},
+        { "W", new(){ "w","w +÷","w +Ê","-Ë","u","-Íd-Ób+÷lju","d-Ób+÷lju","d -Ó b +÷ l j u","w-Ë","v" }},
+        { "X", new(){ "k s","k s +÷","k s +Ê","+¢ ks","+¢ k","+Ì z","+Ì z +÷","+Ì z +Ê","k","+¢","+Ì s","g z","+¢ gz","e gz","egz","+¨ ks","i ks","+¨ k s","eks" }},
+        { "Y", new(){ "j","j +÷","j +Ê","wa+¨","i","ja+¨","w a+¨","j i","ji","+¨","i-…" }},
+        { "Z", new(){ "z","z +÷","z +Ê","s","s +÷","s +Ê","zi","zi-…","z i","z i-…","z+¨","z +¨","z+¢d","z +¢ d","-∆" }},
     };
 
     // Downmix a segment from micClip (handles wrap at call site) with REUSED buffer
@@ -317,7 +357,7 @@ public class PhonemeManager : MonoBehaviour
 
     private void Start()
     {
-        StartCoroutine(WarmUpMic());
+        StartMicIfNeeded();
 
         beamReady = beamMode != BeamMode.BeamOn;
         if (beamMode == BeamMode.BeamOn) StartCoroutine(WarmUpBeam());
@@ -432,7 +472,7 @@ public class PhonemeManager : MonoBehaviour
                 return;
             }
 
-            // got required utterances ‚Äì finish
+            // got required utterances G«Ù finish
             autoStopped = true;
             HandleVirtualRelease();
         }
@@ -457,7 +497,7 @@ public class PhonemeManager : MonoBehaviour
             case PhonemeCheckState.Start:
                 attemptCount = 0; alignPressed = false;
                 feedbackText?.SetText(beamMode == BeamMode.BeamOn && !beamReady
-                    ? "Starting up‚Ä¶ please wait"
+                    ? "Starting upG«™ please wait"
                     : "Look at the button to begin."); break;
 
             case PhonemeCheckState.WaitingToRecord:
@@ -467,12 +507,12 @@ public class PhonemeManager : MonoBehaviour
 
             case PhonemeCheckState.Recording:
                 SetBtnTint(Color.green);
-                feedbackText?.SetText("Recording ‚Ä¶");
+                feedbackText?.SetText("Recording G«™");
                 StartCoroutine(BeginMic());
                 break;
 
             case PhonemeCheckState.WaitingForResponse:
-                feedbackText?.SetText("Processing ‚Ä¶");
+                feedbackText?.SetText("Processing G«™");
                 if (blinkCoroutine != null) StopCoroutine(blinkCoroutine);
                 blinkCoroutine = StartCoroutine(BlinkRed());
                 break;
@@ -511,7 +551,22 @@ public class PhonemeManager : MonoBehaviour
     /* ---------- Mic control ---------- */
     private IEnumerator BeginMic()
     {
-        if (micClip == null) { Debug.LogError("Mic not warmed"); yield break; }
+        if (micClip == null)
+        {
+            StartMicIfNeeded();
+            float timeout = 2f;
+            float waited = 0f;
+            while (micClip == null && isMicWarming && waited < timeout)
+            {
+                waited += Time.unscaledDeltaTime;
+                yield return null;
+            }
+            if (micClip == null)
+            {
+                Debug.LogError("Mic not warmed");
+                yield break;
+            }
+        }
         startSample = Microphone.GetPosition(micDevice);
         recordedClip = null; // reset; we'll create a fresh clip at EndMic
         loudTimer = 0f;
@@ -563,7 +618,7 @@ public class PhonemeManager : MonoBehaviour
 
     private void CancelRecording(string reason)
     {
-        Debug.Log($"PhonemeManager: recording cancelled ‚Äì {reason}");
+        Debug.Log($"PhonemeManager: recording cancelled G«Ù {reason}");
         SetBtnTint(btnColorOriginal);
         SetState(PhonemeCheckState.WaitingToRecord);
     }
@@ -576,7 +631,7 @@ public class PhonemeManager : MonoBehaviour
     {
         if (!beamReady && beamMode == BeamMode.BeamOn)
         {
-            feedbackText?.SetText("Starting up‚Ä¶");
+            feedbackText?.SetText("Starting upG«™");
             return;
         }
         alignPressed = true;
@@ -614,13 +669,13 @@ public class PhonemeManager : MonoBehaviour
             }
             if (Microphone.GetPosition(dev) > 0)
             {
-                Debug.Log($"Mic warmed on ¬´{dev}¬ª ‚úÖ");
+                Debug.Log($"Mic warmed on -Ω{dev}-+ G£‡");
                 yield break;
             }
             Microphone.End(dev);
-            Debug.LogWarning($"Warm-up failed on ¬´{dev}¬ª, next‚Ä¶");
+            Debug.LogWarning($"Warm-up failed on -Ω{dev}-+, nextG«™");
         }
-        Debug.LogError("All mics failed to warm up üö®");
+        Debug.LogError("All mics failed to warm up =É‹ø");
     }
 
     private IEnumerator WarmUpBeam()
@@ -641,7 +696,7 @@ public class PhonemeManager : MonoBehaviour
             req.downloadHandler = new DownloadHandlerBuffer();
             req.SetRequestHeader("Content-Type", "application/json");
             req.SetRequestHeader("Authorization", $"Bearer {TOKEN}");
-            Debug.Log("PhonemeManager: Warming up Beam server‚Ä¶");
+            Debug.Log("PhonemeManager: Warming up Beam serverG«™");
             yield return req.SendWebRequest();
 
             beamReady = true;
@@ -721,7 +776,22 @@ public class PhonemeManager : MonoBehaviour
             return;
         }
 
-        bool isMatch = wants.Any(w => lastBeamText.Contains(w, StringComparison.OrdinalIgnoreCase));
+        bool rawMatch = wants.Any(w => !string.IsNullOrEmpty(w)
+                                    && lastBeamText.IndexOf(w, StringComparison.OrdinalIgnoreCase) >= 0);
+
+        string normalizedBeam = NormalizePhonemeToken(lastBeamText);
+        bool normalizedMatch = !string.IsNullOrEmpty(normalizedBeam) && wants.Any(w =>
+        {
+            string normalizedWant = NormalizePhonemeToken(w);
+            return !string.IsNullOrEmpty(normalizedWant) && normalizedBeam.Contains(normalizedWant);
+        });
+
+        if (normalizedMatch && !rawMatch)
+        {
+            Debug.Log($"[Phoneme] Normalized match for '{L}': raw='{lastBeamText}' normalized='{normalizedBeam}'");
+        }
+
+        bool isMatch = rawMatch || normalizedMatch;
         SetState(isMatch ? PhonemeCheckState.Correct : PhonemeCheckState.Incorrect);
     }
 
@@ -729,6 +799,7 @@ public class PhonemeManager : MonoBehaviour
     private AudioClip TrimSilence(AudioClip clip, float thresh = 0.001f)
     {
         if (!clip) return clip;
+
         float[] samples = new float[clip.samples];
         clip.GetData(samples, 0);
 
@@ -802,6 +873,75 @@ public class PhonemeManager : MonoBehaviour
         if (force || nowWait  != prevWait ) prevWait  = nowWait;
     }
 
+    public void StartMicIfNeeded()
+    {
+        if (!isActiveAndEnabled) return;
+        if (micClip != null) return;
+        if (warmMicRoutine != null) return;
+        warmMicRoutine = StartCoroutine(WarmMicWrapper());
+    }
+
+    public void StopMic()
+    {
+        if (warmMicRoutine != null)
+        {
+            StopCoroutine(warmMicRoutine);
+            warmMicRoutine = null;
+            isMicWarming = false;
+        }
+
+        if (!string.IsNullOrEmpty(micDevice) && Microphone.IsRecording(micDevice))
+            Microphone.End(micDevice);
+
+        if (micClip)
+        {
+            Destroy(micClip);
+            micClip = null;
+        }
+    }
+
+    private IEnumerator WarmMicWrapper()
+    {
+        isMicWarming = true;
+        yield return WarmUpMic();
+        isMicWarming = false;
+        warmMicRoutine = null;
+        bool micReady = micClip && !string.IsNullOrEmpty(micDevice) && Microphone.IsRecording(micDevice);
+        if (!micReady)
+        {
+            if (micClip)
+            {
+                Destroy(micClip);
+                micClip = null;
+            }
+            Debug.LogWarning("PhonemeManager: Mic warm-up did not produce a clip.");
+        }
+    }
+
+    public void ReleaseMemory()
+    {
+        indicatorGate.WantSpeak("state", false, 0);
+        indicatorGate.WantWait ("state", false, 0);
+        if (speakIndicator && speakIndicator.activeSelf) speakIndicator.SetActive(false);
+        if (waitIndicator  && waitIndicator.activeSelf)  waitIndicator.SetActive(false);
+        prevSpeak = speakIndicator && speakIndicator.activeSelf;
+        prevWait  = waitIndicator  && waitIndicator.activeSelf;
+
+        StopMic();
+
+        if (recordedClip)
+        {
+            Destroy(recordedClip);
+            recordedClip = null;
+        }
+
+        micBuf = null;
+        headScratch = null;
+        tailScratch = null;
+        clipScratch = null;
+        recMonoScratch = null;
+    }
+
     /* ---------- Cleanup ---------- */
     private void OnDestroy()
     {
@@ -811,10 +951,7 @@ public class PhonemeManager : MonoBehaviour
             proximityButton.OnButtonReleased -= HandlePhysicalRelease;
         }
         if (levelManager != null) levelManager.OnGameModeChanged -= HandleModeChanged;
-        if (!string.IsNullOrEmpty(micDevice))
-        {
-            if (Microphone.IsRecording(micDevice)) Microphone.End(micDevice);
-        }
+        StopMic();
         if (recordedClip) Destroy(recordedClip);
         recordedClip = null;
 
@@ -839,8 +976,51 @@ public class PhonemeManager : MonoBehaviour
         }
         else
         {
+            StartMicIfNeeded();
             // Re-evaluate based on current recording state
             RefreshIndicators(true);
         }
+    }
+
+    private static string NormalizePhonemeToken(string input)
+    {
+        if (string.IsNullOrEmpty(input)) return string.Empty;
+
+        string decomposed = input.Normalize(NormalizationForm.FormD);
+        var sb = new StringBuilder(decomposed.Length);
+
+        foreach (char c in decomposed)
+        {
+            UnicodeCategory category = CharUnicodeInfo.GetUnicodeCategory(c);
+            if (category == UnicodeCategory.NonSpacingMark ||
+                category == UnicodeCategory.SpacingCombiningMark ||
+                category == UnicodeCategory.EnclosingMark)
+            {
+                continue;
+            }
+
+            if (char.IsWhiteSpace(c) || c == '-' || c == '_' || c == '.' ||
+                c == ',' || c == '\'' || c == '"' || c == '/' || c == '\\')
+            {
+                continue;
+            }
+
+            char lower = char.ToLowerInvariant(c);
+            if (phonemeCharFold.TryGetValue(lower, out var replacement))
+            {
+                if (!string.IsNullOrEmpty(replacement))
+                {
+                    sb.Append(replacement);
+                }
+                continue;
+            }
+
+            if ((lower >= 'a' && lower <= 'z') || char.IsDigit(lower))
+            {
+                sb.Append(lower);
+            }
+        }
+
+        return sb.ToString();
     }
 }

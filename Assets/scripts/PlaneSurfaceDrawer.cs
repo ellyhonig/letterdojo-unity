@@ -747,6 +747,12 @@ private void SetHandState(bool isRight, HandState newState)
             if (isRight && !_lagInitR) { _lagPosR = hitPoint; _lagInitR = true; _lagVelR = Vector3.zero; }
             if (!isRight && !_lagInitL) { _lagPosL = hitPoint; _lagInitL = true; _lagVelL = Vector3.zero; }
 
+            bool handEnabled = thisHandIsDrawing;
+            bool supportOk = !requireSupportHandHold || !handEnabled || _supportReady;
+            UpdateChargeAndDrawState(isRight, handEnabled && extended, handEnabled && pointing, aimedAtBoard, supportOk);
+
+            bool allowDraw = handEnabled && supportOk && ((!requireChargeToDraw) ? fingerOk : ((isRight ? _stateR : _stateL) == HandState.Drawing));
+
             Vector3 lag = isRight ? _lagPosR : _lagPosL;
             Vector3 vel = isRight ? _lagVelR : _lagVelL;
             // Snap lag to aim on first Drawing frame to avoid stray line from previous lag position
@@ -869,14 +875,6 @@ private void SetHandState(bool isRight, HandState newState)
                         UpdateHelperLine(halo, laserStart, lag, haloColor, true);
                 }
             }
-
-            // Update charging/drawing state machine (respect handedness for gating)
-            bool handEnabled = thisHandIsDrawing;
-            bool supportOk = !requireSupportHandHold || !handEnabled || _supportReady;
-            UpdateChargeAndDrawState(isRight, handEnabled && extended, handEnabled && pointing, aimedAtBoard, supportOk);
-
-            // Draw only when allowed (handedness + charged + pointing + aimed)
-            bool allowDraw = handEnabled && supportOk && ((!requireChargeToDraw) ? fingerOk : ((isRight ? _stateR : _stateL) == HandState.Drawing));
             if (allowDraw)
             {
                 // Robustly ensure the drawing loop is active while drawing
@@ -939,6 +937,32 @@ private void SetHandState(bool isRight, HandState newState)
             }
             else
             {
+                SetLineEnabled(laser, false);
+                if (useHaloLaser)
+                {
+                    var halo = isRight ? _laserHaloR : _laserHaloL;
+                    if (halo) SetLineEnabled(halo, false);
+                }
+
+                if (isRight)
+                {
+                    _lagPosR = hitPoint;
+                    _lagVelR = Vector3.zero;
+                    _hasStableR = false;
+                    _hasPrevTargetR = false;
+                    _snapLagR = true;
+                    if (useMomentumLag) _momentumLockedR = false;
+                }
+                else
+                {
+                    _lagPosL = hitPoint;
+                    _lagVelL = Vector3.zero;
+                    _hasStableL = false;
+                    _hasPrevTargetL = false;
+                    _snapLagL = true;
+                    if (useMomentumLag) _momentumLockedL = false;
+                }
+
                 if (isRight && _isDrawingR) { StopDrawingFully(true); }
                 if (!isRight && _isDrawingL) { StopDrawingFully(false); }
                 // Disable FX when not drawing
@@ -1393,6 +1417,27 @@ private void UpdateChargeAndDrawState(bool isRight, bool extended, bool fingerOk
             src.Stop();
             src.clip = null;
         }
+    }
+
+    public void ForceStopAllAudio()
+    {
+        StopDrawingLoopOnBeam(true);
+        StopDrawingLoopOnBeam(false);
+        StopChargeUpOnBeam(true);
+        StopChargeUpOnBeam(false);
+
+        ResetBeamAudioState(true);
+        ResetBeamAudioState(false);
+    }
+
+    private void ResetBeamAudioState(bool isRight)
+    {
+        var src = GetBeamAudio(isRight);
+        if (!src) return;
+        if (src.isPlaying) src.Stop();
+        src.loop = false;
+        if (src.clip == drawingLoopClip || src.clip == chargeUpClip)
+            src.clip = null;
     }
 
     // Default impact FX builders (lightweight, Quest-friendly)
@@ -2027,23 +2072,3 @@ private void UpdateChargeAndDrawState(bool isRight, bool extended, bool fingerOk
         return Mathf.Max(minDim, 0.001f);
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

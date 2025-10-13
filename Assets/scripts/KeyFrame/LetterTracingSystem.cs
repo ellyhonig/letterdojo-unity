@@ -1,7 +1,7 @@
-using UnityEngine;
 using System;
-using System.Collections.Generic;
+using UnityEngine;
 
+[DisallowMultipleComponent]
 public class LetterTracingSystem : MonoBehaviour
 {
     public enum TracingState
@@ -11,114 +11,174 @@ public class LetterTracingSystem : MonoBehaviour
         Completed
     }
 
-    public TracingState CurrentState { get; private set; }
+    [Header("Trace Components")]
+    [SerializeField] private LetterPathRenderer pathRenderer;
+    [SerializeField] private LetterTraceAimSequence aimSequence;
+    [SerializeField] private string fallbackLetter = "a";
+
+    public TracingState CurrentState { get; private set; } = TracingState.Idle;
+    public int CurrentKeyframeIndex { get; private set; }
+    public string CurrentLetter => currentLetter;
 
     public event Action OnTraceStarted;
     public event Action OnKeyframeReached;
     public event Action OnTraceCompleted;
 
-    [SerializeField] private CanvasManager canvasManager;
-    [SerializeField] private float proximityThreshold = 0.1f;
-    [SerializeField] private float pointDistance = 0.5f; // Distance to determine end of first letter
-    [SerializeField] private bool firstLetter = true; // Whether to trace only the first letter
+    private string currentLetter = string.Empty;
+    private bool callbacksAttached;
 
-    private int currentKeyframeIndex;
-    public int lastLetterKeyframeIndex;
-
-    public int CurrentKeyframeIndex => currentKeyframeIndex;
-
-    private void Start()
+    private void Awake()
     {
-        if (canvasManager == null)
-        {
-            canvasManager = GetComponent<CanvasManager>();
-        }
-        
-        CurrentState = TracingState.Idle;
+        ResolveDependencies();
     }
 
-    private void Update()
+    private void OnEnable()
     {
-        if (CurrentState == TracingState.Tracing)
+        AttachCallbacks();
+    }
+
+    private void OnDisable()
+    {
+        DetachCallbacks();
+    }
+
+    private void OnDestroy()
+    {
+        DetachCallbacks();
+    }
+
+    private void ResolveDependencies()
+    {
+        if (!pathRenderer)
         {
-            CheckKeyframeProximity();
+            pathRenderer = GetComponent<LetterPathRenderer>() ?? GetComponentInChildren<LetterPathRenderer>(true);
+        }
+
+        if (!aimSequence)
+        {
+            aimSequence = GetComponent<LetterTraceAimSequence>() ?? GetComponentInChildren<LetterTraceAimSequence>(true);
+        }
+
+        if (aimSequence && !pathRenderer)
+        {
+            pathRenderer = aimSequence.GetComponent<LetterPathRenderer>();
+        }
+
+        if (!aimSequence && pathRenderer)
+        {
+            aimSequence = pathRenderer.GetComponent<LetterTraceAimSequence>();
+        }
+
+        if (!aimSequence || !pathRenderer)
+        {
+            Debug.LogWarning("[LetterTracingSystem] Missing LetterPathRenderer or LetterTraceAimSequence components.", this);
         }
     }
 
-    private void CheckKeyframeProximity()
+    private void AttachCallbacks()
     {
-        if (currentKeyframeIndex >= canvasManager.activeSpheres.Count || 
-            (firstLetter && currentKeyframeIndex > lastLetterKeyframeIndex))
+        ResolveDependencies();
+        if (aimSequence == null || callbacksAttached)
         {
             return;
         }
 
-        Vector3 currentKeyframePosition = canvasManager.activeSpheres[currentKeyframeIndex].transform.position;
+        aimSequence.PointCompleted += HandlePointCompleted;
+        aimSequence.TraceCompleted += HandleTraceCompleted;
+        callbacksAttached = true;
+    }
 
-        // Get the positions of the right and left hands from the CanvasManager's recorder player
-        Vector3 rightHandPosition = canvasManager.recorder.playerToRecord.righthand.transform.position;
-        Vector3 leftHandPosition = canvasManager.recorder.playerToRecord.lefthand.transform.position;
-
-        // Check the distance to both hands and trigger if either hand is close enough
-        if (Vector3.Distance(rightHandPosition, currentKeyframePosition) < proximityThreshold ||
-            Vector3.Distance(leftHandPosition, currentKeyframePosition) < proximityThreshold)
+    private void DetachCallbacks()
+    {
+        if (aimSequence == null || !callbacksAttached)
         {
-            OnKeyframeReached?.Invoke();
-            currentKeyframeIndex++;
-            Debug.Log("Hit a point");
-
-            if (currentKeyframeIndex >= canvasManager.activeSpheres.Count || 
-                (firstLetter && currentKeyframeIndex > lastLetterKeyframeIndex))
-            {
-                CurrentState = TracingState.Completed;
-                OnTraceCompleted?.Invoke();
-            }
+            return;
         }
+
+        aimSequence.PointCompleted -= HandlePointCompleted;
+        aimSequence.TraceCompleted -= HandleTraceCompleted;
+        callbacksAttached = false;
+    }
+
+    public void SetLetter(string letter)
+    {
+        ResolveDependencies();
+
+        currentLetter = string.IsNullOrWhiteSpace(letter) ? fallbackLetter : letter.Trim();
+        CurrentKeyframeIndex = 0;
+        CurrentState = TracingState.Idle;
+
+        if (pathRenderer != null)
+        {
+            pathRenderer.RenderLetter(currentLetter);
+        }
+
+        aimSequence?.PrepareSequence();
     }
 
     public void StartTracing()
     {
+        ResolveDependencies();
+        AttachCallbacks();
 
-    if (canvasManager.activeSpheres.Count == 0)
-    {
-        Debug.LogWarning("StartTracing() aborted – no valid spheres.");
-        return;
-    }
+        if (aimSequence == null)
+        {
+            Debug.LogWarning("[LetterTracingSystem] StartTracing aborted - no LetterTraceAimSequence available.", this);
+            CurrentState = TracingState.Idle;
+            return;
+        }
+
+        if (!aimSequence.StartRun())
+        {
+            Debug.LogWarning($"[LetterTracingSystem] StartTracing aborted - no trace points available for '{currentLetter}'.", this);
+            CurrentState = TracingState.Completed;
+            CurrentKeyframeIndex = 0;
+            OnTraceCompleted?.Invoke();
+            return;
+        }
 
         CurrentState = TracingState.Tracing;
-        currentKeyframeIndex = 0;
-        
-        if (firstLetter)
-        {
-            DetermineLastLetterKeyframe();
-        }
-        else
-        {
-            lastLetterKeyframeIndex = canvasManager.activeSpheres.Count - 1;
-        }
-
+        CurrentKeyframeIndex = 0;
         OnTraceStarted?.Invoke();
     }
 
-    private void DetermineLastLetterKeyframe()
+    private void HandlePointCompleted(int index)
     {
-        lastLetterKeyframeIndex = 0;
-        for (int i = 0; i < canvasManager.activeSpheres.Count - 1; i++)
+        if (CurrentState != TracingState.Tracing)
         {
-            if (Vector3.Distance(canvasManager.activeSpheres[i].transform.position, 
-                                 canvasManager.activeSpheres[i + 1].transform.position) > pointDistance)
-            {
-                lastLetterKeyframeIndex = i;
-                break;
-            }
-        }
-        
-        // If no break is found, set to the last sphere
-        if (lastLetterKeyframeIndex == 0)
-        {
-            lastLetterKeyframeIndex = canvasManager.activeSpheres.Count - 1;
+            return;
         }
 
-        Debug.Log($"Last keyframe of first letter: {lastLetterKeyframeIndex}");
+        CurrentKeyframeIndex = index;
+        OnKeyframeReached?.Invoke();
+        CurrentKeyframeIndex = Mathf.Max(CurrentKeyframeIndex, index + 1);
+    }
+
+    private void HandleTraceCompleted()
+    {
+        CurrentState = TracingState.Completed;
+        if (aimSequence != null)
+        {
+            CurrentKeyframeIndex = Mathf.Max(CurrentKeyframeIndex, aimSequence.CompletedCount);
+        }
+        OnTraceCompleted?.Invoke();
+    }
+
+    public void SetVisualizationActive(bool active)
+    {
+        ResolveDependencies();
+        if (pathRenderer != null)
+            pathRenderer.SetVisualizationVisible(active);
+        if (aimSequence != null)
+            aimSequence.SetVisualizationVisible(active);
+
+        if (!active)
+            CurrentState = TracingState.Idle;
+    }
+
+    public bool TryTriggerAtWorldPoint(Vector3 worldPoint)
+    {
+        // Aim handling is managed internally by LetterTraceAimSequence.
+        return false;
     }
 }
