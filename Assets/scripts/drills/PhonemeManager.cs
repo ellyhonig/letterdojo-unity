@@ -201,42 +201,7 @@ public class PhonemeManager : MonoBehaviour
         prevWait  = waitIndicator  && waitIndicator.activeSelf;
     }
 
-    private static readonly Dictionary<char, string> phonemeCharFold = new()
-    {
-        { '+ª', "ae" },
-        { '+æ', "a" },
-        { '+Æ', "o" },
-        { '+É', "a" },
-        { '-î', "u" },
-        { '+Ö', "e" },
-        { '+¢', "e" },
-        { '+£', "e" },
-        { '+P', "e" },
-        { '+Ü', "er" },
-        { '+¥', "er" },
-        { '+¬', "i" },
-        { '+»', "i" },
-        { '-¦', "i" },
-        { '-Å', "y" },
-        { '-è', "u" },
-        { '+ô', "oe" },
-        { '++', "oe" },
-        { '+ö', "o" },
-        { '+í', "g" },
-        { '++', "th" },
-        { '+¦', "th" },
-        { '-â', "sh" },
-        { '-Æ', "zh" },
-        { '+ï', "ng" },
-        { '+º', "sh" },
-        { '-ñ', "j" },
-        { '-º', "ch" },
-        { '-É', "" },
-        { '-ê', "" },
-        { '-î', "" },
-        { '?', "" },
-        { 'n++', "" }
-    };
+    private static readonly Dictionary<char, string> phonemeCharFold = new();
 
     /* ultra-lenient IPA map */
     private readonly Dictionary<string,List<string>> letterToIPA = new()
@@ -1024,4 +989,5 @@ public class PhonemeManager : MonoBehaviour
         return sb.ToString();
     }
 }
+
 
