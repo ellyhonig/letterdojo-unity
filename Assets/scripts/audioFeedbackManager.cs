@@ -187,6 +187,12 @@ public class AudioFeedbackManager : MonoBehaviour
                 AudioClip clip = DownloadHandlerAudioClip.GetContent(req);
                 if (clip)
                 {
+                    // Clean up previous clip to prevent memory accumulation
+                    if (audioSource.clip != null && audioSource.clip != clip)
+                    {
+                        Destroy(audioSource.clip);
+                    }
+                    
                     audioSource.clip = clip;
                     audioSource.Play();
                 }
@@ -224,5 +230,15 @@ public class AudioFeedbackManager : MonoBehaviour
         {
             objectManager.OnObjectCollected -= HandleObjectCollected;
         }
+        
+        // Clean up audio source clip to prevent memory leaks
+        if (audioSource && audioSource.clip)
+        {
+            Destroy(audioSource.clip);
+            audioSource.clip = null;
+        }
+        
+        // Stop all coroutines to prevent memory leaks
+        StopAllCoroutines();
     }
 }

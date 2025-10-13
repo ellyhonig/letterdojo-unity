@@ -18,6 +18,7 @@ public class ProximityButton : MonoBehaviour
     [SerializeField] private float proximityThreshold = 0.05f;
     [SerializeField] private float holdThreshold = 0.5f;
     [SerializeField] private SimpleRecorder recorder;
+    [SerializeField] private simplePlayer playerToCheck;
 
     private string buttonName;
     private Action buttonAction;
@@ -32,6 +33,15 @@ public class ProximityButton : MonoBehaviour
         buttonName = name;
         buttonAction = action;
         recorder = rec;
+        CurrentState = ButtonState.Idle;
+    }
+
+    // Overload: initialize with simplePlayer instead of SimpleRecorder
+    public void Initialize(string name, Action action, simplePlayer player)
+    {
+        buttonName = name;
+        buttonAction = action;
+        playerToCheck = player;
         CurrentState = ButtonState.Idle;
     }
 
@@ -52,14 +62,38 @@ public class ProximityButton : MonoBehaviour
 
     private void CheckProximity()
     {
-        if (recorder == null || recorder.playerToRecord == null)
+        GameObject rightHand = null;
+        GameObject leftHand = null;
+
+        if (recorder != null && recorder.playerToRecord != null)
         {
-            Debug.LogError("Recorder or player not set!");
+            rightHand = recorder.playerToRecord.righthand;
+            leftHand = recorder.playerToRecord.lefthand;
+        }
+        else if (playerToCheck != null)
+        {
+            rightHand = playerToCheck.righthand;
+            leftHand = playerToCheck.lefthand;
+        }
+        else
+        {
+            // try to auto-find simplePlayer once
+            var sp = FindObjectOfType<simplePlayer>();
+            if (sp != null)
+            {
+                rightHand = sp.righthand;
+                leftHand = sp.lefthand;
+            }
+        }
+
+        if (rightHand == null || leftHand == null)
+        {
+            Debug.LogError("ProximityButton: no player hands found (need SimpleRecorder or simplePlayer)");
             return;
         }
 
-        Vector3 rightHandPosition = recorder.playerToRecord.righthand.transform.position;
-        Vector3 leftHandPosition = recorder.playerToRecord.lefthand.transform.position;
+        Vector3 rightHandPosition = rightHand.transform.position;
+        Vector3 leftHandPosition = leftHand.transform.position;
 
         float rightDistance = Vector3.Distance(transform.position, rightHandPosition);
         float leftDistance = Vector3.Distance(transform.position, leftHandPosition);
