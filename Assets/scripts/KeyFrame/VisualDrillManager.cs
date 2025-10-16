@@ -85,9 +85,6 @@ public class VisualDrillManager : MonoBehaviour
 
     private VisionRequestWrapper _visionPrimary;
     private VisionRequestWrapper _visionFallback;
-    private string _cachedPromptBeforeTrace = string.Empty;
-    private bool _promptHiddenForTrace;
-    private GameObject _promptRoot;
 
     private void ResolveLevelManager()
     {
@@ -99,27 +96,7 @@ public class VisualDrillManager : MonoBehaviour
 
     private void LateUpdate()
     {
-        if (!promptText || !levelManager) return;
-
-        bool shouldShow = levelManager.currentMode == LevelManager.GameMode.PhonemeChecking;
-        if (!shouldShow)
-        {
-            if (!_promptHiddenForTrace)
-            {
-                _cachedPromptBeforeTrace = promptText.text;
-                SetPromptVisible(false);
-                _promptHiddenForTrace = true;
-            }
-        }
-        else if (_promptHiddenForTrace)
-        {
-            string restore = !string.IsNullOrEmpty(_currentExpected)
-                ? _currentExpected.ToUpperInvariant()
-                : _cachedPromptBeforeTrace;
-            promptText.text = restore ?? string.Empty;
-            SetPromptVisible(true);
-            _promptHiddenForTrace = false;
-        }
+        // Prompt visibility is managed by PhonemeManager.
     }
 
     private void HookLevelManager()
@@ -257,12 +234,6 @@ public class VisualDrillManager : MonoBehaviour
             drawerHost = planeDrawer.gameObject;
         }
         ResolveLevelManager();
-        if (promptText)
-        {
-            var parent = promptText.transform.parent;
-            _promptRoot = parent ? parent.gameObject : promptText.gameObject;
-        }
-
         CacheWaits();
         SetupVisionPayloads();
 
@@ -303,44 +274,12 @@ public class VisualDrillManager : MonoBehaviour
 
     private void HandleGameModeChanged(LevelManager.GameMode mode)
     {
-        if (!promptText) return;
-
-        bool shouldShow = mode == LevelManager.GameMode.PhonemeChecking;
-
-        if (!shouldShow)
-        {
-            if (_promptHiddenForTrace) return;
-
-            _cachedPromptBeforeTrace = promptText.text;
-            SetPromptVisible(false);
-            _promptHiddenForTrace = true;
-        }
-        else
-        {
-            if (!_promptHiddenForTrace) return;
-
-            string restore = !string.IsNullOrEmpty(_currentExpected)
-                ? _currentExpected.ToUpperInvariant()
-                : _cachedPromptBeforeTrace;
-            promptText.text = restore ?? string.Empty;
-            SetPromptVisible(true);
-            _promptHiddenForTrace = false;
-        }
+        // Prompt visibility is managed by PhonemeManager.
     }
 
     private void SetPromptVisible(bool visible)
     {
-        if (!promptText) return;
-
-        if (_promptRoot)
-            _promptRoot.SetActive(visible);
-
-        promptText.enabled = visible;
-        if (promptText.canvasRenderer != null)
-            promptText.canvasRenderer.SetAlpha(visible ? 1f : 0f);
-
-        if (!visible)
-            promptText.text = string.Empty;
+        // Legacy method retained for compatibility; actual visibility is managed by PhonemeManager.
     }
 
 #if UNITY_EDITOR

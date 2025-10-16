@@ -31,6 +31,10 @@ public class PhonemeManager : MonoBehaviour
     [Header("TextMeshPro for Feedback")]
     [SerializeField] private TextMeshPro feedbackText;
 
+    [Header("Letter Prompt")]
+    [SerializeField] private TMP_Text letterPrompt;
+    [SerializeField] private GameObject letterPromptRoot;
+
     [Header("Beam API")]
     [SerializeField] private string API_URL = "https://recognize-3a64e01-v3.app.beam.cloud";
     [SerializeField] private string TOKEN   = "YOUR_BEAM_TOKEN";
@@ -301,6 +305,8 @@ public class PhonemeManager : MonoBehaviour
         micDevice = Microphone.devices.Length > 0 ? Microphone.devices[0] : null;
         if (micDevice == null) Debug.LogError("PhonemeManager: No microphone detected");
 
+        SetLetterPromptVisible(false);
+
         if (proximityButtonObject)
         {
             proximityButton = proximityButtonObject.GetComponent<ProximityButton>();
@@ -315,9 +321,15 @@ public class PhonemeManager : MonoBehaviour
 
         sPlayer = GetComponent<simplePlayer>();
         RefreshIndicators(true);
-        levelManager.OnPhonemeCheckStart += () => SetState(PhonemeCheckState.Start);
-        // Ensure indicators follow mode changes instantly (never on in other modes)
-        if (levelManager != null) levelManager.OnGameModeChanged += HandleModeChanged;
+
+        if (levelManager != null)
+        {
+            levelManager.OnPhonemeCheckStart += () => SetState(PhonemeCheckState.Start);
+            levelManager.OnGameModeChanged += HandleModeChanged;
+            levelManager.OnLetterChanged   += HandleLetterChanged;
+            HandleModeChanged(levelManager.currentMode);
+            HandleLetterChanged(levelManager.currentLetter);
+        }
     }
 
     private void Start()
@@ -915,16 +927,66 @@ public class PhonemeManager : MonoBehaviour
             proximityButton.OnButtonPressed  -= HandlePhysicalPress;
             proximityButton.OnButtonReleased -= HandlePhysicalRelease;
         }
-        if (levelManager != null) levelManager.OnGameModeChanged -= HandleModeChanged;
+        if (levelManager != null)
+        {
+            levelManager.OnGameModeChanged -= HandleModeChanged;
+            levelManager.OnLetterChanged   -= HandleLetterChanged;
+        }
         StopMic();
         if (recordedClip) Destroy(recordedClip);
         recordedClip = null;
 
         if (btnMat) Destroy(btnMat);
         btnMat = null;
+
+        SetLetterPromptVisible(false);
     }
 
     [Serializable] private struct BeamReq { public string audio_file; }
+
+    private GameObject ResolveLetterPromptRoot()
+    {
+        if (!letterPrompt) return null;
+        if (letterPromptRoot) return letterPromptRoot;
+        Transform parent = letterPrompt.transform.parent;
+        return parent ? parent.gameObject : letterPrompt.gameObject;
+    }
+
+    private void SetLetterPromptVisible(bool visible)
+    {
+        if (!letterPrompt) return;
+
+        GameObject root = ResolveLetterPromptRoot();
+        if (root) root.SetActive(visible);
+
+        letterPrompt.enabled = visible;
+        if (!visible)
+            letterPrompt.text = string.Empty;
+    }
+
+    private void UpdateLetterPromptText()
+    {
+        if (!letterPrompt || levelManager == null) return;
+        string letter = levelManager.currentLetter ?? string.Empty;
+        letterPrompt.text = string.IsNullOrEmpty(letter) ? string.Empty : letter.ToUpperInvariant();
+    }
+
+    private void HandleLetterChanged(string letter)
+    {
+        if (!letterPrompt) return;
+
+        string display = string.IsNullOrEmpty(letter) ? string.Empty : letter.ToUpperInvariant();
+        letterPrompt.text = display;
+
+        if (levelManager != null && levelManager.currentMode == LevelManager.GameMode.PhonemeChecking)
+        {
+            SetLetterPromptVisible(true);
+        }
+        else
+        {
+            SetLetterPromptVisible(false);
+        }
+    }
 
     private void HandleModeChanged(LevelManager.GameMode mode)
     {
@@ -938,12 +1000,15 @@ public class PhonemeManager : MonoBehaviour
             if (waitIndicator  && waitIndicator.activeSelf)  waitIndicator.SetActive(false);
             prevSpeak = speakIndicator && speakIndicator.activeSelf;
             prevWait  = waitIndicator  && waitIndicator.activeSelf;
+            SetLetterPromptVisible(false);
         }
         else
         {
             StartMicIfNeeded();
             // Re-evaluate based on current recording state
             RefreshIndicators(true);
+            UpdateLetterPromptText();
+            SetLetterPromptVisible(true);
         }
     }
 
