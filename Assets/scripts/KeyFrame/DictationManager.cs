@@ -382,7 +382,7 @@ public class DictationManager : MonoBehaviour
 
     private void AutoGradeUpdate()
     {
-        if (!autoGradeOnIdle || canvas == null || canvas.activeSpheres == null || state != State.Drawing)
+        if (!autoGradeOnIdle || _planeDrawer == null || _planeDrawer.StrokesRoot == null || state != State.Drawing)
             return;
 
         bool canRemote = ShouldUseRemoteGrading;
@@ -391,7 +391,7 @@ public class DictationManager : MonoBehaviour
         if (!canRemote && !canLocal)
             return;
 
-        int pointCount = canvas.activeSpheres.Count;
+        int pointCount = GetCurrentStrokeCount();
         if (pointCount != _lastStrokeCount)
         {
             _lastStrokeCount = pointCount;
