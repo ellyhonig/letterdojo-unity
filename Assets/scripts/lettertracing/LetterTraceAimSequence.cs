@@ -368,9 +368,7 @@ private void ApplyVisual(PointState state, Color color, float scaleMultiplier)
 
     private GameObject CreateGeneratedMarker(Vector3 worldPosition)
     {
-        Transform parent = markerParentOverride != null
-            ? markerParentOverride
-            : ((canvasManager != null && canvasManager.canvasPlane != null) ? canvasManager.canvasPlane.transform : transform);
+        Transform parent = ResolveMarkerParent();
 
         GameObject marker;
         if (markerPrefab)
@@ -381,22 +379,22 @@ private void ApplyVisual(PointState state, Color color, float scaleMultiplier)
         }
         else
         {
-            marker = CreateDefaultMarker(parent);
+            marker = CreateDefaultMarker();
+            marker.transform.SetParent(parent, false);
             marker.transform.localScale = Vector3.one * markerScale;
         }
 
         marker.name = "TraceAnchor";
+        marker.layer = parent.gameObject.layer;
         marker.transform.position = worldPosition;
         generatedMarkers.Add(marker);
         return marker;
     }
 
-    private GameObject CreateDefaultMarker(Transform parent)
+    private GameObject CreateDefaultMarker()
     {
         EnsureSharedMarkerResources();
         GameObject marker = new GameObject("TraceAnchor");
-        marker.transform.SetParent(parent, false);
-        marker.layer = parent.gameObject.layer;
         var filter = marker.AddComponent<MeshFilter>();
         filter.sharedMesh = sharedMarkerMesh;
         var renderer = marker.AddComponent<MeshRenderer>();
@@ -424,6 +422,17 @@ private void ApplyVisual(PointState state, Color color, float scaleMultiplier)
             DestroyImmediate(temp);
     }
 
+    private Transform ResolveMarkerParent()
+    {
+        if (markerParentOverride)
+            return markerParentOverride;
+        if (canvasManager != null && canvasManager.canvasPlane != null)
+            return canvasManager.canvasPlane.transform;
+        if (pathRenderer != null && pathRenderer.ContentRoot != null)
+            return pathRenderer.ContentRoot;
+        return transform;
+    }
+
     private bool TryBuildPointsFromRecorder()
     {
         if (!recorder || recorder.currentRecord == null ||
@@ -433,7 +442,7 @@ private void ApplyVisual(PointState state, Color color, float scaleMultiplier)
         }
 
         Transform canvasPlane = null;
-        if (canvasManager != null && canvasManager.canvasPlane != null != null)
+        if (canvasManager != null && canvasManager.canvasPlane != null)
         {
             canvasPlane = canvasManager.canvasPlane.transform;
         }
@@ -713,8 +722,8 @@ private void ApplyVisual(PointState state, Color color, float scaleMultiplier)
         GameObject cylinder = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
         RemoveCollider(cylinder);
         cylinder.name = "TraceSegment";
-        Transform parent = pathRenderer.ContentRoot != null ? pathRenderer.ContentRoot : transform;
-        cylinder.transform.SetParent(parent, true);
+        Transform parent = ResolveMarkerParent();
+        cylinder.transform.SetParent(parent, false);
         cylinder.GetComponent<Renderer>().sharedMaterial = ResolveCylinderMaterial();
         spawnedCylinders.Add(cylinder);
         return cylinder;
