@@ -682,19 +682,25 @@ private void ApplyVisual(PointState state, Color color, float scaleMultiplier)
 
     private void RevealSegment(int startIndex, int endIndex)
     {
-        SegmentKey key = new SegmentKey(startIndex, endIndex);
-        if (!segmentLookup.TryGetValue(key, out LetterPathRenderer.SegmentLink link))
-        {
+        if (!IsValidPointIndex(startIndex) || !IsValidPointIndex(endIndex))
             return;
-        }
 
-        if (!cylinderLookup.TryGetValue(key, out GameObject cylinder))
+        var startPoint = points[startIndex];
+        var endPoint = points[endIndex];
+        if (startPoint?.marker == null || endPoint?.marker == null)
+            return;
+
+        SegmentKey key = new SegmentKey(startIndex, endIndex);
+        GameObject cylinder = GetOrCreateCylinder(key);
+
+        if (segmentLookup.TryGetValue(key, out LetterPathRenderer.SegmentLink link))
         {
-            cylinder = CreateSegmentCylinder();
-            cylinderLookup[key] = cylinder;
+            PositionCylinder(cylinder, link);
         }
-
-        PositionCylinder(cylinder, link);
+        else
+        {
+            PositionCylinderWorld(cylinder, startPoint.marker.transform.position, endPoint.marker.transform.position);
+        }
 
         if (logSequenceEvents)
         {
@@ -733,6 +739,14 @@ anchors.Count)
         Vector3 startWorld = root.TransformPoint(anchors[link.StartIndex]);
         Vector3 endWorld = root.TransformPoint(anchors[link.EndIndex]);
 
+        PositionCylinderWorld(cylinder, startWorld, endWorld);
+    }
+
+    private void PositionCylinderWorld(GameObject cylinder, Vector3 startWorld, Vector3 endWorld)
+    {
+        if (cylinder == null)
+            return;
+
         Vector3 direction = endWorld - startWorld;
         float length = direction.magnitude;
         if (length < 1e-5f)
@@ -745,7 +759,8 @@ anchors.Count)
         cylinder.transform.position = (startWorld + endWorld) * 0.5f;
         cylinder.transform.rotation = Quaternion.FromToRotation(Vector3.up, direction.normalized);
 
-        float thickness = Mathf.Max(0.005f, pathRenderer.MarkerBaseScale * segmentThicknessRatio);
+        float baseScale = pathRenderer != null ? pathRenderer.MarkerBaseScale : markerScale;
+        float thickness = Mathf.Max(0.002f, baseScale * segmentThicknessRatio);
         cylinder.transform.localScale = new Vector3(thickness, length * 0.5f, thickness);
 
         if (cylinder.TryGetComponent(out Renderer renderer))
@@ -753,6 +768,18 @@ anchors.Count)
             renderer.material.color = completedColor;
         }
     }
+
+    private GameObject GetOrCreateCylinder(SegmentKey key)
+    {
+        if (!cylinderLookup.TryGetValue(key, out GameObject cylinder) || cylinder == null)
+        {
+            cylinder = CreateSegmentCylinder();
+            cylinderLookup[key] = cylinder;
+        }
+        return cylinder;
+    }
+
+    private bool IsValidPointIndex(int index) => index >= 0 && index < points.Count;
 
     private bool TryGetAimRay(out Vector3 origin, out Vector3 direction)
     {

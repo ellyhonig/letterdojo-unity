@@ -1,4 +1,4 @@
-﻿using UnityEngine;
+using UnityEngine;
 using UnityEngine.Networking;
 using System;
 using System.Collections;
@@ -87,6 +87,7 @@ public class VisualDrillManager : MonoBehaviour
     private VisionRequestWrapper _visionFallback;
     private string _cachedPromptBeforeTrace = string.Empty;
     private bool _promptHiddenForTrace;
+    private GameObject _promptRoot;
 
     private void ResolveLevelManager()
     {
@@ -106,18 +107,17 @@ public class VisualDrillManager : MonoBehaviour
             if (!_promptHiddenForTrace)
             {
                 _cachedPromptBeforeTrace = promptText.text;
-                promptText.gameObject.SetActive(false);
-                promptText.text = string.Empty;
+                SetPromptVisible(false);
                 _promptHiddenForTrace = true;
             }
         }
         else if (_promptHiddenForTrace)
         {
-            promptText.gameObject.SetActive(true);
             string restore = !string.IsNullOrEmpty(_currentExpected)
                 ? _currentExpected.ToUpperInvariant()
                 : _cachedPromptBeforeTrace;
             promptText.text = restore ?? string.Empty;
+            SetPromptVisible(true);
             _promptHiddenForTrace = false;
         }
     }
@@ -257,6 +257,11 @@ public class VisualDrillManager : MonoBehaviour
             drawerHost = planeDrawer.gameObject;
         }
         ResolveLevelManager();
+        if (promptText)
+        {
+            var parent = promptText.transform.parent;
+            _promptRoot = parent ? parent.gameObject : promptText.gameObject;
+        }
 
         CacheWaits();
         SetupVisionPayloads();
@@ -305,21 +310,35 @@ public class VisualDrillManager : MonoBehaviour
             if (_promptHiddenForTrace) return;
 
             _cachedPromptBeforeTrace = promptText.text;
-            promptText.text = string.Empty;
-            promptText.gameObject.SetActive(false);
+            SetPromptVisible(false);
             _promptHiddenForTrace = true;
         }
         else
         {
             if (!_promptHiddenForTrace) return;
 
-            promptText.gameObject.SetActive(true);
             string restore = !string.IsNullOrEmpty(_currentExpected)
                 ? _currentExpected.ToUpperInvariant()
                 : _cachedPromptBeforeTrace;
             promptText.text = restore ?? string.Empty;
+            SetPromptVisible(true);
             _promptHiddenForTrace = false;
         }
+    }
+
+    private void SetPromptVisible(bool visible)
+    {
+        if (!promptText) return;
+
+        if (_promptRoot)
+            _promptRoot.SetActive(visible);
+
+        promptText.enabled = visible;
+        if (promptText.canvasRenderer != null)
+            promptText.canvasRenderer.SetAlpha(visible ? 1f : 0f);
+
+        if (!visible)
+            promptText.text = string.Empty;
     }
 
 #if UNITY_EDITOR
