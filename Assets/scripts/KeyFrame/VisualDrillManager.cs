@@ -101,8 +101,8 @@ public class VisualDrillManager : MonoBehaviour
     {
         if (!promptText || !levelManager) return;
 
-        bool isTrace = levelManager.currentMode == LevelManager.GameMode.TraceChecking;
-        if (isTrace)
+        bool shouldShow = levelManager.currentMode == LevelManager.GameMode.PhonemeChecking;
+        if (!shouldShow)
         {
             if (!_promptHiddenForTrace)
             {
@@ -305,7 +305,9 @@ public class VisualDrillManager : MonoBehaviour
     {
         if (!promptText) return;
 
-        if (mode == LevelManager.GameMode.TraceChecking)
+        bool shouldShow = mode == LevelManager.GameMode.PhonemeChecking;
+
+        if (!shouldShow)
         {
             if (_promptHiddenForTrace) return;
 

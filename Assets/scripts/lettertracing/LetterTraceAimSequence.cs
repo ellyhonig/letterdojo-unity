@@ -724,6 +724,7 @@ private void ApplyVisual(PointState state, Color color, float scaleMultiplier)
         cylinder.name = "TraceSegment";
         Transform parent = ResolveMarkerParent();
         cylinder.transform.SetParent(parent, false);
+        cylinder.layer = parent.gameObject.layer;
         cylinder.GetComponent<Renderer>().sharedMaterial = ResolveCylinderMaterial();
         spawnedCylinders.Add(cylinder);
         return cylinder;
