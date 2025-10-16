@@ -190,7 +190,7 @@ public class AudioFeedbackManager : MonoBehaviour
                     // Clean up previous clip to prevent memory accumulation
                     if (audioSource.clip != null && audioSource.clip != clip)
                     {
-                        Destroy(audioSource.clip);
+                        DestroyAudioClipSafe(audioSource.clip);
                     }
                     
                     audioSource.clip = clip;
@@ -234,11 +234,21 @@ public class AudioFeedbackManager : MonoBehaviour
         // Clean up audio source clip to prevent memory leaks
         if (audioSource && audioSource.clip)
         {
-            Destroy(audioSource.clip);
+            DestroyAudioClipSafe(audioSource.clip);
             audioSource.clip = null;
         }
-        
+
         // Stop all coroutines to prevent memory leaks
         StopAllCoroutines();
+    }
+
+    private void DestroyAudioClipSafe(AudioClip clip)
+    {
+        if (!clip) return;
+#if UNITY_EDITOR
+        DestroyImmediate(clip, true);
+#else
+        Destroy(clip);
+#endif
     }
 }
