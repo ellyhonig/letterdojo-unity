@@ -40,9 +40,18 @@ def flatten_levelplan(typed_data):
     phonemes = parse_string_array(fields.get("Phonemes"))
     modes = parse_string_array(fields.get("Modes"))
 
+    normalized_letters = []
+    normalized_phonemes = []
+    for idx, letter in enumerate(letters):
+        cleaned = (letter or "").strip()
+        if cleaned:
+            cleaned = cleaned[0].lower()
+        normalized_letters.append(cleaned)
+        normalized_phonemes.append(cleaned.lower())
+
     return [{
-        "Letters": letters,
-        "Phonemes": phonemes,
+        "Letters": normalized_letters,
+        "Phonemes": normalized_phonemes,
         "Modes": modes
     }]
 

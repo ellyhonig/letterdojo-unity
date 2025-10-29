@@ -6,6 +6,7 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Reflection;
 using Newtonsoft.Json;
+using System.Linq;
 
 public class LevelManager : MonoBehaviour
 {
@@ -33,6 +34,7 @@ public class LevelManager : MonoBehaviour
     [SerializeField] public PhonemeManager phonemeManager;
     [SerializeField] private PlaneSurfaceDrawer planeSurfaceDrawer;
     [SerializeField] private SaveManager saveManager;
+    [SerializeField] private AudioManager audioManager;
 
     [Header("Pause (optional)")]
     [SerializeField] private GameObject pauseButtonGO;
@@ -75,6 +77,8 @@ public class LevelManager : MonoBehaviour
     private Coroutine memorySweepRoutine;
     private float lastMemorySweepTime;
     private float lastMemoryWarningTime;
+    private string lastSpokenLetter = string.Empty;
+    private bool loggedMissingAudioManager = false;
 
     private void Start()
     {
@@ -122,10 +126,15 @@ public class LevelManager : MonoBehaviour
                 planeSurfaceDrawer = FindObjectOfType<PlaneSurfaceDrawer>();
         }
 
+        if (!audioManager)
+            audioManager = GetComponent<AudioManager>() ?? GetComponentInChildren<AudioManager>(true);
+        if (!audioManager)
+            audioManager = FindObjectOfType<AudioManager>();
+
         if (phonemeManager != null)
         {
             phonemeManager.OnPhonemeCorrect += HandlePhonemeCorrect;
-            phonemeManager.OnPhonemeTriesExhausted += ProceedToNextMode;
+            phonemeManager.OnPhonemeTriesExhausted += HandlePhonemeTriesExhausted;
         }
         if (tracingSystem != null)
             tracingSystem.OnTraceCompleted += OnTraceCompleted;
@@ -146,6 +155,67 @@ public class LevelManager : MonoBehaviour
     private void HandlePausePressed()
     {
         SetPaused(!IsPaused);
+    }
+
+    private AudioManager ResolveAudioManager()
+    {
+        if (audioManager && audioManager.isActiveAndEnabled)
+        {
+            loggedMissingAudioManager = false;
+            return audioManager;
+        }
+
+        var managers = Resources.FindObjectsOfTypeAll<AudioManager>()
+            .Where(a => a != null && a.gameObject.scene.IsValid())
+            .ToArray();
+        audioManager = managers.FirstOrDefault(a => a != null && a.isActiveAndEnabled);
+        if (!audioManager && managers.Length > 0)
+            audioManager = managers[0];
+
+        if (audioManager && audioManager.isActiveAndEnabled)
+        {
+            loggedMissingAudioManager = false;
+            return audioManager;
+        }
+
+        if (!loggedMissingAudioManager)
+        {
+            Debug.LogWarning("[LevelManager] AudioManager not available; skipping letter audio.");
+            loggedMissingAudioManager = true;
+        }
+
+        return null;
+    }
+
+    private static char ExtractFirstAsciiLetter(string value)
+    {
+        if (string.IsNullOrEmpty(value)) return '\0';
+        foreach (char c in value)
+        {
+            if (char.IsLetter(c))
+                return c;
+        }
+        return '\0';
+    }
+
+    private void TryPlayLetterAudio(string letter)
+    {
+        if (string.IsNullOrEmpty(letter))
+            return;
+
+        if (string.Equals(lastSpokenLetter, letter, StringComparison.OrdinalIgnoreCase))
+            return;
+
+        var manager = ResolveAudioManager();
+        if (manager == null)
+            return;
+
+        char c = ExtractFirstAsciiLetter(letter);
+        if (c == '\0')
+            return;
+
+        if (manager.TryPlayLetterPronunciation(c))
+            lastSpokenLetter = letter;
     }
 
     private IEnumerator SweepWarmupTimer()
@@ -198,13 +268,28 @@ public class LevelManager : MonoBehaviour
 
     private static void EnsurePhonemeCoverage(Phase phase)
     {
-        if (phase.Phonemes == null)
-            phase.Phonemes = new List<string>();
         if (phase.Letters == null)
             phase.Letters = new List<string>();
+        if (phase.Phonemes == null)
+            phase.Phonemes = new List<string>();
 
-        while (phase.Phonemes.Count < phase.Letters.Count)
-            phase.Phonemes.Add(phase.Letters[phase.Phonemes.Count]);
+        for (int i = 0; i < phase.Letters.Count; i++)
+        {
+            string raw = phase.Letters[i] ?? string.Empty;
+            raw = raw.Trim();
+            string upper = raw.Length > 0 ? raw.Substring(0, 1).ToUpperInvariant() : string.Empty;
+            string lower = upper.ToLowerInvariant();
+
+            phase.Letters[i] = upper;
+
+            if (phase.Phonemes.Count <= i)
+                phase.Phonemes.Add(lower);
+            else
+                phase.Phonemes[i] = lower;
+        }
+
+        if (phase.Phonemes.Count > phase.Letters.Count)
+            phase.Phonemes.RemoveRange(phase.Letters.Count, phase.Phonemes.Count - phase.Letters.Count);
     }
 
     private static List<GameMode> ConvertModes(List<string> modes)
@@ -438,6 +523,11 @@ public class LevelManager : MonoBehaviour
                 break;
             case GameMode.TraceChecking:
                 tracingSystem?.StartTracing();
+                if (!string.IsNullOrEmpty(currentLetter))
+                {
+                    lastSpokenLetter = string.Empty;
+                    TryPlayLetterAudio(currentLetter);
+                }
                 break;
             case GameMode.ObjectPlacing:
                 objectManager?.StartObjectPlacing();
@@ -489,13 +579,22 @@ public class LevelManager : MonoBehaviour
     private IEnumerator LoadAfterStart()
     {
         yield return null;
-        if (recorder) recorder.LoadRecording(currentLetter);
+        // Only load fallback strokes for trace modes; skip in Dictation to avoid unnecessary memory churn.
+        if (recorder && currentMode != GameMode.Dictation)
+            recorder.LoadRecording(currentLetter);
     }
 
     private void HandlePhonemeCorrect()
     {
         if (currentMode == GameMode.PhonemeChecking)
             ProceedToNextMode();
+    }
+
+    private void HandlePhonemeTriesExhausted()
+    {
+        // Ensure the pronunciation can replay when we advance to trace checking.
+        lastSpokenLetter = string.Empty;
+        ProceedToNextMode();
     }
 
     private void OnTraceCompleted()
@@ -595,24 +694,24 @@ public class LevelManager : MonoBehaviour
             return false;
         }
 
+        string normalized = letter.Trim();
+        if (normalized.Length > 0)
+            normalized = normalized.Substring(0, 1).ToLowerInvariant();
+
         for (int p = 0; p < levelPlan.Count; p++)
         {
             var phase = levelPlan[p];
             if (phase?.Letters == null) continue;
 
-            int li = phase.Letters.FindIndex(l => string.Equals(l, letter, StringComparison.OrdinalIgnoreCase));
+            int li = phase.Letters.FindIndex(l => string.Equals(l, normalized, StringComparison.OrdinalIgnoreCase));
             if (li >= 0)
             {
-                if (li >= phase.Phonemes.Count)
-                {
-                    Debug.LogError($"Phonemes array too short for letter '{letter}'. Index {li}, phonemes {phase.Phonemes.Count}.");
-                    return false;
-                }
-
                 phaseIndex = p;
                 letterIndex = li;
                 modeIndex = 0;
                 currentLetter = phase.Letters[li];
+                if (phase.Phonemes.Count <= li)
+                    phase.Phonemes.Add(currentLetter.ToLowerInvariant());
                 currentPhoneme = phase.Phonemes[li];
                 currentLevel = ComputeAbsoluteLevel(p, li);
                 lettersSinceLastSweep = 0;
@@ -626,9 +725,31 @@ public class LevelManager : MonoBehaviour
             }
         }
 
-        if (logIfMissing)
-            Debug.LogWarning($"Letter '{letter}' not found in the level plan.");
-        return false;
+        // Letter not present in plan; inject it into the current phase so downstream systems still work.
+        if (levelPlan.Count == 0)
+            levelPlan.Add(new Phase());
+
+        var targetPhase = levelPlan[Mathf.Clamp(phaseIndex, 0, levelPlan.Count - 1)];
+        if (targetPhase.Letters == null) targetPhase.Letters = new List<string>();
+        if (targetPhase.Phonemes == null) targetPhase.Phonemes = new List<string>();
+
+        int insertIndex = Mathf.Clamp(letterIndex, 0, targetPhase.Letters.Count);
+        targetPhase.Letters.Insert(insertIndex, normalized);
+        int phonemeInsert = Mathf.Clamp(insertIndex, 0, targetPhase.Phonemes.Count);
+        targetPhase.Phonemes.Insert(phonemeInsert, normalized);
+
+        phaseIndex = Mathf.Clamp(phaseIndex, 0, levelPlan.Count - 1);
+        letterIndex = Mathf.Clamp(insertIndex, 0, targetPhase.Letters.Count - 1);
+        modeIndex = 0;
+        currentLetter = normalized;
+        currentPhoneme = normalized;
+        lettersSinceLastSweep = 0;
+        NotifyLetterChanged();
+        LoadLevelData();
+        hasBootstrapped = false;
+        StartCurrentMode();
+        Debug.LogWarning($"Letter '{letter}' was missing from the plan; injecting it into phase {phaseIndex}.");
+        return true;
     }
 
     private int ComputeAbsoluteLevel(int targetPhase, int targetLetterIndex)
@@ -698,16 +819,23 @@ public class LevelManager : MonoBehaviour
         string letter = currentLetter ?? string.Empty;
         tracingSystem?.SetLetter(letter);
         tracingSystem?.SetVisualizationActive(currentMode == GameMode.TraceChecking);
-        if (string.Equals(lastReportedLetter, letter, StringComparison.OrdinalIgnoreCase))
-            return;
 
-        lastReportedLetter = letter;
-        try
+        if (!string.Equals(lastReportedLetter, letter, StringComparison.OrdinalIgnoreCase))
         {
-            PlayerPrefs.SetString("LevelManager.LastLetter", letter);
-            PlayerPrefs.Save();
+            lastReportedLetter = letter;
+            if (!string.IsNullOrEmpty(letter))
+            {
+                try
+                {
+                    PlayerPrefs.SetString("LevelManager.LastLetter", letter);
+                    PlayerPrefs.Save();
+                }
+                catch { }
+            }
         }
-        catch { }
+
+        // Reset so the upcoming mode switch can replay the pronunciation.
+        lastSpokenLetter = string.Empty;
 
         OnLetterChanged?.Invoke(letter);
     }
@@ -828,7 +956,7 @@ public class LevelManager : MonoBehaviour
         if (phonemeManager != null)
         {
             phonemeManager.OnPhonemeCorrect -= HandlePhonemeCorrect;
-            phonemeManager.OnPhonemeTriesExhausted -= ProceedToNextMode;
+            phonemeManager.OnPhonemeTriesExhausted -= HandlePhonemeTriesExhausted;
         }
         if (tracingSystem != null) tracingSystem.OnTraceCompleted -= OnTraceCompleted;
         if (objectManager != null) objectManager.OnObjectCollected -= OnObjectCollected;

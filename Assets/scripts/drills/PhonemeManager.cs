@@ -7,6 +7,7 @@ using System.Collections.Generic;
 using System.Text;
 using System.Linq;
 using System.Globalization;
+using System.Text.RegularExpressions;
 
 [RequireComponent(typeof(LevelManager))]
 public class PhonemeManager : MonoBehaviour
@@ -39,6 +40,11 @@ public class PhonemeManager : MonoBehaviour
     [SerializeField] private string API_URL = "https://recognize-3a64e01-v3.app.beam.cloud";
     [SerializeField] private string TOKEN   = "YOUR_BEAM_TOKEN";
     [NonSerialized] public string lastBeamText = "";
+    [NonSerialized] public string lastBeamRawText = "";
+
+    [Header("Remote Override")]
+    [SerializeField] private bool useRemoteServer = false;
+    [SerializeField] private string remoteAPIUrl = "http://108.46.76.56:8080/recognize";
 
     [Header("Mic Settings")]
     [SerializeField] private int maxRecordingSeconds = 15;
@@ -51,6 +57,10 @@ public class PhonemeManager : MonoBehaviour
     public float amplitudeThreshold = 0.03f;
     public float loudEnoughTime = 0.18f;
 
+    [Header("Ambient Noise Handling")]
+    [SerializeField, Min(0.1f)] private float noiseSampleDuration = 0.5f;
+    [SerializeField, Min(1.1f)] private float noiseDeltaMultiplier = 1.1f;
+
     [Header("Auto-Stop Look-Away")]
     public float lookAwayGrace = 0.2f;
 
@@ -62,12 +72,14 @@ public class PhonemeManager : MonoBehaviour
     [SerializeField] private GameObject speakIndicator;
     [SerializeField] private GameObject waitIndicator;
 
+    [Header("Utterance Progress")]
+    [SerializeField] private GameObject[] utteranceCheckmarks = new GameObject[3];
+    [SerializeField] private AudioManager audioManager;
+
     /* -> LENIENCY */
     [Header("Lenient-mode Settings")]
     [Tooltip("How many loud utterances before we send to Beam")]
     [SerializeField] private int utterancesRequired = 3;
-    [Tooltip("Seconds wait indicator flashes after 1st utterance")]
-    [SerializeField] private float betweenUtteranceFlash = 1f;
     [Tooltip("Secs of relative silence before next utterance allowed")]
     [SerializeField] private float silenceGap = 0.25f;
     [Tooltip("Peak below this factor*ampThresh counts as silence")]
@@ -76,7 +88,6 @@ public class PhonemeManager : MonoBehaviour
     /* ---------- privates ---------- */
     private bool prevSpeak, prevWait;
     private Coroutine blinkCoroutine;
-    private Coroutine flashCoroutine;
 
     public event Action OnPhonemeCorrect;
     public event Action OnPhonemeIncorrect;
@@ -118,6 +129,22 @@ public class PhonemeManager : MonoBehaviour
     /* beam startup gate */
     private bool beamReady = false;
 
+    private float ambientNoisePeak;
+    private float calibratedAmplitudeDelta;
+    private float currentAmplitudeThresholdValue;
+    private bool suppressIndicators;
+    private Coroutine noiseSampleRoutine;
+
+    private string GetActiveApiUrl() => useRemoteServer ? remoteAPIUrl : API_URL;
+    private bool ShouldSendAuthHeader() => !useRemoteServer && !string.IsNullOrEmpty(TOKEN);
+
+    private static readonly Regex ipaFieldRegex    = new Regex("\"ipa\"\\s*:\\s*\"(?<value>.*?)\"", RegexOptions.Compiled);
+    private static readonly Regex textFieldRegex   = new Regex("\"text\"\\s*:\\s*\"(?<value>.*?)\"", RegexOptions.Compiled);
+    private static readonly Regex rawTextFieldRegex = new Regex("\"raw_text\"\\s*:\\s*\"(?<value>.*?)\"", RegexOptions.Compiled);
+    public float AmbientNoiseBaseline => ambientNoisePeak;
+    public float EffectiveAmplitudeThreshold => GetEffectiveAmplitudeThreshold();
+    public float EffectiveSilenceThreshold => GetSilenceThreshold();
+
     /* ===================== INDICATOR GATE (mutex-style) ===================== */
     private sealed class IndicatorGate
     {
@@ -158,7 +185,7 @@ public class PhonemeManager : MonoBehaviour
                     uint sSeq = speakSeq.Values.Max();
                     uint wSeq = waitSeq.Values.Max();
                     if (sSeq != wSeq) finalSpeak = sSeq > wSeq;
-                    else finalSpeak = true; // tie GÂ∆ Speak
+                    else finalSpeak = true; // tie GÔøΩÔøΩ Speak
                 }
                 finalWait = !finalSpeak;
             }
@@ -172,6 +199,14 @@ public class PhonemeManager : MonoBehaviour
     /* ---------- PUBLIC ACCESSORS (safe, mutually exclusive) ---------- */
     public void SetSpeakIndicator(bool on, string tag = "external", int priority = 0)
     {
+        if (suppressIndicators)
+        {
+            indicatorGate.WantSpeak(tag, false, priority);
+            if (speakIndicator && speakIndicator.activeSelf) speakIndicator.SetActive(false);
+            prevSpeak = speakIndicator && speakIndicator.activeSelf;
+            return;
+        }
+
         bool inPhonemeMode = levelManager != null && levelManager.currentMode == LevelManager.GameMode.PhonemeChecking;
         // Only allow enabling during phoneme checking
         indicatorGate.WantSpeak(tag, inPhonemeMode && on, priority);
@@ -187,8 +222,17 @@ public class PhonemeManager : MonoBehaviour
         prevSpeak = speakIndicator && speakIndicator.activeSelf;
         prevWait  = waitIndicator  && waitIndicator.activeSelf;
     }
+
     public void SetWaitIndicator(bool on, string tag = "external", int priority = 0)
     {
+        if (suppressIndicators)
+        {
+            indicatorGate.WantWait(tag, false, priority);
+            if (waitIndicator && waitIndicator.activeSelf) waitIndicator.SetActive(false);
+            prevWait = waitIndicator && waitIndicator.activeSelf;
+            return;
+        }
+
         bool inPhonemeMode = levelManager != null && levelManager.currentMode == LevelManager.GameMode.PhonemeChecking;
         // Only allow enabling during phoneme checking
         indicatorGate.WantWait(tag, inPhonemeMode && on, priority);
@@ -205,38 +249,411 @@ public class PhonemeManager : MonoBehaviour
         prevWait  = waitIndicator  && waitIndicator.activeSelf;
     }
 
+    private void UpdateUtteranceProgressVisuals()
+    {
+        if (utteranceCheckmarks == null || utteranceCheckmarks.Length == 0) return;
+
+        int visibleCount = Mathf.Clamp(utteranceCount, 0, utteranceCheckmarks.Length);
+        for (int i = 0; i < utteranceCheckmarks.Length; i++)
+        {
+            GameObject mark = utteranceCheckmarks[i];
+            if (!mark) continue;
+
+            bool shouldShow = i < visibleCount;
+            bool wasActive = mark.activeSelf;
+            if (wasActive != shouldShow)
+            {
+                mark.SetActive(shouldShow);
+                if (shouldShow && !wasActive)
+                    PlayUtterancePop();
+            }
+        }
+    }
+
+    private void ClearUtteranceProgressVisuals()
+    {
+        utteranceCount = 0;
+        if (utteranceCheckmarks == null || utteranceCheckmarks.Length == 0) return;
+
+        for (int i = 0; i < utteranceCheckmarks.Length; i++)
+        {
+            GameObject mark = utteranceCheckmarks[i];
+            if (mark && mark.activeSelf)
+                mark.SetActive(false);
+        }
+    }
+
+    private void PlayUtterancePop()
+    {
+        if (!audioManager)
+            audioManager = FindObjectOfType<AudioManager>();
+
+        audioManager?.PlayPop();
+    }
+
     private static readonly Dictionary<char, string> phonemeCharFold = new();
 
-    /* ultra-lenient IPA map */
-    private readonly Dictionary<string,List<string>> letterToIPA = new()
+    /* friendly spellings for remote recognizer */
+    private readonly Dictionary<string, List<string>> letterToFriendlyPhonemes = new()
     {
-        { "A", new(){ "a","+Ê","+™","+∆","-Ó","+÷","e+¨","a+¨","+¢","e","+…","a-…","+Ê-…","+™-…","+£","+ˇ","+÷¶É","e +¨" }},
-        { "B", new(){ "b","b +÷","b +Ê","b +ˆ","b +¢","p","p +÷","p +Ê","p +ˆ","p +¢","bi","bi-…","b i","b i-…","b +¨","b+¨" }},
-        { "C", new(){ "k","k +÷","k +Ê","k -Ó","k +ˆ","s","s +÷","s +Ê","s -Ó","s +ˆ","si","si-…","s i","s i-…","t-‚","t -‚","-‚","ts","t s" }},
-        { "D", new(){ "d","d +÷","d +Ê","d +¢","t","t +÷","t +Ê","t -Ó","t +ˆ","di","di-…","d i","d i-…","+¶","++" }},
-        { "E", new(){ "+¢","e","i","e+¨","+£","+¨","+¢+÷","e+÷","i-…","+¨+÷","e-…","e +¨","+ˇ","+÷" }},
-        { "F", new(){ "f","f +÷","f +Ê","v","v +÷","v +Ê","+¢f","e f","+¢ f","ef" }},
-        { "G", new(){ "+Ì","g","+Ì +÷","+Ì +Ê","k","k +÷","k +Ê","k -Ó","k +ˆ","d-∆","d-∆ +÷","d-∆ +Ê","d-∆ -Ó","-∆","d-∆i","d-∆i-…","d -∆ i","d -∆ i-…" }},
-        { "H", new(){ "h","h +÷","h +Ê","h -Ó","h +ˆ","e+¨t-‚","e +¨ t-‚","e+¨ t-‚","he+¨t-‚","h e+¨ t-‚" }},
-        { "I", new(){ "+¨","i","a+¨","e","-Ó","+÷","+¨+÷","i-…","a i","aj","+¨-…" }},
-        { "J", new(){ "d-∆","d-∆ +÷","d-∆ +Ê","d-∆ -Ó","t-‚","t-‚ +÷","t-‚ +Ê","d-∆e+¨","d-∆ e+¨","-∆" }},
-        { "K", new(){ "k","k +÷","k +Ê","k -Ó","+Ì","g","+Ì +÷","+Ì +Ê","ke+¨","k e+¨" }},
-        { "L", new(){ "l","l +÷","l +Ê","+Ω","l¶¨","+÷l","+¢l","e l","+¢ l","el" }},
-        { "M", new(){ "m","m +÷","m +Ê","m¶¨","+÷m","+¢m","e m","+¢ m","em","n" }},
-        { "N", new(){ "n","n +÷","n +Ê","+Ô","n¶¨","+÷n","+¢n","e n","+¢ n","en" }},
-        { "O", new(){ "o-Ë","+∆","+ˆ","+Ê","+÷-Ë","o","+£","-Ó","a","+ˆ-Ë","o-…","+ˆ-…","ow" }},
-        { "P", new(){ "p","p +÷","p +Ê","p +ˆ","b","b +÷","b +Ê","b +ˆ","b +¢","pi","pi-…","p i","p i-…","p+¨","p +¨" }},
-        { "Q", new(){ "k w","k w +÷","k w +Ê","+Ì w","+Ì w +÷","+Ì w +Ê","kw","+Ìw","kju","kju-…","k ju","k j u","k" }},
-        { "R", new(){ "+¶","r","+¶ +÷","+¶ +Ê","+¶ -Ó","+‹","+•","+Ê-…","+Ê+¶","++","++","+Ê +¶","ar","r¶¨","+¶¶¨" }},
-        { "S", new(){ "s","s +÷","s +Ê","z","z +÷","z +Ê","+¢s","e s","+¢ s","es","-‚","++" }},
-        { "T", new(){ "t","t +÷","t +Ê","t -Ó","d","d +÷","d +Ê","d +¢","ti","ti-…","t i","t i-…","t-‚","t -‚","ts","t s","++","++" }},
-        { "U", new(){ "-Ó","u","ju","+÷","-Ë","u-…","a","ju-…","j u","+ª","-Î" }},
-        { "V", new(){ "v","v +÷","v +Ê","f","f +÷","f +Ê","w","vi","vi-…","v i","v i-…","v+¨","v +¨" }},
-        { "W", new(){ "w","w +÷","w +Ê","-Ë","u","-Íd-Ób+÷lju","d-Ób+÷lju","d -Ó b +÷ l j u","w-Ë","v" }},
-        { "X", new(){ "k s","k s +÷","k s +Ê","+¢ ks","+¢ k","+Ì z","+Ì z +÷","+Ì z +Ê","k","+¢","+Ì s","g z","+¢ gz","e gz","egz","+¨ ks","i ks","+¨ k s","eks" }},
-        { "Y", new(){ "j","j +÷","j +Ê","wa+¨","i","ja+¨","w a+¨","j i","ji","+¨","i-…" }},
-        { "Z", new(){ "z","z +÷","z +Ê","s","s +÷","s +Ê","zi","zi-…","z i","z i-…","z+¨","z +¨","z+¢d","z +¢ d","-∆" }},
+        { "A", new()
+            {
+                "a", "ay", "aye", "ai", "ey", "hey",
+                "ah", "uh", "eh",
+                "long a", "short a"
+            }
+        },
+        { "B", new()
+            {
+                "b", "bee", "be", "buh",
+                "p", "pee", "peh"
+            }
+        },
+        { "C", new()
+            {
+                "c", "see", "cee", "sea", "si",
+                "k", "ck", "kee",
+                "s", "ess"
+            }
+        },
+        { "D", new()
+            {
+                "d", "dee", "de", "di",
+                "t", "tee", "teh"
+            }
+        },
+        { "E", new()
+            {
+                "e", "ee", "ie",
+                "eat", "ih", "eh"
+            }
+        },
+        { "F", new()
+            {
+                "f", "eff", "ef", "ph",
+                "v", "vee"
+            }
+        },
+        { "G", new()
+            {
+                "g", "gee", "jee", "ji",
+                "j", "jay",
+                "k", "kay"
+            }
+        },
+        { "H", new()
+            {
+                "h", "aitch",
+                "ha", "hah", "huh", "heh",
+                "hhh", "breath"
+            }
+        },
+        { "I", new()
+            {
+                "i", "eye", "aye", "ai",
+                "ee", "ih", "ah"
+            }
+        },
+        { "J", new()
+            {
+                "j", "jay", "gee",
+                "g", "jee", "dge"
+            }
+        },
+        { "K", new()
+            {
+                "k", "kay", "ke", "kuh",
+                "c", "que", "key",
+                "g"
+            }
+        },
+        { "L", new()
+            {
+                "l", "ell", "el",
+                "al", "ul", "ull"
+            }
+        },
+        { "M", new()
+            {
+                "m", "em", "um", "mm",
+                "n", "en"
+            }
+        },
+        { "N", new()
+            {
+                "n", "en", "in", "an",
+                "m", "em"
+            }
+        },
+        { "O", new()
+            {
+                "o", "oh", "owe",
+                "aw", "ah", "uh",
+                "oo"
+            }
+        },
+        { "P", new()
+            {
+                "p", "pee", "pe", "puh",
+                "b", "bee"
+            }
+        },
+        { "Q", new()
+            {
+                "q", "cue", "queue", "kyoo",
+                "koo", "coo",
+                "k"
+            }
+        },
+        { "R", new()
+            {
+                "r", "ar", "are",
+                "ahr", "er"
+            }
+        },
+        { "S", new()
+            {
+                "s", "ess", "es",
+                "z", "zee",
+                "see"
+            }
+        },
+        { "T", new()
+            {
+                "t", "tee", "ti", "tea",
+                "d", "dee"
+            }
+        },
+        { "U", new()
+            {
+                "u", "you", "yoo", "yew",
+                "oo", "ooh",
+                "uh"
+            }
+        },
+        { "V", new()
+            {
+                "v", "vee", "ve",
+                "f", "eff"
+            }
+        },
+        { "W", new()
+            {
+                "w", "double u", "dubya", "dub you",
+                "woo", "who"
+            }
+        },
+        { "X", new()
+            {
+                "x", "ex", "eks",
+                "ax", "acks", "ks"
+            }
+        },
+        { "Y", new()
+            {
+                "y", "why", "wai", "wi",
+                "ee", "yee", "yah"
+            }
+        },
+        { "Z", new()
+            {
+                "z", "zee", "zed",
+                "es", "ess", "s"
+            }
+        },
     };
+
+    /* ultra-lenient IPA map */
+    // UTF-8, super‚Äëlenient guesses for letter ‚Üí possible pronunciations (IPA + some practical shorthands).
+// Intention: catch noisy inputs & L2 accents; includes letter names ("ke…™", "eks", "wa…™", "z…õd/ziÀê").
+// Note: duplicates kept minimal; both tied and untied affricates included (tÕ° É/t É, dÕ° í/d í), plus spaced forms.
+private readonly Dictionary<string, List<string>> letterToIPA = new()
+{
+    { "A", new()
+        {
+            "a", "√¶", "…ë", "…ëÀê", "…í", "…î", "…îÀê",
+            "e", "…õ", "e…™", "…ô",
+            "a…™", "aj",
+            "√¶…π", "…ë…π", "e…ô", "e…ö"
+        }
+    },
+    { "B", new()
+        {
+            "b", "p",
+            "bi", "biÀê", "b…™", "b i", "b iÀê"
+        }
+    },
+    { "C", new()
+        {
+            "k", "s",
+            "tÕ° É", "t É", " É",
+            "ts", "tÕ°s", "t s",
+            "Œ∏",  // lenient (Spanish C before e/i)
+            "si", "siÀê", "s i", "s iÀê"
+        }
+    },
+    { "D", new()
+        {
+            "d", "t", "√∞", "…æ",
+            "di", "diÀê", "d i", "d iÀê"
+        }
+    },
+    { "E", new()
+        {
+            "e", "e…™",
+            "i", "iÀê", "…™",
+            "…õ", "…ô"
+        }
+    },
+    { "F", new()
+        {
+            "f", "v",
+            "ef", "…õf"
+        }
+    },
+    { "G", new()
+        {
+            "g", "…°", "k",
+            "dÕ° í", "d í", " í",
+            "d íi", "d íiÀê", "…°i", "…°iÀê",
+            "g i", "g iÀê"
+        }
+    },
+    { "H", new()
+        {
+            "h", "‚àÖ", // silent h
+            "he…™t É", "e…™t É"
+        }
+    },
+    { "I", new()
+        {
+            "i", "iÀê", "…™",
+            "a…™", "aj",
+            "e", "…ô"
+        }
+    },
+    { "J", new()
+        {
+            "dÕ° í", "d í", " í", "j", // lenient: some L2 say /j/
+            "d íe…™"
+        }
+    },
+    { "K", new()
+        {
+            "k", "g", // lenient confusion
+            "ke…™", "k e…™"
+        }
+    },
+    { "L", new()
+        {
+            "l", "…´", "lÃ©",
+            "…ôl", "el", "…õl"
+        }
+    },
+    { "M", new()
+        {
+            "m", "…±", "mÃ©",
+            "n", // lenient confusion
+            "em", "…õm", "…ôm"
+        }
+    },
+    { "N", new()
+        {
+            "n", "≈ã", "nÃ©",
+            "…≤", // lenient
+            "en", "…õn", "…ôn"
+        }
+    },
+    { "O", new()
+        {
+            "o", "o ä", "…ô ä",
+            "…í", "…î", "…îÀê", "…ë",
+            "a ä", "ow", "ou" // shorthands commonly seen
+        }
+    },
+    { "P", new()
+        {
+            "p", "b",
+            "pi", "piÀê", "p i", "p iÀê"
+        }
+    },
+    { "Q", new()
+        {
+            "k", "kw", "k ∑", "k w",
+            "kju", "kjuÀê", "kj ä",
+            "q" // ultra-lenient fallback token
+        }
+    },
+    { "R", new()
+        {
+            "…π", "r", "…æ", "…ª", "…Ω",
+            " Ä", " Å",
+            "…ö", "…ù", "…ô…π", "…ë…π", "…úÀê", "ar", "rÃ©"
+        }
+    },
+    { "S", new()
+        {
+            "s", "z", " É", " í",
+            "ts", "tÕ°s", // lenient for /s/‚Üí/ts/
+            "es", "…õs"
+        }
+    },
+    { "T", new()
+        {
+            "t", "d", "…æ", " î",
+            "tÕ° É", "t É", " É", // ti/tu/tion ‚Üí / É/
+            "ts", "t s",
+            "ti", "tiÀê"
+        }
+    },
+    { "U", new()
+        {
+            "u", "uÀê", " ä",
+            "ju", "juÀê",
+            " å", "…ô", "a" // lenient for L2 confusions
+        }
+    },
+    { "V", new()
+        {
+            "v", "f", "w", // common L2 swaps
+            "vi", "viÀê", "v i", "v iÀê"
+        }
+    },
+    { "W", new()
+        {
+            "w", "v", " ç",
+            "u", // sometimes perceived as vowel
+            "wu", "w ä", // shorthands
+            "d åb…ôlju", "d åb…ôljuÀê", "Ààd åb…ôlju", "Ààd åb…ôljuÀê"
+        }
+    },
+    { "X", new()
+        {
+            "ks", "k s", "kÕ°s",
+            "…°z", "g z", "…°Õ°z",
+            "z",
+            "…õks", "eks", "egz",
+            "ik s", "i ks"
+        }
+    },
+    { "Y", new()
+        {
+            "j",
+            "i", "…™", "iÀê",
+            "a…™",
+            "wa…™",
+            "ji", "jiÀê", "j i"
+        }
+    },
+    { "Z", new()
+        {
+            "z", "s", "dz", "dÕ°z",
+            "zi", "ziÀê", "z i", "z iÀê",
+            "z…õd", "zed"
+        }
+    },
+};
+
 
     // Downmix a segment from micClip (handles wrap at call site) with REUSED buffer
     void CopySegmentToMono(int startFrame, int frames, float[] dst, int dstOffset)
@@ -306,6 +723,10 @@ public class PhonemeManager : MonoBehaviour
         if (micDevice == null) Debug.LogError("PhonemeManager: No microphone detected");
 
         SetLetterPromptVisible(false);
+        ClearUtteranceProgressVisuals();
+
+        if (!audioManager)
+            audioManager = FindObjectOfType<AudioManager>();
 
         if (proximityButtonObject)
         {
@@ -324,7 +745,11 @@ public class PhonemeManager : MonoBehaviour
 
         if (levelManager != null)
         {
-            levelManager.OnPhonemeCheckStart += () => SetState(PhonemeCheckState.Start);
+            levelManager.OnPhonemeCheckStart += () =>
+            {
+                RequestAmbientNoiseSample();
+                SetState(PhonemeCheckState.Start);
+            };
             levelManager.OnGameModeChanged += HandleModeChanged;
             levelManager.OnLetterChanged   += HandleLetterChanged;
             HandleModeChanged(levelManager.currentMode);
@@ -335,6 +760,11 @@ public class PhonemeManager : MonoBehaviour
     private void Start()
     {
         StartMicIfNeeded();
+
+        ambientNoisePeak = 0f;
+        calibratedAmplitudeDelta = amplitudeThreshold;
+        currentAmplitudeThresholdValue = Mathf.Max(amplitudeThreshold, 0.001f);
+        RequestAmbientNoiseSample();
 
         beamReady = beamMode != BeamMode.BeamOn;
         if (beamMode == BeamMode.BeamOn) StartCoroutine(WarmUpBeam());
@@ -386,6 +816,102 @@ public class PhonemeManager : MonoBehaviour
         }
     }
 
+    private float GetEffectiveAmplitudeThreshold()
+    {
+        if (currentAmplitudeThresholdValue <= 0f)
+            currentAmplitudeThresholdValue = Mathf.Max(amplitudeThreshold, 0.001f);
+        return currentAmplitudeThresholdValue;
+    }
+
+    private float GetSilenceThreshold()
+    {
+        float baseLine = ambientNoisePeak;
+        float deltaForSilence = calibratedAmplitudeDelta > 0f ? calibratedAmplitudeDelta * silenceAmpFactor : amplitudeThreshold * silenceAmpFactor;
+        float silenceLevel = baseLine + deltaForSilence;
+        float effectiveScaled = GetEffectiveAmplitudeThreshold() * silenceAmpFactor;
+        return Mathf.Max(baseLine, Mathf.Max(silenceLevel, effectiveScaled));
+    }
+
+    private void RequestAmbientNoiseSample()
+    {
+        if (!isActiveAndEnabled) return;
+        if (noiseSampleRoutine != null)
+            StopCoroutine(noiseSampleRoutine);
+        noiseSampleRoutine = StartCoroutine(SampleAmbientNoise());
+    }
+
+    private IEnumerator SampleAmbientNoise()
+    {
+        suppressIndicators = true;
+        indicatorGate.WantSpeak("noise", false, 0);
+        indicatorGate.WantWait("noise", false, 0);
+        RefreshIndicators(true);
+
+        const float MIN_DURATION = 0.1f;
+        float duration = Mathf.Max(noiseSampleDuration, MIN_DURATION);
+
+        if (micClip == null || !Microphone.IsRecording(micDevice))
+        {
+            StartMicIfNeeded();
+            float timeout = 2f;
+            while ((micClip == null || !Microphone.IsRecording(micDevice)) && timeout > 0f)
+            {
+                timeout -= Time.unscaledDeltaTime;
+                yield return null;
+            }
+            if (micClip == null || !Microphone.IsRecording(micDevice))
+            {
+                suppressIndicators = false;
+                RefreshIndicators(true);
+                noiseSampleRoutine = null;
+                yield break;
+            }
+        }
+
+        const int WIN = 1024;
+        float elapsed = 0f;
+        float peak = 0f;
+
+        while (elapsed < duration)
+        {
+            if (micClip != null && Microphone.IsRecording(micDevice))
+            {
+                int ch = Mathf.Max(1, micClip.channels);
+                int pos = Microphone.GetPosition(micDevice);
+                if (pos >= WIN)
+                {
+                    int offset = pos - WIN;
+                    if (offset < 0) offset += micClip.samples;
+                    int needed = WIN * ch;
+                    if (micBuf == null || micBuf.Length < needed) micBuf = new float[needed];
+                    if (SafeGetWindow(offset, needed, micBuf))
+                    {
+                        float framePeak = 0f;
+                        for (int i = 0; i < needed; i++)
+                        {
+                            float a = Mathf.Abs(micBuf[i]);
+                            if (a > framePeak) framePeak = a;
+                        }
+                        if (framePeak > peak) peak = framePeak;
+                    }
+                }
+            }
+            elapsed += Time.unscaledDeltaTime;
+            yield return null;
+        }
+
+        ambientNoisePeak = peak;
+        float deltaMultiplier = Mathf.Max(noiseDeltaMultiplier, 1.1f);
+        float minDelta = ambientNoisePeak * deltaMultiplier;
+        calibratedAmplitudeDelta = Mathf.Max(amplitudeThreshold, minDelta);
+        currentAmplitudeThresholdValue = Mathf.Max(ambientNoisePeak + calibratedAmplitudeDelta, Mathf.Max(amplitudeThreshold, 0.001f));
+
+        suppressIndicators = false;
+        RefreshIndicators(true);
+        noiseSampleRoutine = null;
+
+        Debug.Log($"PhonemeManager | Ambient noise baseline {ambientNoisePeak:F3}, trigger {currentAmplitudeThresholdValue:F3}");
+    }
     /* ---------- Recording monitors ---------- */
     private void HandleRecordingMonitors()
     {
@@ -412,10 +938,13 @@ public class PhonemeManager : MonoBehaviour
         }
         if (framePeak > peakThisClip) peakThisClip = framePeak;
 
+        float effectiveThreshold = GetEffectiveAmplitudeThreshold();
+        float silenceThreshold = GetSilenceThreshold();
+
         // silence gate
         if (waitingForSilence)
         {
-            if (framePeak < amplitudeThreshold * silenceAmpFactor)
+            if (framePeak < silenceThreshold)
                 silenceTimer += Time.deltaTime;
             else
                 silenceTimer = 0f;
@@ -430,10 +959,11 @@ public class PhonemeManager : MonoBehaviour
         }
 
         // loudness count
-        loudTimer = framePeak >= amplitudeThreshold ? (loudTimer + Time.deltaTime) : 0f;
+        loudTimer = framePeak >= effectiveThreshold ? (loudTimer + Time.deltaTime) : 0f;
         if (loudTimer >= loudEnoughTime)
         {
             utteranceCount++;
+            UpdateUtteranceProgressVisuals();
             Debug.Log($"PhonemeManager | utterance {utteranceCount}/{utterancesRequired} | peak {peakThisClip:F3}");
 
             if (utteranceCount < utterancesRequired)
@@ -441,25 +971,15 @@ public class PhonemeManager : MonoBehaviour
                 waitingForSilence = true;
                 silenceTimer = 0f;
 
-                if (flashCoroutine != null) StopCoroutine(flashCoroutine);
-                flashCoroutine = StartCoroutine(FlashWaitBetween());
-
                 loudTimer = 0f;
                 peakThisClip = 0f;
                 return;
             }
 
-            // got required utterances G«Ù finish
+            // got required utterances GÔøΩÔøΩ finish
             autoStopped = true;
             HandleVirtualRelease();
         }
-    }
-
-    private IEnumerator FlashWaitBetween()
-    {
-        SetWaitIndicator(true, tag: "flash", priority: 100);
-        yield return new WaitForSeconds(betweenUtteranceFlash);
-        SetWaitIndicator(false, tag: "flash");
     }
 
     /* ---------- State machine ---------- */
@@ -553,6 +1073,7 @@ public class PhonemeManager : MonoBehaviour
         utteranceCount = 0;
         waitingForSilence = false;
         silenceTimer = 0f;
+        UpdateUtteranceProgressVisuals();
         yield break;
     }
 
@@ -595,7 +1116,7 @@ public class PhonemeManager : MonoBehaviour
 
     private void CancelRecording(string reason)
     {
-        Debug.Log($"PhonemeManager: recording cancelled G«Ù {reason}");
+        Debug.Log($"PhonemeManager: recording cancelled GÔøΩÔøΩ {reason}");
         SetBtnTint(btnColorOriginal);
         SetState(PhonemeCheckState.WaitingToRecord);
     }
@@ -646,18 +1167,25 @@ public class PhonemeManager : MonoBehaviour
             }
             if (Microphone.GetPosition(dev) > 0)
             {
-                Debug.Log($"Mic warmed on -Ω{dev}-+ G£‡");
+                Debug.Log($"Mic warmed on -ÔøΩ{dev}-+ GÔøΩÔøΩ");
                 yield break;
             }
             Microphone.End(dev);
-            Debug.LogWarning($"Warm-up failed on -Ω{dev}-+, nextG«™");
+            Debug.LogWarning($"Warm-up failed on -ÔøΩ{dev}-+, nextG«™");
         }
-        Debug.LogError("All mics failed to warm up =É‹ø");
+        Debug.LogError("All mics failed to warm up =ÔøΩ‹ø");
     }
 
     private IEnumerator WarmUpBeam()
     {
-        if (string.IsNullOrEmpty(API_URL) || string.IsNullOrEmpty(TOKEN)) { beamReady = true; yield break; }
+        string targetUrl = GetActiveApiUrl();
+        bool needsAuth = ShouldSendAuthHeader();
+
+        if (string.IsNullOrEmpty(targetUrl) || (!useRemoteServer && !needsAuth))
+        {
+            beamReady = true;
+            yield break;
+        }
 
         int samples = sampleRate * 1;
         AudioClip silentClip = AudioClip.Create("BeamWarmup", samples, 1, sampleRate, false);
@@ -667,12 +1195,13 @@ public class PhonemeManager : MonoBehaviour
         string b64 = Convert.ToBase64String(wav);
         string json = JsonUtility.ToJson(new BeamReq { audio_file = b64 });
 
-        using (var req = new UnityWebRequest(API_URL, "POST"))
+        using (var req = new UnityWebRequest(targetUrl, "POST"))
         {
             req.uploadHandler   = new UploadHandlerRaw(Encoding.UTF8.GetBytes(json));
             req.downloadHandler = new DownloadHandlerBuffer();
             req.SetRequestHeader("Content-Type", "application/json");
-            req.SetRequestHeader("Authorization", $"Bearer {TOKEN}");
+            if (needsAuth)
+                req.SetRequestHeader("Authorization", $"Bearer {TOKEN}");
             Debug.Log("PhonemeManager: Warming up Beam serverG«™");
             yield return req.SendWebRequest();
 
@@ -709,12 +1238,14 @@ public class PhonemeManager : MonoBehaviour
         byte[] wav = WavUtility.FromAudioClip(clipToSend, out _);
         var jsonBytes = Encoding.UTF8.GetBytes(JsonUtility.ToJson(new BeamReq { audio_file = Convert.ToBase64String(wav) }));
 
-        using (var r = new UnityWebRequest(API_URL, "POST"))
+        using (var r = new UnityWebRequest(GetActiveApiUrl(), "POST"))
         {
+            Debug.Log($"[Phoneme] POST {GetActiveApiUrl()} (remote={useRemoteServer})");
             r.uploadHandler   = new UploadHandlerRaw(jsonBytes);
             r.downloadHandler = new DownloadHandlerBuffer();
             r.SetRequestHeader("Content-Type", "application/json");
-            r.SetRequestHeader("Authorization", $"Bearer {TOKEN}");
+            if (ShouldSendAuthHeader())
+                r.SetRequestHeader("Authorization", $"Bearer {TOKEN}");
 
             yield return r.SendWebRequest();
 
@@ -724,8 +1255,17 @@ public class PhonemeManager : MonoBehaviour
                 blinkCoroutine = null;
             }
 
-            if (r.result == UnityWebRequest.Result.Success) ParseBeam(r.downloadHandler.text);
-            else SetState(PhonemeCheckState.Incorrect);
+            if (r.result == UnityWebRequest.Result.Success)
+            {
+                string body = r.downloadHandler.text ?? "";
+                Debug.Log($"[Phoneme] response ({body.Length} chars) -> {body}");
+                ParseBeam(r.downloadHandler.text);
+            }
+            else
+            {
+                Debug.LogError($"[Phoneme] POST failed: {r.result} ({r.responseCode}) {r.error}");
+                SetState(PhonemeCheckState.Incorrect);
+            }
         }
 
         // cleanup temp clips
@@ -733,34 +1273,84 @@ public class PhonemeManager : MonoBehaviour
         if (recordedClip) { Destroy(recordedClip); recordedClip = null; }
     }
 
+    private bool TryGetExpectedVariants(string letter, out List<string> variants)
+    {
+        variants = null;
+        if (string.IsNullOrEmpty(letter)) return false;
+
+        string key = letter.ToUpperInvariant();
+        bool needFriendlyFallback =
+            useRemoteServer &&
+            !string.IsNullOrEmpty(lastBeamRawText) &&
+            string.Equals(lastBeamRawText, lastBeamText, StringComparison.Ordinal);
+
+        var merged = new List<string>();
+        if (letterToIPA.TryGetValue(key, out var wants) && wants != null)
+            merged.AddRange(wants);
+
+        if (needFriendlyFallback &&
+            letterToFriendlyPhonemes.TryGetValue(key, out var friendly) &&
+            friendly != null)
+        {
+            merged.AddRange(friendly);
+        }
+
+        variants = merged
+            .Where(s => !string.IsNullOrWhiteSpace(s))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        return variants.Count > 0;
+    }
+
     private void ParseBeam(string json)
     {
-        int idx = json.IndexOf("\"text\":\"", StringComparison.Ordinal);
-        lastBeamText = idx >= 0
-            ? json.Substring(idx + 8, json.IndexOf("\"", idx + 8, StringComparison.Ordinal) - (idx + 8))
-            : "";
+        string payload = json ?? string.Empty;
+        var match = ipaFieldRegex.Match(payload);
+        if (!match.Success)
+            match = textFieldRegex.Match(payload);
+        lastBeamText = match.Success ? match.Groups["value"].Value : string.Empty;
+        var rawMatch = rawTextFieldRegex.Match(payload);
+        lastBeamRawText = rawMatch.Success ? rawMatch.Groups["value"].Value : string.Empty;
+        if (!string.IsNullOrEmpty(lastBeamRawText))
+            lastBeamRawText = lastBeamRawText.Trim();
 
         if (string.IsNullOrEmpty(lastBeamText))
         {
+            Debug.LogWarning("[Phoneme] Empty transcription from recognizer.");
             SetState(PhonemeCheckState.Incorrect);
             return;
         }
 
-        string L = levelManager.currentLetter.ToUpper();
-        if (!letterToIPA.TryGetValue(L, out var wants) || wants.Count == 0)
+        string currentLetter = levelManager != null ? levelManager.currentLetter : string.Empty;
+        string L = string.IsNullOrEmpty(currentLetter) ? string.Empty : currentLetter.ToUpperInvariant();
+        if (!TryGetExpectedVariants(L, out var wants) || wants.Count == 0)
         {
+            Debug.LogWarning($"[Phoneme] No expectations for letter '{currentLetter}'.");
             SetState(PhonemeCheckState.Incorrect);
             return;
         }
 
-        bool rawMatch = wants.Any(w => !string.IsNullOrEmpty(w)
-                                    && lastBeamText.IndexOf(w, StringComparison.OrdinalIgnoreCase) >= 0);
+        lastBeamText = lastBeamText.Trim();
+        if (!string.IsNullOrEmpty(lastBeamRawText) && !string.Equals(lastBeamRawText, lastBeamText, StringComparison.Ordinal))
+            Debug.Log($"[Phoneme] raw transcript='{lastBeamRawText}'");
+
+        Debug.Log($"[Phoneme] last='{lastBeamText}' expects={string.Join("|", wants)}");
+
+        string beamRawLower = lastBeamText.ToLowerInvariant();
+        bool rawMatch = wants.Any(w =>
+        {
+            if (string.IsNullOrEmpty(w)) return false;
+            string wantLower = w.ToLowerInvariant().Trim();
+            return wantLower.Length > 0 && beamRawLower.Contains(wantLower);
+        });
 
         string normalizedBeam = NormalizePhonemeToken(lastBeamText);
-        bool normalizedMatch = !string.IsNullOrEmpty(normalizedBeam) && wants.Any(w =>
+        string normalizedBeamLower = normalizedBeam.ToLowerInvariant();
+        bool normalizedMatch = !string.IsNullOrEmpty(normalizedBeamLower) && wants.Any(w =>
         {
-            string normalizedWant = NormalizePhonemeToken(w);
-            return !string.IsNullOrEmpty(normalizedWant) && normalizedBeam.Contains(normalizedWant);
+            string normalizedWant = NormalizePhonemeToken(w).ToLowerInvariant().Trim();
+            return !string.IsNullOrEmpty(normalizedWant) && normalizedBeamLower.Contains(normalizedWant);
         });
 
         if (normalizedMatch && !rawMatch)
@@ -768,6 +1358,7 @@ public class PhonemeManager : MonoBehaviour
             Debug.Log($"[Phoneme] Normalized match for '{L}': raw='{lastBeamText}' normalized='{normalizedBeam}'");
         }
 
+        Debug.Log($"[Phoneme] rawMatch={rawMatch} normalizedMatch={normalizedMatch}");
         bool isMatch = rawMatch || normalizedMatch;
         SetState(isMatch ? PhonemeCheckState.Correct : PhonemeCheckState.Incorrect);
     }
@@ -822,6 +1413,16 @@ public class PhonemeManager : MonoBehaviour
 
     private void RefreshIndicators(bool force = false)
     {
+        if (suppressIndicators)
+        {
+            indicatorGate.WantSpeak("state", false, 0);
+            indicatorGate.WantWait("state", false, 0);
+            if (speakIndicator && speakIndicator.activeSelf) speakIndicator.SetActive(false);
+            if (waitIndicator && waitIndicator.activeSelf) waitIndicator.SetActive(false);
+            prevSpeak = speakIndicator && speakIndicator.activeSelf;
+            prevWait = waitIndicator && waitIndicator.activeSelf;
+            return;
+        }
         bool inPhonemeMode = levelManager != null && levelManager.currentMode == LevelManager.GameMode.PhonemeChecking;
         // Outside phoneme mode: force both indicators off and clear state wants
         if (!inPhonemeMode)
@@ -860,6 +1461,13 @@ public class PhonemeManager : MonoBehaviour
 
     public void StopMic()
     {
+        if (noiseSampleRoutine != null)
+        {
+            StopCoroutine(noiseSampleRoutine);
+            noiseSampleRoutine = null;
+        }
+        suppressIndicators = false;
+
         if (warmMicRoutine != null)
         {
             StopCoroutine(warmMicRoutine);
@@ -899,6 +1507,12 @@ public class PhonemeManager : MonoBehaviour
     {
         indicatorGate.WantSpeak("state", false, 0);
         indicatorGate.WantWait ("state", false, 0);
+        if (noiseSampleRoutine != null)
+        {
+            StopCoroutine(noiseSampleRoutine);
+            noiseSampleRoutine = null;
+        }
+        suppressIndicators = false;
         if (speakIndicator && speakIndicator.activeSelf) speakIndicator.SetActive(false);
         if (waitIndicator  && waitIndicator.activeSelf)  waitIndicator.SetActive(false);
         prevSpeak = speakIndicator && speakIndicator.activeSelf;
@@ -917,6 +1531,7 @@ public class PhonemeManager : MonoBehaviour
         tailScratch = null;
         clipScratch = null;
         recMonoScratch = null;
+        ClearUtteranceProgressVisuals();
     }
 
     /* ---------- Cleanup ---------- */
@@ -939,6 +1554,7 @@ public class PhonemeManager : MonoBehaviour
         if (btnMat) Destroy(btnMat);
         btnMat = null;
 
+        ClearUtteranceProgressVisuals();
         SetLetterPromptVisible(false);
     }
 
@@ -957,7 +1573,11 @@ public class PhonemeManager : MonoBehaviour
         if (!letterPrompt) return;
 
         GameObject root = ResolveLetterPromptRoot();
-        if (root) root.SetActive(visible);
+        if (root && !root.activeSelf)
+        {
+            // Keep the plane active so trace visuals stay available.
+            root.SetActive(true);
+        }
 
         letterPrompt.enabled = visible;
         if (!visible)
@@ -1001,10 +1621,12 @@ public class PhonemeManager : MonoBehaviour
             prevSpeak = speakIndicator && speakIndicator.activeSelf;
             prevWait  = waitIndicator  && waitIndicator.activeSelf;
             SetLetterPromptVisible(false);
+            ClearUtteranceProgressVisuals();
         }
         else
         {
             StartMicIfNeeded();
+            RequestAmbientNoiseSample();
             // Re-evaluate based on current recording state
             RefreshIndicators(true);
             UpdateLetterPromptText();

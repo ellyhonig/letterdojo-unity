@@ -7,7 +7,7 @@ public class HandPlaneConstraint : MonoBehaviour
 
     [SerializeField] private simplePlayer player;
 
-    // Start constraining only after this much penetration *through* the plane (meters)
+    // Start constradining only after this much penetration *through* the plane (meters)
     [SerializeField] private float penetrationEpsilon = 0.004f;  // ~4 mm
     // Release when depth is shallower than this (meters)
     [SerializeField] private float releaseEpsilon = 0.0015f;      // ~1.5 mm

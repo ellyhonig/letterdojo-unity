@@ -1,0 +1,30 @@
+*** Begin Patch
+*** Update File: Assets/scripts/KeyFrame/audio-manager.cs
+@@
+-        foreach (var candidate in candidates)
+-        {
+-            clip = Resources.Load<AudioClip>(candidate);
+-            if (clip != null)
+-            {
+-                letterClips[upper] = clip;
+-                letterClips[lower] = clip;
+-                return clip;
+-            }
+-        }
+-
+-        return null;
++        foreach (var candidate in candidates)
++        {
++            clip = Resources.Load<AudioClip>(candidate);
++            if (clip != null)
++            {
++                letterClips[upper] = clip;
++                letterClips[lower] = clip;
++                Debug.Log($"[AudioManager] Loaded clip '{candidate}' for letter '{upper}'.");
++                return clip;
++            }
++        }
++
++        Debug.LogWarning($"[AudioManager] Could not locate clip for letter '{upper}'.");
++        return null;
+*** End Patch

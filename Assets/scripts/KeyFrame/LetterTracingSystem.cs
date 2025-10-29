@@ -168,7 +168,7 @@ public class LetterTracingSystem : MonoBehaviour
     {
         ResolveDependencies();
         if (pathRenderer != null)
-            pathRenderer.SetVisualizationVisible(active);
+            pathRenderer.SetVisualizationVisible(false);
         if (aimSequence != null)
             aimSequence.SetVisualizationVisible(active);
 

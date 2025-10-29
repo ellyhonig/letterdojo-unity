@@ -3,6 +3,7 @@ using System;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Pool;
+using UnityEngine.Serialization;
 using Newtonsoft.Json.Linq;
 using System.Text;
 
@@ -13,17 +14,22 @@ public class LetterPathRenderer : MonoBehaviour
     [SerializeField] private bool autoRenderOnEnable = true;
     [SerializeField] private bool autoFitToSurface = true;
     [SerializeField, Min(2)] private int samplesPerSegment = 16;
-    [SerializeField] private float coordinateScale = 0.005f;
+    [SerializeField, HideInInspector] private float coordinateScale = 0.005f;
     [SerializeField] private float depthOffset = 0.002f;
-    [SerializeField, Range(0.001f, 0.2f)] private float markerSizeRatio = 0.06f;
-    [SerializeField, Range(0.0005f, 0.1f)] private float lineWidthRatio = 0.01f;
+
+    [Header("Letter Scale")]
+    [Tooltip("Scales the letter height relative to the tracing plane height (1 = fill the plane).")]
+    [SerializeField, Min(0.01f)] private float letterHeightMultiplier = 1f;
+    [FormerlySerializedAs("dotSize")]
+    [Tooltip("Dot size as a fraction of the letter height.")]
+    [SerializeField, Min(0.0001f)] private float dotSizeRelativeToHeight = 0.05f;
+    [SerializeField, HideInInspector] private float lineWidthRelativeToHeight = 0.01f;
     [SerializeField] private Transform contentRoot;
     [SerializeField] private GameObject anchorPointPrefab;
     [SerializeField] private GameObject controlPointPrefab;
     [SerializeField] private LineRenderer lineRendererPrefab;
     [SerializeField] private bool spawnControlMarkers;
-    [SerializeField, Min(0.01f)] private float letterScaleMultiplier = 1f;
-    [SerializeField, Min(0.01f)] private float markerScaleMultiplier = 1f;
+    [SerializeField] private bool exposeSourceGuides = false;
 
     private ObjectPool<GameObject> anchorPool;
     private ObjectPool<GameObject> controlPool;
@@ -39,7 +45,7 @@ public class LetterPathRenderer : MonoBehaviour
     private readonly HashSet<Vector2Int> controlCache = new();
 
     private const float QuantizeFactor = 1000f;
-    private const string ResourcePrefix = "2dletterdata/";
+    private const string ResourcePrefix = "letter2Dpathdata/";
     private const float DefaultMarkerSize = 0.01f;
     private const float DefaultLineWidth = 0.005f;
     private const float ControlScaleFactor = 0.75f;
@@ -66,7 +72,8 @@ public class LetterPathRenderer : MonoBehaviour
     public IReadOnlyList<SegmentLink> SegmentLinks => segmentLinks;
     public IReadOnlyList<LineRenderer> StrokeLines => activeLines;
     public Transform ContentRoot => contentRoot;
-    public float MarkerBaseScale => resolvedMarkerScale * markerScaleMultiplier;
+    public float MarkerBaseScale => resolvedMarkerScale;
+    public float DepthOffset => depthOffset;
 
     public event Action<LetterPathRenderer> LetterRendered;
 
@@ -225,8 +232,6 @@ public class LetterPathRenderer : MonoBehaviour
 
     private void OnValidate()
     {
-        markerScaleMultiplier = Mathf.Max(0.01f, markerScaleMultiplier);
-        letterScaleMultiplier = Mathf.Max(0.01f, letterScaleMultiplier);
 
         if (Application.isPlaying)
         {
@@ -393,14 +398,16 @@ DestroyControlMarker, false, 8, 128);
         return renderer;
     }
 
+    private bool _sourceGuidesVisible;
+
     private void OnLineRetrieved(LineRenderer renderer)
     {
         renderer.transform.SetParent(contentRoot != null ? contentRoot : transform, false);
         renderer.useWorldSpace = false;
         renderer.positionCount = 0;
-        float width = resolvedLineWidth * markerScaleMultiplier;
+        float width = resolvedLineWidth;
         renderer.startWidth = renderer.endWidth = width;
-        renderer.enabled = true;
+        renderer.enabled = _sourceGuidesVisible;
     }
 
     private void OnLineReleased(LineRenderer renderer)
@@ -426,7 +433,7 @@ DestroyControlMarker, false, 8, 128);
         GameObject marker = anchorPointPrefab != null ? Instantiate(anchorPointPrefab, parent) :
             GameObject.CreatePrimitive(PrimitiveType.Sphere);
         marker.transform.SetParent(parent, false);
-        marker.transform.localScale = Vector3.one * (resolvedMarkerScale * markerScaleMultiplier);
+        marker.transform.localScale = Vector3.one * resolvedMarkerScale;
         marker.SetActive(false);
         RemoveCollider(marker);
         if (marker.TryGetComponent(out Renderer renderer))
@@ -439,9 +446,9 @@ DestroyControlMarker, false, 8, 128);
     private void OnAnchorRetrieved(GameObject marker)
     {
         marker.transform.SetParent(contentRoot != null ? contentRoot : transform, false);
-        marker.transform.localScale = Vector3.one * (resolvedMarkerScale * markerScaleMultiplier);
+        marker.transform.localScale = Vector3.one * resolvedMarkerScale;
         marker.transform.localRotation = Quaternion.identity;
-        marker.SetActive(true);
+        marker.SetActive(_sourceGuidesVisible);
     }
 
     private void OnAnchorReleased(GameObject marker)
@@ -463,7 +470,7 @@ DestroyControlMarker, false, 8, 128);
         GameObject marker = controlPointPrefab != null ? Instantiate(controlPointPrefab, parent) :
             GameObject.CreatePrimitive(PrimitiveType.Sphere);
         marker.transform.SetParent(parent, false);
-        marker.transform.localScale = Vector3.one * (resolvedMarkerScale * ControlScaleFactor * markerScaleMultiplier);
+        marker.transform.localScale = Vector3.one * (resolvedMarkerScale * ControlScaleFactor);
         marker.SetActive(false);
         RemoveCollider(marker);
         if (marker.TryGetComponent(out Renderer renderer))
@@ -476,7 +483,7 @@ DestroyControlMarker, false, 8, 128);
     private void OnControlRetrieved(GameObject marker)
     {
         marker.transform.SetParent(contentRoot != null ? contentRoot : transform, false);
-        marker.transform.localScale = Vector3.one * (resolvedMarkerScale * ControlScaleFactor * markerScaleMultiplier);
+        marker.transform.localScale = Vector3.one * (resolvedMarkerScale * ControlScaleFactor);
         marker.transform.localRotation = Quaternion.identity;
         marker.SetActive(true);
     }
@@ -561,7 +568,7 @@ DestroyControlMarker, false, 8, 128);
     private Vector3 ToLocalPosition(Vector2 source)
     {
         float scale = resolvedCoordinateScale > 0f ? resolvedCoordinateScale : coordinateScale;
-        float appliedScale = scale * letterScaleMultiplier;
+        float appliedScale = scale;
         float x = (source.x - dataCenter.x) * appliedScale;
         float z = (dataCenter.y - source.y) * appliedScale;
         return new Vector3(x, depthOffset, z);
@@ -639,11 +646,11 @@ DestroyControlMarker, false, 8, 128);
     private void AutoConfigureForSurface(Stroke[] strokes)
     {
         float dataHeight = Mathf.Max(0.0001f, dataMax.y - dataMin.y);
-        float scaleByHeight = planeHeight / dataHeight;
+        float letterWorldHeight = planeHeight * letterHeightMultiplier;
 
-        resolvedCoordinateScale = Mathf.Max(scaleByHeight, 0.0001f);
-        resolvedMarkerScale = Mathf.Max(DefaultMarkerSize, planeHeight * markerSizeRatio);
-        resolvedLineWidth = Mathf.Max(DefaultLineWidth * 0.25f, planeHeight * lineWidthRatio);
+        resolvedCoordinateScale = Mathf.Max(letterWorldHeight / dataHeight, 0.0001f);
+        resolvedMarkerScale = Mathf.Max(0.0001f, letterWorldHeight * dotSizeRelativeToHeight);
+        resolvedLineWidth = Mathf.Max(DefaultLineWidth * 0.25f, letterWorldHeight * lineWidthRelativeToHeight);
         coordinateScale = resolvedCoordinateScale;
     }
 
@@ -708,69 +715,96 @@ QuantizeFactor));
             }
         }
 
-        Cache[normalized] = resolved;
+        if (resolved.Length > 0)
+            Cache[normalized] = resolved;
+        else
+            Cache.Remove(normalized);
         return resolved;
     }
 
     private Stroke[] LoadFromSimpleRecording(string normalized)
     {
-        string resourcePath = $"letter3Dpathdata/simple_recording_{normalized.ToUpperInvariant()}";
+        string resourcePath = $"{ResourcePrefix}simple_recording_{normalized.ToUpperInvariant()}";
         TextAsset asset = Resources.Load<TextAsset>(resourcePath);
         if (asset == null || string.IsNullOrWhiteSpace(asset.text))
         {
+            Debug.LogWarning($"LetterPathRenderer: Missing 2D recording data for '{normalized}'.");
             return Array.Empty<Stroke>();
         }
 
         try
         {
-            var record = JsonUtility.FromJson<SimpleRecordingDto>(asset.text);
-            if (record == null || record.frames == null || record.frames.Length < 2)
-            {
-                return Array.Empty<Stroke>();
-            }
-
-            Debug.Log("LetterPathRenderer: Loaded simple recording '" + normalized + "' frames=" + record.frames.Length);
-
-            Vector3 origin = Vector3.zero;
-            Quaternion rotation = Quaternion.identity;
-            if (record.canvasTransform != null)
-            {
-                origin = record.canvasTransform.position;
-                rotation = record.canvasTransform.rotation;
-            }
-
-            Vector3 right = rotation * Vector3.right;
-            Vector3 up = rotation * Vector3.up;
-
-            var segments = new Segment[record.frames.Length - 1];
-            for (int i = 1; i < record.frames.Length; i++)
-            {
-                Vector3 relPrev = record.frames[i - 1].position - origin;
-                Vector3 relCurr = record.frames[i].position - origin;
-
-                Vector2 a = new Vector2(Vector3.Dot(relPrev, right), Vector3.Dot(relPrev, up));
-                Vector2 b = new Vector2(Vector3.Dot(relCurr, right), Vector3.Dot(relCurr, up));
-                Vector2 ctrl = (a + b) * 0.5f;
-
-                segments[i - 1] = new Segment
-                {
-                    a = a,
-                    b = b,
-                    ctrl = ctrl
-                };
-            }
-
-            Debug.Log("LetterPathRenderer: simple recording generated " + segments.Length + " segments for letter '" + normalized + "'.");
-            var stroke = new Stroke { segments = segments };
-            var strokes = new[] { stroke };
-            Normalize(strokes);
+            Stroke[] strokes = ParseSimpleRecording(asset.text);
+            if (strokes.Length == 0)
+                Debug.LogWarning($"LetterPathRenderer: 2D recording for '{normalized}' contains no usable segments.");
             return strokes;
         }
         catch (Exception ex)
         {
-            Debug.LogWarning($"LetterPathRenderer: Failed to parse simple recording fallback for '{normalized}': {ex.Message}");
+            Debug.LogWarning($"LetterPathRenderer: Failed to parse 2D recording for '{normalized}': {ex.Message}");
             return Array.Empty<Stroke>();
         }
+    }
+
+    private Stroke[] ParseSimpleRecording(string json)
+    {
+        JObject root = JObject.Parse(json);
+        JArray frames = root["frames"] as JArray;
+        if (frames == null || frames.Count < 2)
+        {
+            return Array.Empty<Stroke>();
+        }
+
+        int frameCount = frames.Count;
+        var points = new Vector2[frameCount];
+        for (int i = 0; i < frameCount; i++)
+        {
+            points[i] = ExtractFrame2D(frames[i]);
+        }
+
+        var segments = new List<Segment>(frameCount - 1);
+        Vector2 previous = points[0];
+        for (int i = 1; i < frameCount; i++)
+        {
+            Vector2 current = points[i];
+            if ((current - previous).sqrMagnitude < 1e-6f)
+                continue;
+
+            Vector2 ctrl = (previous + current) * 0.5f;
+            segments.Add(new Segment
+            {
+                a = previous,
+                b = current,
+                ctrl = ctrl
+            });
+
+            previous = current;
+        }
+
+        if (segments.Count == 0)
+        {
+            return Array.Empty<Stroke>();
+        }
+
+        var stroke = new Stroke { segments = segments.ToArray() };
+        var strokes = new[] { stroke };
+        Normalize(strokes);
+        return strokes;
+    }
+
+    private static Vector2 ExtractFrame2D(JToken frameToken)
+    {
+        if (frameToken == null)
+            return Vector2.zero;
+
+        JObject posObj = frameToken["position"] as JObject;
+        if (posObj == null)
+            return Vector2.zero;
+
+        float x = posObj.Value<float?>("x") ?? 0f;
+        float y = posObj.Value<float?>("y") ?? 0f;
+
+        return new Vector2(x, y);
     }
 
     private static Stroke[] ParseLetterJson(string json)
@@ -1000,24 +1034,4 @@ Shader.Find("Sprites/Default");
         material = null;
     }
 
-    [Serializable]
-    private class SimpleRecordingDto
-    {
-        public SimpleFrameDto[] frames;
-        public SimpleCanvasTransformDto canvasTransform;
-    }
-
-    [Serializable]
-    private class SimpleFrameDto
-    {
-        public Vector3 position;
-    }
-
-    [Serializable]
-    private class SimpleCanvasTransformDto
-    {
-        public Vector3 position;
-        public Quaternion rotation;
-        public Vector3 scale;
-    }
 }

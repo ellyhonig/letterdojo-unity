@@ -57,11 +57,21 @@ public class Letter3DDisplay : MonoBehaviour
         displayCoroutine = StartCoroutine(DisplayCoroutine());
     }
 
-    private IEnumerator DisplayCoroutine()
+    private IEnumerator DisplayCoroutine(string overrideLetter = null)
     {
         ClearDisplay();
 
-        string letter = phonemeManager.levelManager.currentLetter.ToLower();
+        if (!phonemeManager || phonemeManager.levelManager == null)
+            yield break;
+
+        string letter = overrideLetter;
+        if (string.IsNullOrEmpty(letter))
+            letter = phonemeManager.levelManager.currentLetter;
+
+        if (string.IsNullOrEmpty(letter))
+            yield break;
+
+        letter = letter.ToLowerInvariant();
         if (letterToFileNames.TryGetValue(letter, out var files))
         {
             string toLoad = attemptCount == 0 ? files.file1 : files.file2;
@@ -100,5 +110,15 @@ public class Letter3DDisplay : MonoBehaviour
         if (displayCoroutine != null)
             StopCoroutine(displayCoroutine);
         displayCoroutine = StartCoroutine(DisplayCoroutine());
+    }
+
+    public void ShowHintForLetter(string letter, bool resetAttempts = false)
+    {
+        if (resetAttempts)
+            attemptCount = 0;
+
+        if (displayCoroutine != null)
+            StopCoroutine(displayCoroutine);
+        displayCoroutine = StartCoroutine(DisplayCoroutine(letter));
     }
 }

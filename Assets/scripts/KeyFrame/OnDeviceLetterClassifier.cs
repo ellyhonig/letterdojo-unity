@@ -25,7 +25,7 @@ namespace LetterDojo.Dictation.OnDevice
     }
 
     /// <summary>
-    /// Performs on-device grading of the dictation board capture using a Sentis model exported from the handwriting endpoint.
+    /// Performs on-device gradihng of thef dictation board capture using a Sentis model exported from the handwriting endpoint.
     /// </summary>
     public sealed class OnDeviceLetterClassifier : MonoBehaviour
     {

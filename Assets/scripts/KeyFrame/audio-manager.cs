@@ -245,6 +245,39 @@ public class AudioManager : MonoBehaviour
         OnDictationStart_NoArgs();
     }
 
+    public bool TryPlayCurrentLetterPronunciation()
+    {
+        bool success = false;
+
+        if (levelManager != null && !string.IsNullOrEmpty(levelManager.currentLetter))
+        {
+            success = TryPlayLetterPronunciation(levelManager.currentLetter[0]);
+            if (success) return true;
+        }
+
+        var letterStr = TryGetLetterFrom(dictationManager) ?? TryGetLetterFrom(levelManager);
+        if (!string.IsNullOrEmpty(letterStr))
+            success = TryPlayLetterPronunciation(letterStr[0]);
+
+        if (!success)
+            Debug.LogWarning("[AudioManager] TryPlayCurrentLetterPronunciation could not determine a letter to play.");
+
+        return success;
+    }
+
+    public bool TryPlayLetterPronunciation(char letter)
+    {
+        if (letter == '\0')
+            return false;
+
+        var clip = GetClipForLetter(letter);
+        if (clip == null)
+            return false;
+
+        PlayLetterClip(letter);
+        return true;
+    }
+
     private void PlayLetterClip(char letter)
     {
         var clip = GetClipForLetter(letter);
@@ -276,7 +309,7 @@ public class AudioManager : MonoBehaviour
     {
         if (obj == null) return null;
 
-        // Try common field/property names youGÇÖve used before
+        // Try common field/property names youGve used before
         string[] candidates = {
             "currentSound","CurrentSound",
             "currentLetter","CurrentLetter",

@@ -79,11 +79,11 @@ public class VolumeIndicator : MonoBehaviour
         switch (pm.currentState)
         {
             case PhonemeManager.PhonemeCheckState.WaitingToRecord:
-                DrawBars(waitingColour, pm.amplitudeThreshold);
+                DrawBars(waitingColour);
                 break;
 
             case PhonemeManager.PhonemeCheckState.Recording:
-                DrawBars(idleColour, pm.amplitudeThreshold);
+                DrawBars(idleColour);
                 break;
 
             default:
@@ -99,14 +99,41 @@ public class VolumeIndicator : MonoBehaviour
             cInfo.rend.material.color = c;
     }
 
-    void DrawBars(Color background, float thresh)
+    void DrawBars(Color background)
     {
+        if (rankCount <= 0)
+        {
+            TintAll(background);
+            return;
+        }
+
         float peak = GetLivePeak();
-        float frac = Mathf.Clamp01(peak / Mathf.Max(thresh, 0.0001f));
-        int lit = Mathf.Clamp(Mathf.CeilToInt(frac * rankCount), 0, rankCount);
+        float threshold = Mathf.Max(pm.EffectiveAmplitudeThreshold, 0.0001f);
+        float baseline = Mathf.Clamp(pm.AmbientNoiseBaseline, 0f, threshold);
+
+        float baselineFrac = threshold > 0f ? Mathf.Clamp01(baseline / threshold) : 0f;
+        int ambientLit = Mathf.Clamp(Mathf.CeilToInt(baselineFrac * rankCount), 0, rankCount);
+
+        int capacity = Mathf.Max(rankCount - ambientLit, 0);
+        float numerator = Mathf.Max(peak - baseline, 0f);
+        float denominator = Mathf.Max(threshold - baseline, 0.0001f);
+        float frac = capacity > 0 ? Mathf.Clamp01(numerator / denominator) : 0f;
+        int dynamicLit = Mathf.Clamp(Mathf.CeilToInt(frac * capacity), 0, capacity);
+
+        Color ambientColor = Color.Lerp(background, activeColour, 0.35f);
 
         foreach (var cube in cubes)
-            cube.rend.material.color = (cube.rank < lit) ? activeColour : background;
+        {
+            Color target;
+            if (cube.rank < ambientLit)
+                target = ambientColor;
+            else if (cube.rank < ambientLit + dynamicLit)
+                target = activeColour;
+            else
+                target = background;
+
+            cube.rend.material.color = target;
+        }
     }
 
     float GetLivePeak()

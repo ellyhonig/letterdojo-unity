@@ -245,6 +245,7 @@ public class FirebaseLevelSyncSinglePlan : MonoBehaviour
                 Phonemes = p?.Phonemes ?? new List<string>(),
                 Modes    = new List<LevelManager.GameMode>(modes)
             };
+            NormalizePhaseLettersAndPhonemes(phase);
             phases.Add(phase);
         }
 
@@ -288,5 +289,30 @@ public class FirebaseLevelSyncSinglePlan : MonoBehaviour
         var dv = v["doubleValue"]?.Value<double>();
         if (dv.HasValue) return (long)dv.Value;
         return defVal;
+    }
+
+    private static void NormalizePhaseLettersAndPhonemes(LevelManager.Phase phase)
+    {
+        if (phase == null) return;
+        if (phase.Letters == null)
+            phase.Letters = new List<string>();
+        if (phase.Phonemes == null)
+            phase.Phonemes = new List<string>();
+
+        for (int i = 0; i < phase.Letters.Count; i++)
+        {
+            string raw = phase.Letters[i] ?? string.Empty;
+            raw = raw.Trim();
+            string lower = raw.Length > 0 ? raw.Substring(0, 1).ToLowerInvariant() : string.Empty;
+            phase.Letters[i] = lower;
+
+            if (phase.Phonemes.Count <= i)
+                phase.Phonemes.Add(lower);
+            else
+                phase.Phonemes[i] = lower;
+        }
+
+        if (phase.Phonemes.Count > phase.Letters.Count)
+            phase.Phonemes.RemoveRange(phase.Letters.Count, phase.Phonemes.Count - phase.Letters.Count);
     }
 }

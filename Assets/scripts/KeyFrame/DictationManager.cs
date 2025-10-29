@@ -1,5 +1,6 @@
 using UnityEngine;
 using UnityEngine.Networking;
+using UnityEngine.SceneManagement;
 using System;
 using System.Collections;
 using System.Collections.Generic;
@@ -39,6 +40,12 @@ public class DictationManager : MonoBehaviour
     [SerializeField] private GameObject eraseButtonGO;
     [SerializeField] private GameObject repeatButtonGO;
     [SerializeField] private TMP_Text   feedbackText;
+
+    [Header("Replay Prompt")]
+    [SerializeField] private TMP_Text replayPromptText;
+    [SerializeField] private GameObject replayPromptRoot;
+    [SerializeField, Range(0f, 0.02f)] private float replayPromptDuration = 1.2f;
+    [SerializeField, Min(0f)] private float tmpReplayFlashDuration = 1f;
     [SerializeField] private float waitBeforeRef    = 0.75f;
     [SerializeField] private float waitAfterReplay  = 0.5f;
     [SerializeField] private float waitAfterCorrect = 0.5f;
@@ -85,6 +92,8 @@ public class DictationManager : MonoBehaviour
     [SerializeField] private bool autoGradeOnIdle = true;
     [SerializeField, Range(0.1f, 2f)] private float autoGradeIdleSeconds = 0.7f;
     [SerializeField, Range(0f, 1f)] private float autoGradeMinimumConfidence = 0.5f;
+    [SerializeField, Range(0f, 1f)] private float autoGradeWrongMinimumConfidence = 0.2f;
+    [SerializeField, Min(0f)] private float autoGradeMinimumStrokeLength = 0.01f;
 
     [Header("Guide Lines (optional visuals)")]
     public Transform skyLine, planeLine, groundLine;
@@ -96,6 +105,9 @@ public class DictationManager : MonoBehaviour
     [SerializeField] private GameObject drawerHost;
 
     [SerializeField] private GameObject tmpLetter;
+
+    [Header("Hint Display")]
+    [SerializeField] private Letter3DDisplay hintDisplay;
 
     private CanvasManager  canvas;
     private SimpleRecorder rec;
@@ -112,7 +124,9 @@ public class DictationManager : MonoBehaviour
     private LaserUIButton repeatLaserBtn;
 
     private AudioManager audioManager;
+    private bool loggedMissingAudioManager = false;
     private int attemptCount = 0; // two tries policy
+    private bool suppressTmpOnAdvance;
     private readonly List<GameObject> replayDots = new List<GameObject>();
 
     private enum State { Idle, Drawing, WaitingForResponse, GradedAccept, GradedReject }
@@ -129,9 +143,12 @@ public class DictationManager : MonoBehaviour
     private bool _autoGradeTriggeredForStroke = false;
     private bool _autoGradeRunning = false;
     private PlaneSurfaceDrawer _planeDrawer;
+    private HandPlaneConstraint _planeConstraint;
+    [SerializeField, Range(0f, 0.02f)] private float replayDotLift = 0.0015f;
     private HandState _rightHandState = HandState.Idle;
     private HandState _leftHandState = HandState.Idle;
     private int _lastObservedStrokeTotal = 0;
+    private bool _playedInitialAudio = false;
     private static readonly HashSet<char> LettersRequiringTwoStrokes = new HashSet<char> { 'f', 't', 'k', 'x' };
     private bool ShouldUseRemoteGrading => useRemoteClassifier && !string.IsNullOrWhiteSpace(remoteClassifierBaseUrl);
 
@@ -160,7 +177,10 @@ public class DictationManager : MonoBehaviour
         rec    = GetComponent<SimpleRecorder>();
         lvl    = GetComponent<LevelManager>();
         saver  = GetComponent<SaveManager>();
-        audioManager = FindObjectOfType<AudioManager>();
+        ResolveAudioManager();
+        ResolveHintDisplay();
+        if (lvl != null)
+            lvl.OnLetterChanged += HandleLevelManagerLetterChanged;
 
         EnsureLocalClassifierConfigured();
 
@@ -194,7 +214,14 @@ public class DictationManager : MonoBehaviour
                            drawerHost.GetComponentInChildren<PlaneSurfaceDrawer>(true);
         }
 
+        if (_planeDrawer != null)
+        {
+            _planeConstraint = _planeDrawer.GetComponent<HandPlaneConstraint>() ??
+                                _planeDrawer.GetComponentInParent<HandPlaneConstraint>();
+        }
+
         EnsurePlaneDrawerCallbacks();
+        HideReplayPrompt();
 
         if (gradingButtonGO)
         {
@@ -259,12 +286,14 @@ public class DictationManager : MonoBehaviour
 
     void OnEnable()
     {
+        ResolveAudioManager();
         EnsurePlaneDrawerCallbacks();
         if (gradingBtn) gradingBtn.OnButtonPressed += HandleGradeBtn;
         if (eraseBtn)   eraseBtn.OnButtonPressed   += HandleEraseBtn;
         if (debugLocalBtn) debugLocalBtn.OnButtonPressed += HandleDebugLocalBtn;
         ClearBoardVisuals();
         UpdateUI();
+        TryPlayInitialLetterAudio();
     }
     void OnDisable()
     {
@@ -277,6 +306,13 @@ public class DictationManager : MonoBehaviour
             StopCoroutine(_debugLocalRoutine);
             _debugLocalRoutine = null;
         }
+        _playedInitialAudio = false;
+    }
+
+    void OnDestroy()
+    {
+        if (lvl != null)
+            lvl.OnLetterChanged -= HandleLevelManagerLetterChanged;
     }
 
     private void EnsureLocalClassifierConfigured()
@@ -323,6 +359,9 @@ public class DictationManager : MonoBehaviour
 
         if (_planeDrawer != null)
         {
+            _planeConstraint = _planeDrawer.GetComponent<HandPlaneConstraint>() ??
+                                _planeDrawer.GetComponentInParent<HandPlaneConstraint>();
+
             _planeDrawer.OnHandStateChanged -= HandleDrawerHandStateChanged;
             _planeDrawer.OnHandStateChanged += HandleDrawerHandStateChanged;
         }
@@ -342,6 +381,114 @@ public class DictationManager : MonoBehaviour
 
     private bool IsUserCurrentlyDrawing => _rightHandState == HandState.Drawing || _leftHandState == HandState.Drawing;
 
+    private AudioManager ResolveAudioManager()
+    {
+        if (audioManager && audioManager.isActiveAndEnabled)
+        {
+            loggedMissingAudioManager = false;
+            return audioManager;
+        }
+
+        var managers = Resources.FindObjectsOfTypeAll<AudioManager>()
+            .Where(a => a != null && a.gameObject.scene.IsValid())
+            .ToArray();
+        audioManager = managers.FirstOrDefault(a => a != null && a.isActiveAndEnabled);
+        if (!audioManager && managers.Length > 0)
+            audioManager = managers[0];
+
+        if (audioManager && audioManager.isActiveAndEnabled)
+        {
+            loggedMissingAudioManager = false;
+            return audioManager;
+        }
+
+        if (!loggedMissingAudioManager)
+        {
+            Debug.LogWarning("[Dictation] AudioManager not available; letter audio will be skipped until it returns.");
+            loggedMissingAudioManager = true;
+        }
+
+        return null;
+    }
+
+    private static char ExtractFirstAsciiLetter(string value)
+    {
+        if (string.IsNullOrEmpty(value)) return '\0';
+        foreach (char c in value)
+            if (char.IsLetter(c))
+                return c;
+        return '\0';
+    }
+
+    private static string ToDisplayLetter(string letter)
+    {
+        if (string.IsNullOrEmpty(letter)) return "?";
+        string trimmed = letter.Trim();
+        return trimmed.Length > 0 ? trimmed.Substring(0, 1).ToUpperInvariant() : "?";
+    }
+
+    private void TryPlayInitialLetterAudio()
+    {
+        if (_playedInitialAudio)
+            return;
+        if (!isActiveAndEnabled)
+            return;
+        if (lvl == null || string.IsNullOrEmpty(lvl.currentLetter))
+            return;
+
+        if (TryPlayCurrentLetterAudio())
+            _playedInitialAudio = true;
+    }
+
+    private void HandleLevelManagerLetterChanged(string newLetter)
+    {
+        _playedInitialAudio = false;
+        if (lvl != null && lvl.currentMode == LevelManager.GameMode.Dictation)
+            TryPlayInitialLetterAudio();
+    }
+
+    private bool TryPlayCurrentLetterAudio()
+    {
+        var manager = ResolveAudioManager();
+        if (manager == null)
+        {
+            Debug.LogWarning("[Dictation] AudioManager unavailable; cannot play letter audio.");
+            return false;
+        }
+
+        char letter = ExtractFirstAsciiLetter(lvl != null ? lvl.currentLetter : null);
+        if (letter != '\0')
+        {
+            if (manager.TryPlayLetterPronunciation(letter))
+            {
+                Debug.Log($"[Dictation] Played pronunciation for letter '{char.ToUpperInvariant(letter)}'.");
+                return true;
+            }
+
+            Debug.LogWarning($"[Dictation] Primary audio failed for letter '{char.ToUpperInvariant(letter)}'; attempting fallback.");
+            bool fallback = manager.TryPlayCurrentLetterPronunciation();
+            Debug.Log(fallback
+                ? "[Dictation] Fallback pronunciation succeeded."
+                : "[Dictation] Fallback pronunciation failed.");
+            return fallback;
+        }
+
+        bool noLetterFallback = manager.TryPlayCurrentLetterPronunciation();
+        Debug.Log(noLetterFallback
+            ? "[Dictation] Played pronunciation using fallback (no current letter)."
+            : "[Dictation] Could not determine any letter audio to play.");
+        return noLetterFallback;
+    }
+
+#if UNITY_EDITOR
+    [ContextMenu("Play Current Letter Audio")]
+    public void EditorPlayCurrentLetterAudio()
+    {
+        Debug.Log("[Dictation] Editor request: play current letter audio.");
+        TryPlayCurrentLetterAudio();
+    }
+#endif
+
     private int GetCurrentStrokeCount()
     {
         return _planeDrawer != null && _planeDrawer.StrokesRoot != null
@@ -351,10 +498,48 @@ public class DictationManager : MonoBehaviour
 
     private int GetRequiredStrokeCount()
     {
+        return RequiresTwoStrokeLetter() ? 2 : 1;
+    }
+
+    private bool RequiresTwoStrokeLetter()
+    {
         string normalized = NormalizeAsciiStrict(lvl != null ? lvl.currentLetter : null);
-        if (string.IsNullOrEmpty(normalized)) return 1;
-        char letter = normalized[0];
-        return LettersRequiringTwoStrokes.Contains(letter) ? 2 : 1;
+        if (string.IsNullOrEmpty(normalized))
+            return false;
+        return LettersRequiringTwoStrokes.Contains(normalized[0]);
+    }
+
+    private float EstimateCurrentStrokeLength()
+    {
+        if (_planeDrawer == null || _planeDrawer.StrokesRoot == null)
+            return 0f;
+
+        float total = 0f;
+        for (int i = 0; i < _planeDrawer.StrokesRoot.childCount; i++)
+        {
+            var child = _planeDrawer.StrokesRoot.GetChild(i);
+            if (!child) continue;
+            var lr = child.GetComponent<LineRenderer>();
+            if (lr == null) continue;
+            int points = lr.positionCount;
+            if (points < 2) continue;
+            Vector3 prev = lr.GetPosition(0);
+            for (int p = 1; p < points; p++)
+            {
+                Vector3 current = lr.GetPosition(p);
+                total += Vector3.Distance(prev, current);
+                prev = current;
+            }
+        }
+        return total;
+    }
+
+    private bool HasSufficientInk()
+    {
+        float minLength = Mathf.Max(0f, autoGradeMinimumStrokeLength);
+        if (minLength <= 0f)
+            return true;
+        return EstimateCurrentStrokeLength() >= minLength;
     }
 
     private bool MeetsStrokeRequirement()
@@ -406,7 +591,8 @@ public class DictationManager : MonoBehaviour
         if (IsUserCurrentlyDrawing)
             return;
 
-        if (!MeetsStrokeRequirement())
+        bool hasEnoughStrokes = MeetsStrokeRequirement();
+        if (!hasEnoughStrokes && !RequiresTwoStrokeLetter())
             return;
 
         if (_lastStrokeChangeTime < 0f)
@@ -434,6 +620,14 @@ public class DictationManager : MonoBehaviour
 
         _lastNotifiedMode = mode;
         _hasLastMode = true;
+
+        if (tmpLetter != null)
+        {
+            if (isDict)
+                tmpLetter.SetActive(false);
+            else
+                tmpLetter.SetActive(true);
+        }
 
         UpdateUI();
         if (!isDict) SetFeedback("");
@@ -464,8 +658,11 @@ public class DictationManager : MonoBehaviour
 
         state = State.Drawing;
         UpdateUI();
-        SetFeedback(!string.IsNullOrEmpty(lvl.currentLetter) ? $"Write '{lvl.currentLetter}'" : "Write the letter");
+        string displayLetter = ToDisplayLetter(lvl.currentLetter);
+        SetFeedback(displayLetter != "?" ? $"Write '{displayLetter}'" : "Write the letter");
         OnDictationStart?.Invoke();
+        if (TryPlayCurrentLetterAudio())
+            _playedInitialAudio = true;
         ClearBoardVisuals();
     }
 
@@ -493,17 +690,54 @@ public class DictationManager : MonoBehaviour
     private void PlayRepeatAudio()
     {
         if (!isActiveAndEnabled) return;
-        char letter = '\0';
-        if (lvl != null && !string.IsNullOrEmpty(lvl.currentLetter))
-            letter = lvl.currentLetter[0];
-        if (audioManager != null)
+
+        char letter = ExtractFirstAsciiLetter(lvl != null ? lvl.currentLetter : null);
+        bool played = TryPlayCurrentLetterAudio();
+
+        if (letter != '\0')
         {
-            audioManager.PlayCurrentLetterPronunciation();
-            if (letter != '\0') SetFeedback($"Listen: '{char.ToUpperInvariant(letter)}'");
+            SetFeedback(played
+                ? $"Listen: '{char.ToUpperInvariant(letter)}'"
+                : $"Letter: '{char.ToUpperInvariant(letter)}'");
         }
-        else
+        else if (!played)
         {
-            if (letter != '\0') SetFeedback($"Letter: '{char.ToUpperInvariant(letter)}'");
+            SetFeedback("Listen again when you're ready.");
+        }
+    }
+
+    private Letter3DDisplay ResolveHintDisplay()
+    {
+        if (hintDisplay != null)
+            return hintDisplay;
+
+        var candidates = Resources.FindObjectsOfTypeAll<Letter3DDisplay>();
+        foreach (var candidate in candidates)
+        {
+            if (candidate == null) continue;
+            var go = candidate.gameObject;
+            if (!go) continue;
+            var scene = go.scene;
+            if (!scene.IsValid() || !scene.isLoaded)
+                continue;
+
+            hintDisplay = candidate;
+            break;
+        }
+
+        return hintDisplay;
+    }
+
+    private void ShowHintDisplay()
+    {
+        var display = ResolveHintDisplay();
+        if (display != null)
+        {
+            if (!display.isActiveAndEnabled)
+                display.enabled = true;
+
+            string letter = lvl != null ? lvl.currentLetter : null;
+            display.ShowHintForLetter(letter, resetAttempts: true);
         }
     }
     public void TriggerLocalDebug()
@@ -582,22 +816,23 @@ public class DictationManager : MonoBehaviour
 
         int matchRank = eval.MatchRank;
         bool hasMatch = matchRank >= 0;
-        bool matchCorrect = hasMatch && eval.Normalized == expectedNormalized;
+        bool matchCorrect = hasMatch && LettersEquivalent(eval.Normalized, expectedNormalized);
         float matchConfidence = eval.Confidence;
         string matchRaw = hasMatch ? eval.Raw : string.Empty;
         string matchNormalized = hasMatch ? eval.Normalized : string.Empty;
 
         string topRaw = prediction.TopLetter ?? string.Empty;
         string topNormalized = NormalizeAsciiStrict(topRaw);
-        bool topCorrect = eval.Top1Match && topNormalized == expectedNormalized;
+        bool topCorrect = eval.Top1Match && LettersEquivalent(topNormalized, expectedNormalized);
         float topConfidence = eval.Top1Confidence;
 
         float requiredTopConfidence = Mathf.Max(autoGradeMinimumConfidence, remoteConfidenceThreshold);
         float requiredSecondConfidence = Mathf.Max(autoGradeMinimumConfidence, remoteSecondRankConfidenceThreshold);
+        float wrongConfidenceThreshold = Mathf.Max(autoGradeWrongMinimumConfidence, remoteWrongConfidenceThreshold);
 
         bool acceptTop1 = topCorrect && topConfidence >= requiredTopConfidence;
         bool acceptTop2 = hasMatch && matchCorrect && matchRank <= 1 && matchConfidence >= requiredSecondConfidence;
-        bool forceWrong = !topCorrect && topConfidence >= remoteWrongConfidenceThreshold && matchRank < 0;
+        bool shouldForceWrong = !topCorrect && topConfidence >= wrongConfidenceThreshold && (!hasMatch || !matchCorrect || matchConfidence < requiredSecondConfidence);
 
         if (acceptTop2 && hasMatch && matchCorrect && matchRank <= 1)
         {
@@ -620,7 +855,7 @@ public class DictationManager : MonoBehaviour
         chosenRaw = topRaw;
         chosenNormalized = topNormalized;
         chosenConfidence = topConfidence;
-        highConfidenceRemoteWrong = forceWrong;
+        highConfidenceRemoteWrong = shouldForceWrong;
         topMatch = topCorrect;
         return false;
     }
@@ -649,7 +884,7 @@ public class DictationManager : MonoBehaviour
         string topRaw = prediction.HasWriting ? (prediction.TopLetter ?? string.Empty) : string.Empty;
         float topConfidence = prediction.TopConfidence;
         string topNormalized = NormalizeAsciiStrict(topRaw);
-        bool top1Match = !string.IsNullOrEmpty(topNormalized) && topNormalized == expectedNormalized;
+        bool top1Match = LettersEquivalent(topNormalized, expectedNormalized);
 
         string matchedRaw = topRaw;
         float matchedConfidence = topConfidence;
@@ -664,7 +899,7 @@ public class DictationManager : MonoBehaviour
             {
                 var candidate = prediction.Ranked[i];
                 string candidateNorm = NormalizeAsciiStrict(candidate.letter);
-                if (!string.IsNullOrEmpty(candidateNorm) && candidateNorm == expectedNormalized)
+                if (LettersEquivalent(candidateNorm, expectedNormalized))
                 {
                     matchedRaw = candidate.letter;
                     matchedConfidence = candidate.probability;
@@ -676,7 +911,7 @@ public class DictationManager : MonoBehaviour
             }
         }
 
-        bool normalizedMatch = !string.IsNullOrEmpty(matchedNormalized) && matchedNormalized == expectedNormalized;
+        bool normalizedMatch = LettersEquivalent(matchedNormalized, expectedNormalized);
         bool meetsThreshold = prediction.HasWriting && normalizedMatch && matchedConfidence >= localConfidenceThreshold;
         bool success = (inTopThreeMatch && normalizedMatch) || meetsThreshold;
 
@@ -894,15 +1129,18 @@ public class DictationManager : MonoBehaviour
 
         string expected = NormalizeAsciiStrict(lvl != null ? lvl.currentLetter : null);
         string targetLetter = lvl?.currentLetter ?? "?";
+        string displayTargetLetter = ToDisplayLetter(targetLetter);
         string gotRaw;
         string gotNormalized;
         bool correct;
         bool usedRemote = attemptedRemote && !remoteFailedHard;
-        bool usedLocal = !usedRemote && attemptedLocal;
+        bool usedLocal = false;
         float primaryConfidence = 0f;
         bool hasWriting = true;
         bool normalizedMatch = false;
         bool highConfidenceRemoteWrong = false;
+
+        bool insufficientInk = !HasSufficientInk();
 
         if (usedRemote)
         {
@@ -917,28 +1155,54 @@ public class DictationManager : MonoBehaviour
             DebugCodepoint("[Remote] RAW", gotRaw);
             Debug.Log($"[Remote] NORMALIZED got='{gotNormalized}' expected='{expected}' conf={primaryConfidence:F3} accepted={accepted} highWrong={highConfidenceRemoteWrong} hasWriting={hasWriting}");
         }
-        else if (usedLocal)
-        {
-            LetterPrediction prediction = localFailedHard ? LetterPrediction.NoWriting : localPrediction ?? LetterPrediction.NoWriting;
-            var eval = EvaluateLocalPrediction(prediction, expected);
-
-            hasWriting = eval.HasWriting;
-            primaryConfidence = eval.Confidence;
-            gotRaw = eval.Raw;
-            gotNormalized = eval.Normalized;
-            normalizedMatch = eval.NormalizedMatch;
-            correct = eval.IsSuccess;
-
-            DebugCodepoint("[Local] RAW", gotRaw);
-            Debug.Log($"[Local] NORMALIZED got='{gotNormalized}' expected='{expected}' conf={primaryConfidence:F3} hasWriting={hasWriting} top3={eval.InTopThree} threshold={eval.MeetsThreshold}");
-        }
         else
         {
             gotRaw = ocrText ?? string.Empty;
             DebugCodepoint("[Vision] RAW", gotRaw);
             gotNormalized = NormalizeAsciiStrict(gotRaw);
-            correct = (!string.IsNullOrEmpty(gotNormalized) && gotNormalized == expected);
+            correct = LettersEquivalent(gotNormalized, expected);
             Debug.Log($"[Vision] NORMALIZED got='{gotNormalized}' expected='{expected}'");
+        }
+
+        if (!correct && (!hasWriting || insufficientInk))
+        {
+            string reason = !hasWriting ? "no writing detected" : "insufficient ink";
+            Debug.Log($"[Dictation][Grade] {reason}; treating as stray mark.");
+            state = State.Drawing;
+            UpdateUI();
+            SetFeedback(!hasWriting
+                ? "No writing yet. Keep writing or erase stray marks."
+                : "Keep writing a bit more before grading.");
+            yield break;
+        }
+
+        bool shouldTreatAsStray =
+            !correct &&
+            usedRemote &&
+            !normalizedMatch &&
+            !highConfidenceRemoteWrong;
+
+        if (shouldTreatAsStray)
+        {
+            Debug.Log("[Dictation][Grade] Prediction does not strongly indicate the wrong letter; treating as stray mark.");
+            state = State.Drawing;
+            UpdateUI();
+            SetFeedback("Keep writing or erase stray marks.");
+            yield break;
+        }
+
+        bool lowConfidenceWrong = !correct
+                                   && hasWriting
+                                   && primaryConfidence >= 0f
+                                   && primaryConfidence < autoGradeWrongMinimumConfidence
+                                   && (usedRemote || usedLocal);
+        if (lowConfidenceWrong)
+        {
+            Debug.Log($"[Dictation][Grade] Low-confidence wrong ({primaryConfidence:F3}) treated as stray mark.");
+            state = State.Drawing;
+            UpdateUI();
+            SetFeedback("Looks like a stray mark. Erase it or keep writing.");
+            yield break;
         }
 
         state = correct ? State.GradedAccept : State.GradedReject;
@@ -949,11 +1213,11 @@ public class DictationManager : MonoBehaviour
             OnDictationGraded?.Invoke(100f);
             OnLetterCorrect?.Invoke();
             if (usedRemote)
-                SetFeedback($"Correct (remote '{gotRaw}' @ {Mathf.RoundToInt(primaryConfidence * 100f)}%)");
+                SetFeedback($"Correct (remote '{ToDisplayLetter(gotRaw)}' @ {Mathf.RoundToInt(primaryConfidence * 100f)}%)");
             else if (usedLocal)
-                SetFeedback($"Correct (local '{gotRaw}' @ {Mathf.RoundToInt(primaryConfidence * 100f)}%)");
+                SetFeedback($"Correct (local '{ToDisplayLetter(gotRaw)}' @ {Mathf.RoundToInt(primaryConfidence * 100f)}%)");
             else
-                SetFeedback($"Correct (saw: '{gotRaw}')");
+                SetFeedback($"Correct (saw: '{ToDisplayLetter(gotRaw)}')");
             ClearBoardVisuals();
             yield return new WaitForSeconds(waitAfterCorrect);
             Advance();
@@ -962,11 +1226,10 @@ public class DictationManager : MonoBehaviour
         {
             OnDictationGraded?.Invoke(0f);
             OnLetterIncorrect?.Invoke();
-            if (attemptCount == 0)
+            if (attemptCount <= 0)
             {
                 // First mistake: show image hint (same as phoneme manager)
-                var hint = FindObjectOfType<Letter3DDisplay>();
-                if (hint != null) hint.ShowHintNow();
+                ShowHintDisplay();
                 string retryMsg;
                 if (usedRemote)
                 {
@@ -975,9 +1238,9 @@ public class DictationManager : MonoBehaviour
                     else if (normalizedMatch)
                         retryMsg = $"Not quite yet ({Mathf.RoundToInt(primaryConfidence * 100f)}% confidence). Try again.";
                     else if (highConfidenceRemoteWrong)
-                        retryMsg = $"Remote is very confident it's '{(string.IsNullOrEmpty(gotRaw) ? "?" : gotRaw)}' ({Mathf.RoundToInt(primaryConfidence * 100f)}%). Watch the demo and retry.";
+                        retryMsg = $"Remote is very confident it's '{ToDisplayLetter(gotRaw)}' ({Mathf.RoundToInt(primaryConfidence * 100f)}%). Watch the demo and retry.";
                     else
-                        retryMsg = $"Remote saw '{(string.IsNullOrEmpty(gotRaw) ? "?" : gotRaw)}'. Try '{targetLetter}' again.";
+                        retryMsg = $"Remote saw '{ToDisplayLetter(gotRaw)}'. Try '{displayTargetLetter}' again.";
                 }
                 else if (usedLocal)
                 {
@@ -986,13 +1249,14 @@ public class DictationManager : MonoBehaviour
                     else if (normalizedMatch)
                         retryMsg = $"Not quite yet ({Mathf.RoundToInt(primaryConfidence * 100f)}% confidence). Try again.";
                     else
-                        retryMsg = $"Local saw '{(string.IsNullOrEmpty(gotRaw) ? "?" : gotRaw)}'. Try '{targetLetter}' again.";
+                        retryMsg = $"Local saw '{ToDisplayLetter(gotRaw)}'. Try '{displayTargetLetter}' again.";
                 }
                 else
                 {
-                    retryMsg = $"Hint shown. Try '{targetLetter}' again.";
+                    retryMsg = $"Hint shown. Try '{displayTargetLetter}' again.";
                 }
 
+                ClearBoardVisuals();
                 SetFeedback(retryMsg);
                 attemptCount = 1;
                 state = State.Drawing;
@@ -1005,13 +1269,15 @@ public class DictationManager : MonoBehaviour
                 if ((usedRemote || usedLocal) && !hasWriting)
                     SetFeedback("No writing detected. Watch the demo and try again.");
                 else
-                    SetFeedback($"Watch the demo of '{targetLetter}'...");
-                ClearBoardVisuals();
+                    SetFeedback($"Watch the demo of '{displayTargetLetter}'...");
                 yield return new WaitForSeconds(waitBeforeRef);
-                yield return ReplayReference(); // revert to classic sphere replay
+                string letterForPrompt = lvl != null ? lvl.currentLetter : string.Empty;
+                ClearBoardVisuals();
+                yield return ShowReplayPrompt(letterForPrompt);
                 SetFeedback("Your turn!");
                 yield return new WaitForSeconds(waitAfterReplay);
                 attemptCount = 2;
+                suppressTmpOnAdvance = true;
                 Advance();
             }
         }
@@ -1027,9 +1293,17 @@ public class DictationManager : MonoBehaviour
         }
 
         bool canRemote = ShouldUseRemoteGrading;
-        bool canLocal = ShouldUseLocalGrading && localClassifier != null && localClassifier.HasModelAsset;
+        bool canLocal = false;
 
-        if (!canRemote && !canLocal)
+        int strokeCount = GetCurrentStrokeCount();
+        _lastObservedStrokeTotal = strokeCount;
+        int requiredStrokes = Mathf.Max(1, GetRequiredStrokeCount());
+        bool hasEnoughStrokes = strokeCount >= requiredStrokes;
+        bool requiresTwoStrokeLetter = RequiresTwoStrokeLetter();
+        bool allowEarlyWrongCheck = requiresTwoStrokeLetter && strokeCount > 0;
+        bool hasSufficientInk = HasSufficientInk();
+
+        if (!hasSufficientInk)
         {
             _autoGradeRunning = false;
             _autoGradeTriggeredForStroke = false;
@@ -1037,7 +1311,7 @@ public class DictationManager : MonoBehaviour
             yield break;
         }
 
-        if (!isActiveAndEnabled || state != State.Drawing || IsUserCurrentlyDrawing || !MeetsStrokeRequirement())
+        if (!isActiveAndEnabled || state != State.Drawing || IsUserCurrentlyDrawing || (!hasEnoughStrokes && !allowEarlyWrongCheck))
         {
             _autoGradeRunning = false;
             _autoGradeTriggeredForStroke = false;
@@ -1077,25 +1351,36 @@ public class DictationManager : MonoBehaviour
 
             string expectedRemote = NormalizeAsciiStrict(lvl != null ? lvl.currentLetter : null);
             var remoteEval = EvaluateLocalPrediction(remotePrediction, expectedRemote);
+            bool hasAnyWriting = remoteEval.HasWriting;
 
-            bool topCorrect = remoteEval.Top1Match && remoteEval.Top1Normalized == expectedRemote;
+            if (!hasAnyWriting)
+            {
+                Debug.Log("[Dictation][AutoGrade] Remote detected no writing; skipping auto-grade.");
+                _autoGradeRunning = false;
+                _autoGradeTriggeredForStroke = false;
+                _lastStrokeChangeTime = Time.time;
+                yield break;
+            }
+
+            bool topCorrect = remoteEval.Top1Match && LettersEquivalent(remoteEval.Top1Normalized, expectedRemote);
             float topConfidence = remoteEval.Top1Confidence;
             int matchRank = remoteEval.MatchRank;
             bool hasMatch = matchRank >= 0;
-            bool matchCorrect = hasMatch && remoteEval.Normalized == expectedRemote;
+            bool matchCorrect = hasMatch && LettersEquivalent(remoteEval.Normalized, expectedRemote);
             float matchConfidence = remoteEval.Confidence;
 
             float requiredTopConfidence = Mathf.Max(autoGradeMinimumConfidence, remoteConfidenceThreshold);
             float requiredSecondConfidence = Mathf.Max(autoGradeMinimumConfidence, remoteSecondRankConfidenceThreshold);
+            float wrongConfidenceThreshold = Mathf.Max(autoGradeWrongMinimumConfidence, remoteWrongConfidenceThreshold);
 
             bool acceptTop1 = topCorrect && topConfidence >= requiredTopConfidence;
             bool acceptTop2 = hasMatch && matchCorrect && matchRank <= 1 && matchConfidence >= requiredSecondConfidence;
-            bool forceWrong = !topCorrect && topConfidence >= remoteWrongConfidenceThreshold && matchRank < 0;
+            bool shouldForceWrong = !topCorrect && topConfidence >= wrongConfidenceThreshold && (!hasMatch || !matchCorrect || matchConfidence < requiredSecondConfidence);
 
             DebugCodepoint("[Auto][Remote] RAW", remotePrediction.TopLetter ?? string.Empty);
             Debug.Log($"[Dictation][AutoGrade] REMOTE top1='{remoteEval.Top1Normalized}' expected='{expectedRemote}' confTop1={topConfidence:F3} matchRank={matchRank} matchConf={matchConfidence:F3} strokes={_lastObservedStrokeTotal}");
 
-            if (acceptTop1 || acceptTop2)
+            if ((acceptTop1 || acceptTop2) && hasEnoughStrokes)
             {
                 state = State.GradedAccept;
                 UpdateUI();
@@ -1106,12 +1391,12 @@ public class DictationManager : MonoBehaviour
                 float displayConfidence;
                 if (acceptTop2 && hasMatch && matchCorrect && matchRank <= 1)
                 {
-                    display = string.IsNullOrEmpty(remoteEval.Raw) ? expectedRemote : remoteEval.Raw;
+                    display = ToDisplayLetter(string.IsNullOrEmpty(remoteEval.Raw) ? expectedRemote : remoteEval.Raw);
                     displayConfidence = matchConfidence;
                 }
                 else
                 {
-                    display = string.IsNullOrEmpty(remotePrediction.TopLetter) ? expectedRemote : remotePrediction.TopLetter;
+                    display = ToDisplayLetter(string.IsNullOrEmpty(remotePrediction.TopLetter) ? expectedRemote : remotePrediction.TopLetter);
                     displayConfidence = topConfidence;
                 }
 
@@ -1120,20 +1405,41 @@ public class DictationManager : MonoBehaviour
                 yield return new WaitForSeconds(waitAfterCorrect);
                 Advance();
             }
-            else if (forceWrong)
+            else if (shouldForceWrong && (hasEnoughStrokes || allowEarlyWrongCheck))
             {
+                string display = ToDisplayLetter(string.IsNullOrEmpty(remotePrediction.TopLetter) ? expectedRemote : remotePrediction.TopLetter);
+
+                if (attemptCount <= 0)
+                {
+                    OnDictationGraded?.Invoke(0f);
+                    OnLetterIncorrect?.Invoke();
+
+                    attemptCount = 1;
+                    state = State.Drawing;
+                    UpdateUI();
+
+                    ShowHintDisplay();
+
+                    ClearBoardVisuals();
+                    SetFeedback($"Remote thinks it's '{display}' ({Mathf.RoundToInt(topConfidence * 100f)}%). Try '{expectedRemote}' again.");
+                    _lastStrokeChangeTime = Time.time;
+                    _autoGradeTriggeredForStroke = false;
+                    yield break;
+                }
+
                 state = State.GradedReject;
                 UpdateUI();
                 OnDictationGraded?.Invoke(0f);
                 OnLetterIncorrect?.Invoke();
-                string display = string.IsNullOrEmpty(remotePrediction.TopLetter) ? "?" : remotePrediction.TopLetter;
                 SetFeedback($"Remote is very confident it's '{display}' ({Mathf.RoundToInt(topConfidence * 100f)}%). Watch the demo and retry.");
-                ClearBoardVisuals();
                 yield return new WaitForSeconds(waitBeforeRef);
-                yield return ReplayReference();
+                string letterForPrompt = lvl != null ? lvl.currentLetter : string.Empty;
+                ClearBoardVisuals();
+                yield return ShowReplayPrompt(letterForPrompt);
                 SetFeedback("Your turn!");
                 yield return new WaitForSeconds(waitAfterReplay);
                 attemptCount = 2;
+                suppressTmpOnAdvance = true;
                 Advance();
             }
             else
@@ -1144,63 +1450,6 @@ public class DictationManager : MonoBehaviour
 
             _autoGradeRunning = false;
             yield break;
-        }
-
-        // Local Sentis fallback
-        LetterPrediction localPrediction = null;
-        try
-        {
-            localPrediction = localClassifier.Predict(snap);
-        }
-        catch (Exception ex)
-        {
-            Debug.LogWarning($"[Dictation][AutoGrade] Local classifier inference failed: {ex.Message}");
-        }
-
-        Destroy(snap);
-
-        if (localPrediction == null)
-        {
-            _autoGradeRunning = false;
-            _autoGradeTriggeredForStroke = false;
-            _lastStrokeChangeTime = Time.time;
-            yield break;
-        }
-
-        if (IsUserCurrentlyDrawing || !MeetsStrokeRequirement() || state != State.Drawing)
-        {
-            _autoGradeRunning = false;
-            _autoGradeTriggeredForStroke = false;
-            _lastStrokeChangeTime = Time.time;
-            yield break;
-        }
-
-        string expectedLocal = NormalizeAsciiStrict(lvl != null ? lvl.currentLetter : null);
-        var localEval = EvaluateLocalPrediction(localPrediction, expectedLocal);
-
-        DebugCodepoint("[Auto][Local] RAW", localEval.Raw);
-        Debug.Log($"[Dictation][AutoGrade] LOCAL top1='{localEval.Top1Normalized}' expected='{expectedLocal}' conf={localEval.Top1Confidence:F3} hasWriting={localEval.HasWriting}");
-
-        float requiredLocalConfidence = Mathf.Max(autoGradeMinimumConfidence, localConfidenceThreshold);
-        bool localEligible = localEval.Top1Match && localEval.Top1Confidence >= requiredLocalConfidence && localEval.HasWriting;
-
-        if (localEligible)
-        {
-            state = State.GradedAccept;
-            UpdateUI();
-            OnDictationGraded?.Invoke(100f);
-            OnLetterCorrect?.Invoke();
-
-            string display = string.IsNullOrEmpty(localEval.Raw) ? expectedLocal : localEval.Raw;
-            SetFeedback($"Great! ('{display}' @ {Mathf.RoundToInt(localEval.Top1Confidence * 100f)}%)");
-            ClearBoardVisuals();
-            yield return new WaitForSeconds(waitAfterCorrect);
-            Advance();
-        }
-        else
-        {
-            _lastStrokeChangeTime = Time.time;
-            _autoGradeTriggeredForStroke = false;
         }
 
         _autoGradeRunning = false;
@@ -1308,9 +1557,10 @@ public class DictationManager : MonoBehaviour
         UpdateUI();
         SetFeedback("");
 
-        if (tmpLetter != null) tmpLetter.SetActive(true);
+        if (!suppressTmpOnAdvance && tmpLetter != null) tmpLetter.SetActive(true);
 
         OnDictationComplete?.Invoke();
+        suppressTmpOnAdvance = false;
     }
 
     // ===== UI helpers =====
@@ -1331,11 +1581,67 @@ public class DictationManager : MonoBehaviour
         if (feedbackText) feedbackText.text = msg ?? "";
     }
 
+    private IEnumerator ShowReplayPrompt(string letter)
+    {
+        GameObject root = GetReplayPromptRoot();
+
+        if (replayPromptText != null)
+            replayPromptText.text = string.IsNullOrEmpty(letter) ? string.Empty : letter.ToLowerInvariant();
+
+        if (root)
+            root.SetActive(true);
+
+        if (tmpLetter != null)
+            tmpLetter.SetActive(true);
+
+        var manager = ResolveAudioManager();
+        if (manager)
+            manager.PlayPop();
+
+        float promptDuration = Mathf.Max(0f, replayPromptDuration);
+        float tmpDuration = Mathf.Max(0f, tmpReplayFlashDuration);
+        float waitDuration = Mathf.Max(promptDuration, tmpDuration);
+
+        if (waitDuration > 0f)
+        {
+            float elapsed = 0f;
+            while (elapsed < waitDuration)
+            {
+                elapsed += Time.deltaTime;
+                yield return null;
+            }
+        }
+        else
+        {
+            yield return null;
+        }
+
+        if (tmpLetter != null)
+            tmpLetter.SetActive(false);
+
+        HideReplayPrompt();
+    }
+
+    private GameObject GetReplayPromptRoot()
+    {
+        if (replayPromptRoot) return replayPromptRoot;
+        return replayPromptText != null ? replayPromptText.gameObject : null;
+    }
+
+    private void HideReplayPrompt()
+    {
+        if (replayPromptText != null)
+            replayPromptText.text = string.Empty;
+        GameObject root = GetReplayPromptRoot();
+        if (root) root.SetActive(false);
+    }
+
     // ===== Board ops =====
     private void ClearBoardVisuals()
     {
         if (canvas != null) canvas.ClearVisualization();
         if (_planeDrawer != null) _planeDrawer.ClearStrokes();
+        HideReplayPrompt();
 
         _autoGradeTriggeredForStroke = false;
         _autoGradeRunning = false;
@@ -1429,8 +1735,8 @@ public class DictationManager : MonoBehaviour
                     yield return null;
                 }
                 s.transform.localScale = Vector3.one * canvas.sphereRadius * 5f;
-                if (!audioManager) audioManager = FindObjectOfType<AudioManager>();
-                if (audioManager) audioManager.PlayPop();
+                var manager = ResolveAudioManager();
+                if (manager) manager.PlayPop();
             }
         }
     }
@@ -1456,9 +1762,9 @@ public class DictationManager : MonoBehaviour
         float replayTotal = 1.25f;
         float step = replayTotal / Mathf.Max(canvas.activeSpheres.Count, 1);
 
-        Transform root = null;
-        if (canvas.activeSpheres.Count > 0 && canvas.activeSpheres[0])
-            root = canvas.activeSpheres[0].transform.parent;
+        Transform root = ResolveReplayParent(canvas != null && canvas.canvasPlane != null
+            ? canvas.canvasPlane.transform
+            : (canvas.activeSpheres.Count > 0 && canvas.activeSpheres[0] ? canvas.activeSpheres[0].transform.parent : null));
 
         GameObject prev = null;
         for (int i = 0; i < canvas.activeSpheres.Count; i++)
@@ -1479,11 +1785,12 @@ public class DictationManager : MonoBehaviour
             }
             cur.transform.localScale = targetScale;
 
-            if (!audioManager) audioManager = FindObjectOfType<AudioManager>();
-            if (audioManager) audioManager.PlayPop();
+            var manager = ResolveAudioManager();
+            if (manager) manager.PlayPop();
 
-            // draw segment to previous
-            if (prev && root)
+            CreateReplayDot(cur.transform.position, root);
+
+            if (prev)
             {
                 CreateReplaySegment(prev.transform.position, cur.transform.position, root);
             }
@@ -1491,16 +1798,81 @@ public class DictationManager : MonoBehaviour
         }
     }
 
-    private void CreateReplaySegment(Vector3 a, Vector3 b, Transform parent)
+    private Transform ResolveReplayParent(Transform overrideParent = null)
     {
-        float dist = Vector3.Distance(a, b);
+        if (overrideParent != null)
+            return overrideParent;
+        if (canvas != null && canvas.canvasPlane != null)
+            return canvas.canvasPlane.transform;
+        if (_planeDrawer != null && _planeDrawer.StrokesRoot != null)
+            return _planeDrawer.StrokesRoot;
+        if (_planeDrawer != null)
+            return _planeDrawer.transform;
+        if (drawerHost != null)
+            return drawerHost.transform;
+        return null;
+    }
+
+    private Vector3 GetReplayPlaneNormal(Transform parent)
+    {
+        if (_planeConstraint != null)
+            return _planeConstraint.PlaneNormal.normalized;
+
+        if (parent != null)
+        {
+            Vector3 normal = parent.forward;
+            if (normal.sqrMagnitude <= 1e-6f)
+                normal = parent.up;
+            if (normal.sqrMagnitude > 1e-6f)
+                return normal.normalized;
+        }
+
+        if (_planeDrawer != null)
+        {
+            Vector3 normal = _planeDrawer.transform.forward;
+            if (normal.sqrMagnitude > 1e-6f)
+                return normal.normalized;
+        }
+
+        return Vector3.forward;
+    }
+
+    private Vector3 ProjectReplayPoint(Vector3 worldPos, Transform parent, bool applyLift = false)
+    {
+        Vector3 projected = worldPos;
+
+        if (_planeConstraint != null)
+        {
+            projected = _planeConstraint.ProjectToPlane(worldPos);
+        }
+        else if (parent != null)
+        {
+            Vector3 normal = GetReplayPlaneNormal(parent);
+            Plane plane = new Plane(normal, parent.position);
+            projected = plane.ClosestPointOnPlane(worldPos);
+        }
+
+        if (applyLift && replayDotLift > 0f)
+            projected += GetReplayPlaneNormal(parent) * replayDotLift;
+
+        return projected;
+    }
+
+    private void CreateReplaySegment(Vector3 a, Vector3 b, Transform parentHint)
+    {
+        Transform parent = ResolveReplayParent(parentHint);
+
+        Vector3 worldA = ProjectReplayPoint(a, parent);
+        Vector3 worldB = ProjectReplayPoint(b, parent);
+
+        float dist = Vector3.Distance(worldA, worldB);
         if (dist <= 1e-6f) return;
+
         GameObject cyl = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
         cyl.name = "TraceSegment";
-        cyl.transform.SetParent(parent, true);
-        var col = cyl.GetComponent<Collider>(); if (col) Destroy(col);
+        var col = cyl.GetComponent<Collider>();
+        if (col) Destroy(col);
 
-        // material
         var mr = cyl.GetComponent<MeshRenderer>();
         if (mr != null)
         {
@@ -1510,19 +1882,71 @@ public class DictationManager : MonoBehaviour
             mr.material = mat;
         }
 
-        // align between a and b
-        cyl.transform.position = (a + b) * 0.5f;
-        cyl.transform.up = (b - a).normalized;
-        float radius = canvas != null ? Mathf.Max(0.0015f, canvas.sphereRadius * 1.8f) : 0.003f; // restore original stroke thickness
-        cyl.transform.localScale = new Vector3(radius, dist * 0.5f, radius); // height = 2*y
+        float radius = canvas != null ? Mathf.Max(0.0015f, canvas.sphereRadius * 1.8f) : 0.003f;
+
+        if (parent != null)
+        {
+            cyl.transform.SetParent(parent, false);
+
+            Vector3 localA = parent.InverseTransformPoint(worldA);
+            Vector3 localB = parent.InverseTransformPoint(worldB);
+            Vector3 localDelta = localB - localA;
+            float localDist = localDelta.magnitude;
+            if (localDist <= 1e-6f)
+            {
+                Destroy(cyl);
+                return;
+            }
+
+            Vector3 localMid = (localA + localB) * 0.5f;
+            Vector3 localDir = localDelta / localDist;
+
+            cyl.transform.localPosition = localMid;
+            cyl.transform.localRotation = Quaternion.FromToRotation(Vector3.up, localDir);
+            cyl.transform.localScale = new Vector3(radius, localDist * 0.5f, radius);
+            cyl.layer = parent.gameObject.layer;
+        }
+        else
+        {
+            Vector3 mid = (worldA + worldB) * 0.5f;
+            Vector3 worldDir = (worldB - worldA).normalized;
+
+            cyl.transform.position = mid;
+            cyl.transform.rotation = Quaternion.FromToRotation(Vector3.up, worldDir);
+            cyl.transform.localScale = new Vector3(radius, dist * 0.5f, radius);
+
+            if (drawerHost != null)
+                cyl.layer = drawerHost.layer;
+        }
     }
 
-    private void CreateReplayDot(Vector3 worldPos)
+    private void CreateReplayDot(Vector3 worldPos, Transform parentOverride = null)
     {
+        Transform parent = ResolveReplayParent(parentOverride);
+        Vector3 projected = ProjectReplayPoint(worldPos, parent, applyLift: true);
+
         var dot = GameObject.CreatePrimitive(PrimitiveType.Sphere);
         dot.name = "ReplayDot_" + replayDots.Count;
-        dot.transform.position = worldPos;
-        dot.transform.localScale = Vector3.one * Mathf.Max(0.0015f, canvas != null ? canvas.sphereRadius * 2.5f : 0.01f);
+
+        float scale = Mathf.Max(0.0015f, canvas != null ? canvas.sphereRadius * 2.5f : 0.01f);
+
+        if (parent != null)
+        {
+            dot.transform.SetParent(parent, false);
+            dot.transform.localPosition = parent.InverseTransformPoint(projected);
+            dot.transform.localRotation = Quaternion.identity;
+            dot.transform.localScale = Vector3.one * scale;
+            dot.layer = parent.gameObject.layer;
+        }
+        else
+        {
+            dot.transform.position = projected;
+            dot.transform.localScale = Vector3.one * scale;
+            dot.transform.up = GetReplayPlaneNormal(parent);
+            if (drawerHost != null)
+                dot.layer = drawerHost.layer;
+        }
+
         Destroy(dot.GetComponent<Collider>());
         var r = dot.GetComponent<Renderer>();
         if (r != null)
@@ -1531,8 +1955,7 @@ public class DictationManager : MonoBehaviour
             if (mat.HasProperty("_BaseColor")) mat.SetColor("_BaseColor", Color.black);
             else if (mat.HasProperty("_Color")) mat.color = Color.black;
         }
-        // Parent under drawerHost if available
-        if (drawerHost) dot.transform.SetParent(drawerHost.transform, true);
+
         replayDots.Add(dot);
     }
 
@@ -2013,6 +2436,22 @@ public class DictationManager : MonoBehaviour
         }
         return "";
     }
+
+    private static bool LettersEquivalent(string a, string b)
+    {
+        if (string.IsNullOrEmpty(a) || string.IsNullOrEmpty(b))
+            return false;
+        if (string.Equals(a, b, StringComparison.Ordinal))
+            return true;
+        if (a.Length == 1 && b.Length == 1)
+        {
+            char ca = char.ToLowerInvariant(a[0]);
+            char cb = char.ToLowerInvariant(b[0]);
+            if ((ca == 'l' && cb == 'i') || (ca == 'i' && cb == 'l'))
+                return true;
+        }
+        return false;
+    }
 // ==================   PEM/DER PARSER (FIXED)   ===================
 private static class PemKeyUtil
 {
@@ -2131,28 +2570,4 @@ private static class PemKeyUtil
         return new RSAParameters { Modulus = n, Exponent = e, D = d, P = p, Q = q, DP = dp, DQ = dq, InverseQ = iq };
     }
 }
-
-
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

@@ -21,12 +21,11 @@ public class LetterTraceAimSequence : MonoBehaviour
     [SerializeField] private ControllerHand controllerHand = ControllerHand.Right;
 
     [Header("Point Visuals")]
-    [SerializeField, Range(4, 64)] private int samplesPerSegment = 12;
-    [SerializeField, Range(1f, 3f)] private float activeScaleMultiplier = 1.4f;
     [SerializeField] private Color pendingColor = new(0.85f, 0.1f, 0.1f, 1f);
     [SerializeField] private Color activeColor = new(0.2f, 0.95f, 0.2f, 1f);
     [SerializeField] private Color completedColor = new(0.2f, 0.8f, 0.2f, 1f);
-    [SerializeField, Range(0.5f, 2f)] private float completedScaleMultiplier = 1f;
+    [Tooltip("Scale multiplier applied when a dot is highlighted.")]
+    [SerializeField, Min(1f)] private float hitDotScaleMultiplier = 1.35f;
     [SerializeField, Range(0.05f, 1f)] private float segmentThicknessRatio = 0.12f;
 
     [Header("Laser Visuals")]
@@ -45,9 +44,10 @@ public class LetterTraceAimSequence : MonoBehaviour
     [SerializeField] private GameObject markerPrefab;
     [SerializeField] private Material markerMaterialOverride;
     [SerializeField] private Transform markerParentOverride;
-    [SerializeField, Range(0.001f, 0.05f)] private float markerScale = 0.02f;
-    [SerializeField, Range(0.001f, 0.05f)] private float minPointSpacing = 0.01f;
+    [SerializeField, Range(0.0001f, 0.05f)] private float minPointSpacing = 0.002f;
     [SerializeField, Range(8, 256)] private int maxPointCount = 128;
+    [Tooltip("Fallback dot size used when temporary markers are generated.")]
+    [SerializeField, Min(0.001f)] private float fallbackGeneratedScale = 0.02f;
 
     [Header("Events")]
     [SerializeField] private UnityEvent onTraceCompleted;
@@ -64,7 +64,6 @@ public class LetterTraceAimSequence : MonoBehaviour
     private readonly Dictionary<SegmentKey, LetterPathRenderer.SegmentLink> segmentLookup = new();
     private readonly Dictionary<SegmentKey, GameObject> cylinderLookup = new();
     private readonly List<GameObject> spawnedCylinders = new();
-    private readonly List<GameObject> generatedMarkers = new();
     private readonly Stack<GameObject> cylinderPool = new();
     private MaterialPropertyBlock cylinderPropertyBlock;
     private static Mesh sharedMarkerMesh;
@@ -86,6 +85,13 @@ public class LetterTraceAimSequence : MonoBehaviour
     private Vector3 lagTip;
     private Vector3 lagVelocity;
     private bool hasLag;
+    private Transform cachedMarkerParent;
+    private Transform activePlaneTransform;
+    private Vector3 activePlaneNormal = Vector3.up;
+    private float activePlaneDepth = 0.002f;
+    private float cachedMarkerBaseScale = -1f;
+    private int cachedAnchorHash;
+    private const float AnchorHashQuantize = 1000f;
 
 private class PointState
 {
@@ -95,6 +101,7 @@ private class PointState
     public Vector3 baseScale;
     public Vector3 localPosition;
     public bool hit;
+    public bool generated;
 }
 
 
@@ -146,38 +153,153 @@ private class PointState
         if (recorder) recorder.OnRecordingLoaded += HandleRecorderLoaded;
         TryBuildSequence();
     }
-private void ApplyPointColor(PointState state, Color color)
-{
-    if (state == null || state.renderer == null)
+    private void ApplyPointColor(PointState state, Color color)
     {
-        return;
+        if (state == null || state.renderer == null)
+        {
+            return;
+        }
+
+        if (state.propertyBlock == null)
+        {
+            state.propertyBlock = new MaterialPropertyBlock();
+        }
+
+        state.renderer.GetPropertyBlock(state.propertyBlock);
+        state.propertyBlock.SetColor(BaseColorId, color);
+        state.propertyBlock.SetColor(ColorId, color);
+        state.propertyBlock.SetColor(EmissionColorId, color * 0.5f);
+        state.renderer.SetPropertyBlock(state.propertyBlock);
+
+        if (state.marker != null)
+        {
+            state.marker.transform.localScale = state.baseScale;
+        }
     }
 
-    if (state.propertyBlock == null)
+    private void ApplyVisual(PointState state, Color color, float scaleMultiplier)
     {
-        state.propertyBlock = new MaterialPropertyBlock();
+        if (state == null)
+        {
+            return;
+        }
+
+        ApplyPointColor(state, color);
+
+        if (state.marker != null)
+        {
+            state.marker.transform.localScale = state.baseScale * scaleMultiplier;
+        }
     }
 
-    state.renderer.GetPropertyBlock(state.propertyBlock);
-    state.propertyBlock.SetColor(BaseColorId, color);
-    state.propertyBlock.SetColor(ColorId, color);
-    state.propertyBlock.SetColor(EmissionColorId, color * 0.5f);
-    state.renderer.SetPropertyBlock(state.propertyBlock);
-}
-private void ApplyVisual(PointState state, Color color, float scaleMultiplier)
-{
-    if (state == null)
+    private void ClampPointScale(PointState state, float neighborSpacing)
     {
-        return;
+        if (state == null)
+            return;
+
+        float desired = Mathf.Max(0.0001f, state.baseScale.x);
+        state.baseScale = Vector3.one * desired;
+
+        if (state.marker != null)
+            state.marker.transform.localScale = state.baseScale;
     }
 
-    ApplyPointColor(state, color);
-
-    if (state.marker != null)
+    private void MaybeRefreshMarkerScales()
     {
-        state.marker.transform.localScale = state.baseScale * scaleMultiplier;
+        if (!visualsVisible || points.Count == 0)
+            return;
+
+        float baseScale = GetBaseMarkerScale();
+        if (Mathf.Approximately(baseScale, cachedMarkerBaseScale))
+            return;
+
+        RefreshPointScales(baseScale);
     }
-}
+
+    private void RefreshPointScales(float baseScale)
+    {
+        cachedMarkerBaseScale = baseScale;
+        if (points.Count == 0)
+            return;
+
+        UpdateActivePlane();
+
+        Vector3? lastWorld = null;
+        for (int i = 0; i < points.Count; i++)
+        {
+            PointState state = points[i];
+            if (state == null)
+                continue;
+
+            state.baseScale = Vector3.one * baseScale;
+            Vector3 world = PlaneLocalToWorld(state.localPosition);
+            float spacing = lastWorld.HasValue ? Vector3.Distance(world, lastWorld.Value) : float.PositiveInfinity;
+
+            if (i > 0)
+            {
+                PointState previous = points[i - 1];
+                if (previous != null)
+                {
+                    ClampPointScale(previous, spacing);
+                }
+            }
+
+            ClampPointScale(state, spacing);
+            lastWorld = world;
+        }
+
+        ReapplyPointVisuals();
+    }
+
+    private void ReapplyPointVisuals()
+    {
+        for (int i = 0; i < points.Count; i++)
+        {
+            PointState state = points[i];
+            if (state == null)
+                continue;
+
+            if (state.hit)
+            {
+                ApplyPointColor(state, completedColor);
+            }
+            else if (i == currentIndex)
+            {
+                ApplyVisual(state, activeColor, hitDotScaleMultiplier);
+            }
+            else
+            {
+                ApplyPointColor(state, pendingColor);
+            }
+        }
+    }
+
+    private int ComputeAnchorHash()
+    {
+        if (pathRenderer == null)
+            return 0;
+
+        IReadOnlyList<Vector3> anchors = pathRenderer.AnchorPositions;
+        if (anchors == null || anchors.Count == 0)
+            return 0;
+
+        int hash = 17;
+        for (int i = 0; i < anchors.Count; i++)
+        {
+            Vector3 p = anchors[i];
+            int x = Mathf.RoundToInt(p.x * AnchorHashQuantize);
+            int y = Mathf.RoundToInt(p.y * AnchorHashQuantize);
+            int z = Mathf.RoundToInt(p.z * AnchorHashQuantize);
+            unchecked
+            {
+                hash = hash * 31 + x;
+                hash = hash * 31 + y;
+                hash = hash * 31 + z;
+            }
+        }
+
+        return hash;
+    }
 
     private void OnDisable()
     {
@@ -195,6 +317,8 @@ private void ApplyVisual(PointState state, Color color, float scaleMultiplier)
 
     private void Update()
     {
+        MaybeRefreshMarkerScales();
+
         if (!laserEnabled)
         {
             UpdateLaser(false, Vector3.zero, Vector3.forward);
@@ -233,10 +357,19 @@ private void ApplyVisual(PointState state, Color color, float scaleMultiplier)
 
     private void HandleLetterRendered(LetterPathRenderer renderer)
     {
-        if (renderer == pathRenderer)
+        if (renderer != pathRenderer)
+            return;
+
+        int newAnchorHash = ComputeAnchorHash();
+        bool needsRebuild = !isReady || points.Count == 0 || newAnchorHash != cachedAnchorHash;
+
+        if (needsRebuild)
         {
             TryBuildSequence();
+            return;
         }
+
+        RefreshPointScales(GetBaseMarkerScale());
     }
 
     public bool PrepareSequence()
@@ -261,7 +394,7 @@ private void ApplyVisual(PointState state, Color color, float scaleMultiplier)
         ResetLaser();
         laserEnabled = true;
         if (visualsVisible && pathRenderer != null)
-            pathRenderer.SetVisualizationVisible(true);
+            pathRenderer.SetStrokeLinesVisible(true);
         SequenceStarted?.Invoke();
         return true;
     }
@@ -271,12 +404,11 @@ private void ApplyVisual(PointState state, Color color, float scaleMultiplier)
         if (!visualsVisible)
             return false;
 
+        UpdateActivePlane();
         ResetSequence();
 
         BuildPoints();
         BuildSegmentLookup();
-        if (pathRenderer != null)
-            pathRenderer.SetVisualizationVisible(false);
 
         if (points.Count == 0)
         {
@@ -284,110 +416,117 @@ private void ApplyVisual(PointState state, Color color, float scaleMultiplier)
             return false;
         }
 
-        if (visualsVisible && pathRenderer != null)
-            pathRenderer.SetVisualizationVisible(true);
         if (logSequenceEvents)
         {
             Debug.Log($"[LetterTraceAimSequence] Prepared {points.Count} point(s) with {segmentLookup.Count} cached segment link(s).");
         }
-        if (visualsVisible)
-            pathRenderer.SetStrokeLinesVisible(false);
+        pathRenderer?.SetStrokeLinesVisible(false);
 
         isReady = true;
         isCompleted = false;
         currentIndex = 0;
         ActivateCurrentPoint();
+        cachedMarkerBaseScale = GetBaseMarkerScale();
+        cachedAnchorHash = ComputeAnchorHash();
         return true;
     }
 
     private void BuildPoints()
     {
+        UpdateActivePlane();
+        if (TryBuildFromAnchors())
+            return;
+
         if (TryBuildPointsFromRecorder())
             return;
 
-        IReadOnlyList<GameObject> markers = pathRenderer.AnchorMarkers;
-        IReadOnlyList<Vector3> positions = pathRenderer.AnchorPositions;
-        Transform root = pathRenderer.ContentRoot != null ? pathRenderer.ContentRoot : pathRenderer.transform;
+        Debug.LogWarning("[LetterTraceAimSequence] No anchor data available to build points.", this);
+    }
 
-        int count = Mathf.Max(markers.Count, positions.Count);
-        if (count == 0)
-        {
-            if (!TryBuildPointsFromRecorder())
-            {
-                Debug.LogWarning("[LetterTraceAimSequence] No anchor data available to build points.", this);
-            }
-            return;
-        }
+    private bool TryBuildFromAnchors()
+    {
+        if (pathRenderer == null)
+            return false;
+
+        Transform root = pathRenderer.ContentRoot != null ? pathRenderer.ContentRoot : pathRenderer.transform;
+        IReadOnlyList<Vector3> anchorPositions = pathRenderer.AnchorPositions;
+        if (anchorPositions == null || anchorPositions.Count == 0)
+            return false;
 
         float minSpacingSqr = Mathf.Max(0.000001f, minPointSpacing * minPointSpacing);
+        float baseScaleValue = GetBaseMarkerScale();
+        Vector3? lastWorld = null;
 
-        for (int i = 0; i < count; i++)
+        for (int i = 0; i < anchorPositions.Count; i++)
         {
             if (points.Count >= maxPointCount)
                 break;
 
-            Vector3 local = Vector3.zero;
-            if (positions.Count > i)
-                local = positions[i];
-            else if (i < markers.Count && markers[i])
-                local = markers[i].transform.localPosition;
-
+            Vector3 local = anchorPositions[i];
             Vector3 world = root.TransformPoint(local);
+            Vector3 projectedWorld = ProjectOntoActivePlane(world);
+            Vector3 planeLocal = WorldToPlaneLocal(projectedWorld);
 
-            if (points.Count > 0)
-            {
-                Vector3 prev = points[points.Count - 1].marker.transform.position;
-                if ((world - prev).sqrMagnitude < minSpacingSqr)
-                    continue;
-            }
+            if (lastWorld.HasValue && (projectedWorld - lastWorld.Value).sqrMagnitude < minSpacingSqr)
+                continue;
 
-            GameObject marker = CreateGeneratedMarker(world);
+            GameObject marker = CreateGeneratedMarker(planeLocal);
+            marker.transform.localScale = Vector3.one * baseScaleValue;
             Renderer renderer = marker.GetComponent<Renderer>() ?? marker.GetComponentInChildren<Renderer>();
-            Vector3 baseScale = marker.transform.localScale;
 
             PointState state = new PointState
             {
                 marker = marker,
                 renderer = renderer,
-                baseScale = baseScale,
-                localPosition = transform.InverseTransformPoint(world),
-                hit = false
+                baseScale = Vector3.one * baseScaleValue,
+                localPosition = planeLocal,
+                hit = false,
+                generated = true
             };
 
+            float spacing = lastWorld.HasValue ? Vector3.Distance(projectedWorld, lastWorld.Value) : float.PositiveInfinity;
+            if (points.Count > 0)
+                ClampPointScale(points[points.Count - 1], spacing);
+            ClampPointScale(state, spacing);
+
             ApplyPointColor(state, pendingColor);
-            marker.transform.localScale = baseScale;
             marker.SetActive(visualsVisible);
             points.Add(state);
+            lastWorld = projectedWorld;
         }
+
+        pathRenderer.SetVisualizationVisible(false);
+        HideSourceMarkers();
 
         if (logSequenceEvents)
-        {
-            Debug.Log($"[LetterTraceAimSequence] Built {points.Count} point(s) from LetterPathRenderer anchors.", this);
-        }
+            Debug.Log($"[LetterTraceAimSequence] Adopted {points.Count} anchor point(s) from LetterPathRenderer.", this);
+
+        return points.Count > 0;
     }
 
-    private GameObject CreateGeneratedMarker(Vector3 worldPosition)
+    private GameObject CreateGeneratedMarker(Vector3 planeLocalPosition)
     {
         Transform parent = ResolveMarkerParent();
+        float baseScale = GetBaseMarkerScale();
 
         GameObject marker;
         if (markerPrefab)
         {
             marker = Instantiate(markerPrefab, parent, false);
-            marker.transform.localScale = markerPrefab.transform.localScale * markerScale;
+            marker.transform.localScale = Vector3.one * baseScale;
             RemoveCollider(marker);
         }
         else
         {
             marker = CreateDefaultMarker();
             marker.transform.SetParent(parent, false);
-            marker.transform.localScale = Vector3.one * markerScale;
+            marker.transform.localScale = Vector3.one * baseScale;
         }
 
         marker.name = "TraceAnchor";
         marker.layer = parent.gameObject.layer;
-        marker.transform.position = worldPosition;
-        generatedMarkers.Add(marker);
+        marker.transform.localPosition = planeLocalPosition;
+        marker.transform.localRotation = Quaternion.identity;
         return marker;
     }
 
@@ -422,15 +561,180 @@ private void ApplyVisual(PointState state, Color color, float scaleMultiplier)
             DestroyImmediate(temp);
     }
 
-    private Transform ResolveMarkerParent()
+    private float GetBaseMarkerScale()
     {
-        if (markerParentOverride)
-            return markerParentOverride;
-        if (canvasManager != null && canvasManager.canvasPlane != null)
-            return canvasManager.canvasPlane.transform;
-        if (pathRenderer != null && pathRenderer.ContentRoot != null)
-            return pathRenderer.ContentRoot;
-        return transform;
+        if (pathRenderer != null)
+            return Mathf.Max(0.0001f, pathRenderer.MarkerBaseScale);
+        return Mathf.Max(0.0001f, fallbackGeneratedScale);
+    }
+
+    private void ReleaseCylinders()
+    {
+        bool canPoolCylinders = Application.isPlaying;
+        Transform poolParent = ResolveMarkerParent();
+
+        foreach (GameObject cylinder in spawnedCylinders)
+        {
+            if (!cylinder) continue;
+
+            if (canPoolCylinders)
+            {
+                cylinder.SetActive(false);
+                cylinder.transform.SetParent(poolParent, false);
+                cylinderPool.Push(cylinder);
+            }
+            else
+            {
+                DestroyImmediate(cylinder);
+            }
+        }
+
+        if (!canPoolCylinders)
+            cylinderPool.Clear();
+
+        spawnedCylinders.Clear();
+        cylinderLookup.Clear();
+    }
+
+    private void RecyclePointStates(bool keepVisible)
+    {
+        Transform parent = ResolveMarkerParent();
+
+        foreach (PointState state in points)
+        {
+            if (state == null || state.marker == null)
+                continue;
+
+            if (state.generated)
+            {
+                if (Application.isPlaying)
+                    Destroy(state.marker);
+                else
+                    DestroyImmediate(state.marker);
+                state.marker = null;
+                continue;
+            }
+
+            state.hit = false;
+            ApplyPointColor(state, pendingColor);
+            state.marker.transform.SetParent(parent, false);
+            state.marker.transform.localPosition = state.localPosition;
+            state.marker.transform.localRotation = Quaternion.identity;
+            state.marker.transform.localScale = state.baseScale;
+            state.marker.SetActive(keepVisible && visualsVisible);
+        }
+
+        points.Clear();
+    }
+
+    private void HideSourceMarkers()
+    {
+        if (pathRenderer == null)
+            return;
+
+        var anchors = pathRenderer.AnchorMarkers;
+        if (anchors != null)
+        {
+            for (int i = 0; i < anchors.Count; i++)
+            {
+                if (anchors[i])
+                    anchors[i].SetActive(false);
+            }
+        }
+
+        pathRenderer.SetStrokeLinesVisible(false);
+        pathRenderer.SetVisualizationVisible(false);
+    }
+
+    private Transform ResolveMarkerParent(bool forceRefresh = false)
+    {
+        if (forceRefresh || cachedMarkerParent == null)
+        {
+            cachedMarkerParent = markerParentOverride
+                ? markerParentOverride
+                : (canvasManager != null && canvasManager.canvasPlane != null
+                    ? canvasManager.canvasPlane.transform
+                    : (pathRenderer != null && pathRenderer.ContentRoot != null
+                        ? pathRenderer.ContentRoot
+                        : transform));
+        }
+        return cachedMarkerParent;
+    }
+
+    private void UpdateActivePlane()
+    {
+        Transform resolved = ResolveMarkerParent(true);
+        activePlaneTransform = resolved != null ? resolved : transform;
+
+        Vector3 referenceNormal = pathRenderer != null
+            ? pathRenderer.transform.TransformDirection(Vector3.up)
+            : Vector3.up;
+
+        if (activePlaneTransform != null && activePlaneTransform != transform)
+        {
+            Vector3[] axes =
+            {
+                activePlaneTransform.TransformDirection(Vector3.up),
+                activePlaneTransform.TransformDirection(Vector3.forward),
+                activePlaneTransform.TransformDirection(Vector3.right)
+            };
+
+            float bestDot = -1f;
+            Vector3 bestAxis = referenceNormal;
+            Vector3 refNorm = referenceNormal.sqrMagnitude > 0f ? referenceNormal.normalized : Vector3.up;
+            for (int i = 0; i < axes.Length; i++)
+            {
+                Vector3 axis = axes[i].sqrMagnitude > 0f ? axes[i].normalized : Vector3.zero;
+                float dot = Mathf.Abs(Vector3.Dot(refNorm, axis));
+                if (dot > bestDot)
+                {
+                    bestDot = dot;
+                    bestAxis = axis;
+                }
+            }
+            if (Vector3.Dot(bestAxis, referenceNormal) < 0f)
+                bestAxis = -bestAxis;
+            activePlaneNormal = bestAxis.sqrMagnitude > 0f ? bestAxis.normalized : refNorm;
+        }
+        else
+        {
+            activePlaneNormal = referenceNormal.sqrMagnitude > 0f ? referenceNormal.normalized : Vector3.up;
+        }
+
+        float depth = pathRenderer != null ? pathRenderer.DepthOffset : 0.002f;
+        activePlaneDepth = Mathf.Clamp(depth, -0.2f, 0.2f);
+    }
+
+    private Vector3 ProjectOntoActivePlane(Vector3 worldPoint)
+    {
+        Vector3 normal = activePlaneNormal.sqrMagnitude > 0f ? activePlaneNormal.normalized : Vector3.up;
+        Vector3 origin = PlaneLocalToWorld(Vector3.zero);
+        float distance = Vector3.Dot(worldPoint - origin, normal);
+        Vector3 projected = worldPoint - distance * normal;
+        return projected + normal * activePlaneDepth;
+    }
+
+    private Vector3 PlaneLocalToWorld(Vector3 planeLocal)
+    {
+        Transform plane = activePlaneTransform != null ? activePlaneTransform : transform;
+        return plane != null ? plane.TransformPoint(planeLocal) : planeLocal;
+    }
+
+    private Vector3 WorldToPlaneLocal(Vector3 worldPoint)
+    {
+        Transform plane = activePlaneTransform != null ? activePlaneTransform : transform;
+        return plane != null ? plane.InverseTransformPoint(worldPoint) : worldPoint;
+    }
+
+    private Vector3 GetStateWorldPosition(PointState state)
+    {
+        if (state == null)
+            return Vector3.zero;
+
+        if (state.marker != null)
+            return state.marker.transform.position;
+
+        return PlaneLocalToWorld(state.localPosition);
     }
 
     private bool TryBuildPointsFromRecorder()
@@ -441,15 +745,11 @@ private void ApplyVisual(PointState state, Color color, float scaleMultiplier)
             return false;
         }
 
-        Transform canvasPlane = null;
-        if (canvasManager != null && canvasManager.canvasPlane != null)
-        {
-            canvasPlane = canvasManager.canvasPlane.transform;
-        }
-
+        UpdateActivePlane();
         bool created = false;
         bool treatLocal = recorder.currentRecord.isLocalSpace;
         float minSpacingSqr = Mathf.Max(0.000001f, minPointSpacing * minPointSpacing);
+        Vector3? lastWorld = null;
 
         for (int i = 0; i < recorder.currentRecord.frames.Count; i++)
         {
@@ -457,35 +757,43 @@ private void ApplyVisual(PointState state, Color color, float scaleMultiplier)
                 break;
 
             Vector3 framePos = recorder.currentRecord.frames[i].position;
-            Vector3 worldPos = (treatLocal && canvasPlane != null)
-                ? canvasPlane.TransformPoint(framePos)
+            Vector3 worldPos = treatLocal
+                ? PlaneLocalToWorld(framePos)
                 : framePos;
+            Vector3 projectedWorld = ProjectOntoActivePlane(worldPos);
+            Vector3 planeLocal = WorldToPlaneLocal(projectedWorld);
 
             if (points.Count > 0)
             {
-                Vector3 prev = points[points.Count - 1].marker.transform.position;
-                if ((worldPos - prev).sqrMagnitude < minSpacingSqr)
+                Vector3 prevWorld = PlaneLocalToWorld(points[points.Count - 1].localPosition);
+                if ((projectedWorld - prevWorld).sqrMagnitude < minSpacingSqr)
                     continue;
             }
 
-            GameObject marker = CreateGeneratedMarker(worldPos);
+            GameObject marker = CreateGeneratedMarker(planeLocal);
             Renderer renderer = marker.GetComponent<Renderer>() ?? marker.GetComponentInChildren<Renderer>();
-            Vector3 baseScale = marker.transform.localScale;
+            float baseScaleValue = marker.transform.localScale.x;
 
             PointState state = new PointState
             {
                 marker = marker,
                 renderer = renderer,
-                baseScale = baseScale,
-                localPosition = transform.InverseTransformPoint(worldPos),
-                hit = false
+                baseScale = Vector3.one * baseScaleValue,
+                localPosition = planeLocal,
+                hit = false,
+                generated = true
             };
 
+            float spacing = lastWorld.HasValue ? Vector3.Distance(projectedWorld, lastWorld.Value) : float.PositiveInfinity;
+            if (points.Count > 0)
+                ClampPointScale(points[points.Count - 1], spacing);
+            ClampPointScale(state, spacing);
+
             ApplyPointColor(state, pendingColor);
-            marker.transform.localScale = baseScale;
             marker.SetActive(visualsVisible);
             points.Add(state);
             created = true;
+            lastWorld = projectedWorld;
         }
 
         if (created && logSequenceEvents)
@@ -493,6 +801,7 @@ private void ApplyVisual(PointState state, Color color, float scaleMultiplier)
             Debug.Log($"[LetterTraceAimSequence] Built {points.Count} point(s) from SimpleRecorder fallback.", this);
         }
 
+        pathRenderer?.SetVisualizationVisible(false);
         return created;
     }
 
@@ -529,69 +838,11 @@ private void ApplyVisual(PointState state, Color color, float scaleMultiplier)
         laserEnabled = false;
         ResetLaser();
 
-        bool canPoolCylinders = Application.isPlaying;
-        Transform poolParent = pathRenderer != null && pathRenderer.ContentRoot != null ? pathRenderer.ContentRoot : transform;
-
-        foreach (GameObject cylinder in spawnedCylinders)
-        {
-            if (cylinder == null)
-            {
-                continue;
-            }
-
-            if (canPoolCylinders)
-            {
-                cylinder.SetActive(false);
-                cylinder.transform.SetParent(poolParent, false);
-                cylinderPool.Push(cylinder);
-            }
-            else
-            {
-                DestroyImmediate(cylinder);
-            }
-        }
-
-        if (!canPoolCylinders)
-        {
-            cylinderPool.Clear();
-        }
-
-        spawnedCylinders.Clear();
-        cylinderLookup.Clear();
+        ReleaseCylinders();
+        RecyclePointStates(keepVisible: visualsVisible);
         segmentLookup.Clear();
-
-        foreach (PointState state in points)
-        {
-            if (state == null)
-            {
-                continue;
-            }
-
-            state.hit = false;
-            ApplyPointColor(state, pendingColor);
-
-            if (state.marker != null)
-            {
-                state.marker.transform.localScale = state.baseScale;
-                state.marker.SetActive(visualsVisible);
-            }
-        }
-
-        points.Clear();
-        if (generatedMarkers.Count > 0)
-        {
-            for (int i = 0; i < generatedMarkers.Count; i++)
-            {
-                var marker = generatedMarkers[i];
-                if (!marker) continue;
-
-                if (Application.isPlaying)
-                    Destroy(marker);
-                else
-                    DestroyImmediate(marker);
-            }
-            generatedMarkers.Clear();
-        }
+        cachedMarkerBaseScale = -1f;
+        cachedAnchorHash = 0;
     }
 
     public void SetVisualizationVisible(bool visible)
@@ -600,22 +851,26 @@ private void ApplyVisual(PointState state, Color color, float scaleMultiplier)
             return;
 
         visualsVisible = visible;
-        pathRenderer?.SetVisualizationVisible(visible);
 
         if (!visible)
         {
             laserEnabled = false;
-            ResetSequence();
-            if (laserRenderer) laserRenderer.enabled = false;
+            ResetLaser();
+            RecyclePointStates(false);
+            ReleaseCylinders();
+            HideSourceMarkers();
             isReady = false;
+            currentIndex = 0;
+            cachedMarkerBaseScale = -1f;
+            cachedAnchorHash = 0;
             return;
         }
 
+        HideSourceMarkers();
         TryBuildSequence();
         if (!laserEnabled)
             ResetLaser();
     }
-
     private void ActivateCurrentPoint()
     {
         if (currentIndex < 0 || currentIndex >= points.Count)
@@ -628,7 +883,7 @@ private void ApplyVisual(PointState state, Color color, float scaleMultiplier)
             Debug.Log($"[LetterTraceAimSequence] Activating point {currentIndex + 1}/{points.Count}.");
         }
 
-        ApplyVisual(points[currentIndex], activeColor, activeScaleMultiplier);
+        ApplyVisual(points[currentIndex], activeColor, hitDotScaleMultiplier);
     }
 
     private void CompleteCurrentPoint()
@@ -650,7 +905,7 @@ private void ApplyVisual(PointState state, Color color, float scaleMultiplier)
         }
 
         state.hit = true;
-        ApplyVisual(state, completedColor, completedScaleMultiplier);
+        ApplyVisual(state, completedColor, hitDotScaleMultiplier);
 
         int previousIndex = currentIndex - 1;
         if (previousIndex >= 0 && previousIndex < points.Count)
@@ -691,29 +946,9 @@ private void ApplyVisual(PointState state, Color color, float scaleMultiplier)
 
     private void RevealSegment(int startIndex, int endIndex)
     {
-        if (!IsValidPointIndex(startIndex) || !IsValidPointIndex(endIndex))
-            return;
-
-        var startPoint = points[startIndex];
-        var endPoint = points[endIndex];
-        if (startPoint?.marker == null || endPoint?.marker == null)
-            return;
-
-        SegmentKey key = new SegmentKey(startIndex, endIndex);
-        GameObject cylinder = GetOrCreateCylinder(key);
-
-        if (segmentLookup.TryGetValue(key, out LetterPathRenderer.SegmentLink link))
-        {
-            PositionCylinder(cylinder, link);
-        }
-        else
-        {
-            PositionCylinderWorld(cylinder, startPoint.marker.transform.position, endPoint.marker.transform.position);
-        }
-
         if (logSequenceEvents)
         {
-            Debug.Log($"[LetterTraceAimSequence] Revealed segment {startIndex}->{endIndex}.");
+            Debug.Log($"[LetterTraceAimSequence] Connectors disabled; visited segment {startIndex}->{endIndex}.");
         }
     }
 
@@ -769,7 +1004,7 @@ anchors.Count)
         cylinder.transform.position = (startWorld + endWorld) * 0.5f;
         cylinder.transform.rotation = Quaternion.FromToRotation(Vector3.up, direction.normalized);
 
-        float baseScale = pathRenderer != null ? pathRenderer.MarkerBaseScale : markerScale;
+        float baseScale = GetBaseMarkerScale();
         float thickness = Mathf.Max(0.002f, baseScale * segmentThicknessRatio);
         cylinder.transform.localScale = new Vector3(thickness, length * 0.5f, thickness);
 
@@ -841,9 +1076,7 @@ anchors.Count)
             return false;
         }
 
-        Vector3 center = state.marker != null
-            ? state.marker.transform.position
-            : transform.TransformPoint(state.localPosition);
+        Vector3 center = GetStateWorldPosition(state);
         float radius = GetPointRadius(state);
 
         Vector3 oc = origin - center;
@@ -887,9 +1120,7 @@ anchors.Count)
             return false;
         }
 
-        worldCenter = state.marker != null
-            ? state.marker.transform.position
-            : transform.TransformPoint(state.localPosition);
+        worldCenter = GetStateWorldPosition(state);
         radius = GetPointRadius(state);
         return radius > 0f;
     }
@@ -1024,3 +1255,4 @@ Shader.Find("Sprites/Default");
         }
     }
 }
+

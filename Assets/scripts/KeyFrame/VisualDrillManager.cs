@@ -5,6 +5,7 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
 using TMPro;
@@ -46,6 +47,7 @@ public class VisualDrillManager : MonoBehaviour
     [Header("Optional Refs")]
     [SerializeField] private GameObject drawerHost;
     [SerializeField] private LevelManager levelManager;
+    [SerializeField] private AudioManager audioManager;
 
     public event Action<string> OnLetterStarted;
     public event Action<string, bool> OnLetterCompleted;
@@ -79,6 +81,8 @@ public class VisualDrillManager : MonoBehaviour
     private DrillState _state = DrillState.Inactive;
     private string _currentExpected = string.Empty;
     private string _lastRecognized = string.Empty;
+    private string _lastSpokenLetter = string.Empty;
+    private bool _loggedMissingAudioManager = false;
 
     private string _cachedAccessToken;
     private double _tokenExpiry;
@@ -94,9 +98,69 @@ public class VisualDrillManager : MonoBehaviour
             levelManager = FindObjectOfType<LevelManager>();
     }
 
+    private AudioManager ResolveAudioManager()
+    {
+        if (audioManager && audioManager.isActiveAndEnabled)
+        {
+            _loggedMissingAudioManager = false;
+            return audioManager;
+        }
+
+        var managers = Resources.FindObjectsOfTypeAll<AudioManager>()
+            .Where(a => a != null && a.gameObject.scene.IsValid())
+            .ToArray();
+        audioManager = managers.FirstOrDefault(a => a != null && a.isActiveAndEnabled);
+        if (!audioManager && managers.Length > 0)
+            audioManager = managers[0];
+
+        if (audioManager && audioManager.isActiveAndEnabled)
+        {
+            _loggedMissingAudioManager = false;
+            return audioManager;
+        }
+
+        if (!_loggedMissingAudioManager)
+        {
+            Debug.LogWarning("[VisualDrill] AudioManager not available; letter audio will be skipped until it returns.");
+            _loggedMissingAudioManager = true;
+        }
+
+        return null;
+    }
+
     private void LateUpdate()
     {
         // Prompt visibility is managed by PhonemeManager.
+    }
+
+    private static char ExtractFirstAsciiLetter(string value)
+    {
+        if (string.IsNullOrEmpty(value)) return '\0';
+        foreach (char c in value)
+        {
+            if (char.IsLetter(c))
+                return c;
+        }
+        return '\0';
+    }
+
+    private bool TryPlayLetterAudio(string letter)
+    {
+        if (string.IsNullOrEmpty(letter))
+            return false;
+
+        var manager = ResolveAudioManager();
+        if (manager == null)
+            return false;
+
+        char c = ExtractFirstAsciiLetter(letter);
+        if (c == '\0')
+            return false;
+
+        bool played = manager.TryPlayLetterPronunciation(c);
+        if (played)
+            _lastSpokenLetter = letter;
+        return played;
     }
 
     private void HookLevelManager()
@@ -106,13 +170,17 @@ public class VisualDrillManager : MonoBehaviour
 
         levelManager.OnGameModeChanged -= HandleGameModeChanged;
         levelManager.OnGameModeChanged += HandleGameModeChanged;
+        levelManager.OnLetterChanged   -= HandleLevelLetterChanged;
+        levelManager.OnLetterChanged   += HandleLevelLetterChanged;
         HandleGameModeChanged(levelManager.currentMode);
+        HandleLevelLetterChanged(levelManager.currentLetter);
     }
 
     private void UnhookLevelManager()
     {
         if (!levelManager) return;
         levelManager.OnGameModeChanged -= HandleGameModeChanged;
+        levelManager.OnLetterChanged   -= HandleLevelLetterChanged;
     }
 
     private static readonly Gradient sBlackGradient = BuildSolidGradient(Color.black);
@@ -244,6 +312,7 @@ public class VisualDrillManager : MonoBehaviour
 
         _gradeUnlockAt = float.NegativeInfinity;
         SetDrawerEnabled(false);
+        ResolveAudioManager();
     }
 
     private void OnEnable()
@@ -275,6 +344,20 @@ public class VisualDrillManager : MonoBehaviour
     private void HandleGameModeChanged(LevelManager.GameMode mode)
     {
         // Prompt visibility is managed by PhonemeManager.
+    }
+
+    private void HandleLevelLetterChanged(string letter)
+    {
+        if (string.IsNullOrEmpty(letter))
+            return;
+
+        if (string.Equals(_lastSpokenLetter, letter, StringComparison.OrdinalIgnoreCase))
+            return;
+
+        if (!TryPlayLetterAudio(letter))
+        {
+            _lastSpokenLetter = string.Empty;
+        }
     }
 
     private void SetPromptVisible(bool visible)
@@ -387,7 +470,10 @@ public class VisualDrillManager : MonoBehaviour
                 foreach (var letter in phase.Letters)
                 {
                     if (string.IsNullOrWhiteSpace(letter)) continue;
-                    list.Add(letter.Trim());
+                    string trimmed = letter.Trim();
+                    if (trimmed.Length > 0)
+                        trimmed = trimmed.Substring(0, 1).ToLowerInvariant();
+                    list.Add(trimmed);
                 }
             }
 
@@ -440,6 +526,11 @@ public class VisualDrillManager : MonoBehaviour
 
         _state = DrillState.WaitingForDraw;
         ScheduleGradeUnlock();
+
+        if (!string.Equals(_lastSpokenLetter, _currentExpected, StringComparison.OrdinalIgnoreCase))
+        {
+            TryPlayLetterAudio(_currentExpected);
+        }
 
         OnLetterStarted?.Invoke(_currentExpected);
     }

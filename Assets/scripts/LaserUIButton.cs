@@ -10,18 +10,20 @@ public class LaserUIButton : MonoBehaviour
     [Header("Laser / Aim")]
     public float hmdDownOffset = 0.20f;
     public float raycastMaxDistance = 6f;
+    [Tooltip("If the controller touches the button, treat it as a direct hit")]
+    public float proximityRadius = 0.1f;
     [Tooltip("If the ray barely misses, still count it if the ray->collider distance <= this")]
     public float lockDistance = 0.06f;
 
     [Header("Gate (match PlaneSurfaceDrawer)")]
     [Tooltip("Arm length needed to count as extended")]
-    public float extendDistanceThreshold = 0.18f;  // set this to Drawer’s value
+    public float extendDistanceThreshold = 0.18f;  // set this to DrawerG��s value
     [Tooltip("Require a finger to be aligned toward the aim dir")]
     public bool requireExtendedFinger = true;
     [Range(0f,1f)] public float fingerAlignDot = 0.65f;
 
     [Header("Sticky / Hysteresis")]
-    [Tooltip("Keep aim ‘latched’ after ray leaves the button")]
+    [Tooltip("Keep aim G��latchedG�� after ray leaves the button")]
     public float aimStickyTime = 0.6f;
     [Tooltip("Frames of pointing to arm")]
     public int armFrames = 2;
@@ -73,6 +75,9 @@ public class LaserUIButton : MonoBehaviour
     private bool? _lockedHand; // true=right, false=left
     private float _triggerTimer;
     private bool _hasLaserLock;
+    private bool _proximityAim;
+    private AudioManager _audioManager;
+    private bool _waitingForExit;
 
     // sticky aim
     private float _lastAimTime = -999f;
@@ -206,6 +211,9 @@ public class LaserUIButton : MonoBehaviour
         _laserMat = new Material(sh) { color = laserColor };
         _laser.sharedMaterial = _laserMat;
         _laser.widthMultiplier = laserWidth;
+
+        if (!_audioManager)
+            _audioManager = FindObjectOfType<AudioManager>();
     }
 
     void OnDestroy()
@@ -224,10 +232,12 @@ public class LaserUIButton : MonoBehaviour
     {
         if (!levelManager)
             levelManager = FindObjectOfType<LevelManager>();
+        if (!_audioManager || !_audioManager.isActiveAndEnabled)
+            _audioManager = FindObjectOfType<AudioManager>();
 
         if (player == null || player.hmd == null) { SoftReset(clearLaser:true); return; }
 
-        // 1) Try fresh aim; else we’ll use sticky
+        // 1) Try fresh aim; else weG��ll use sticky
         bool gotAim = TryAim(out bool aimRight, out Vector3 hit);
         if (gotAim)
         {
@@ -254,7 +264,7 @@ public class LaserUIButton : MonoBehaviour
         Vector3 origin = hmdPos + Vector3.down * hmdDownOffset;
         Vector3 arm = (con.position - origin);
         float armLen = arm.magnitude;
-        bool extended = armLen >= Mathf.Max(0.05f, extendDistanceThreshold);
+        bool extended = armLen >= Mathf.Max(0.05f, extendDistanceThreshold) || _proximityAim;
         Vector3 aimDir = armLen > 1e-5f ? (arm / armLen) : Vector3.forward;
 
         var hf = isRight ? rightFingers : leftFingers;
@@ -262,10 +272,28 @@ public class LaserUIButton : MonoBehaviour
         Vector3? aimPoint = aiming ? _lastHitPoint : (Vector3?)null;
         bool pointing = IsAnyFingerPointingToward(hf, aimDir, aimPoint, out _);
 
-        bool fingerOk = !requireExtendedFinger || pointing;
+        bool fingerOk = !requireExtendedFinger || pointing || _proximityAim;
         bool gateTriggered = extended && fingerOk;
 
-        if (!_selected)
+        if (_waitingForExit)
+        {
+            bool stillInContact = gateTriggered || _proximityAim;
+            if (stillInContact)
+            {
+                _misalignFrames = 0;
+            }
+            else
+            {
+                _misalignFrames++;
+                if (_misalignFrames >= releaseFrames)
+                {
+                    _waitingForExit = false;
+                    _alignFrames = 0;
+                    _misalignFrames = 0;
+                }
+            }
+        }
+        else if (!_selected)
         {
             if (gateTriggered) _alignFrames++;
             else _alignFrames = 0;
@@ -275,15 +303,31 @@ public class LaserUIButton : MonoBehaviour
             {
                 _selected = true;
                 _misalignFrames = 0;
+
+                if (_proximityAim)
+                {
+                    Trigger();
+                }
+                else
+                {
+                    TriggerWhileSelected();
+                }
             }
         }
         else
         {
-            if (!gateTriggered) _misalignFrames++;
-            else _misalignFrames = 0;
-
-            if (_misalignFrames >= releaseFrames)
-                Trigger();
+            if (gateTriggered)
+            {
+                _misalignFrames = 0;
+                if (!_proximityAim)
+                    TriggerWhileSelected();
+            }
+            else
+            {
+                _misalignFrames++;
+                if (_misalignFrames >= releaseFrames)
+                    SoftReset(clearLaser: false);
+            }
         }
 
         // 5) Scale FX
@@ -295,73 +339,123 @@ public class LaserUIButton : MonoBehaviour
 
     bool TryAim(out bool aimRight, out Vector3 hitPoint)
     {
-        aimRight = true; hitPoint = Vector3.zero;
+        aimRight = true;
+        hitPoint = Vector3.zero;
         _hasLaserLock = false;
+        _proximityAim = false;
         if (player == null || player.hmd == null) return false;
 
-        bool gotR = TryAimHand(true, out Vector3 hitR, out float scoreR);
-        bool gotL = TryAimHand(false, out Vector3 hitL, out float scoreL);
+        bool gotR = TryAimHand(true, out Vector3 hitR, out float scoreR, out bool proxR);
+        bool gotL = TryAimHand(false, out Vector3 hitL, out float scoreL, out bool proxL);
 
-        if (!gotR && !gotL) return false;
+        if (!gotR && !gotL)
+            return false;
+
         if (gotR && !gotL)
         {
-            bool allowed = LaserMutex.TryClaim(this, true, scoreR);
-            _hasLaserLock = allowed;
-            if (!allowed) return false;
+            if (!LaserMutex.TryClaim(this, true, scoreR))
+                return false;
+            _hasLaserLock = true;
             aimRight = true;
             hitPoint = hitR;
+            _proximityAim = proxR;
             return true;
         }
+
         if (gotL && !gotR)
         {
-            bool allowed = LaserMutex.TryClaim(this, false, scoreL);
-            _hasLaserLock = allowed;
-            if (!allowed) return false;
+            if (!LaserMutex.TryClaim(this, false, scoreL))
+                return false;
+            _hasLaserLock = true;
             aimRight = false;
             hitPoint = hitL;
+            _proximityAim = proxL;
             return true;
         }
 
-        // both hit: choose closer to ray
-        Vector3 originR = player.hmd.transform.position + Vector3.down * hmdDownOffset;
-        Vector3 dirR = (player.conR.transform.position - originR).normalized;
-        float dR = DistancePointToRay(_col.ClosestPoint(hitR), originR, dirR);
+        bool allowR = LaserMutex.TryClaim(this, true, scoreR);
+        bool allowL = LaserMutex.TryClaim(this, false, scoreL);
 
-        Vector3 originL = player.hmd.transform.position + Vector3.down * hmdDownOffset;
-        Vector3 dirL = (player.conL.transform.position - originL).normalized;
-        float dL = DistancePointToRay(_col.ClosestPoint(hitL), originL, dirL);
+        if (!allowR && !allowL)
+            return false;
 
-        if (dR <= dL)
+        if (allowR && allowL)
         {
-            bool allowed = LaserMutex.TryClaim(this, true, scoreR);
-            _hasLaserLock = allowed;
-            if (!allowed) return false;
+            Vector3 originBase = player.hmd.transform.position + Vector3.down * hmdDownOffset;
+
+            float distR = float.MaxValue;
+            Transform conR = player.conR?.transform;
+            if (conR != null)
+            {
+                Vector3 dirR = conR.position - originBase;
+                if (dirR.sqrMagnitude > 1e-6f)
+                    distR = DistancePointToRay(hitR, originBase, dirR.normalized);
+            }
+
+            float distL = float.MaxValue;
+            Transform conL = player.conL?.transform;
+            if (conL != null)
+            {
+                Vector3 dirL = conL.position - originBase;
+                if (dirL.sqrMagnitude > 1e-6f)
+                    distL = DistancePointToRay(hitL, originBase, dirL.normalized);
+            }
+
+            bool chooseRight = distR <= distL;
+            if (chooseRight)
+            {
+                aimRight = true;
+                hitPoint = hitR;
+                _proximityAim = proxR;
+            }
+            else
+            {
+                aimRight = false;
+                hitPoint = hitL;
+                _proximityAim = proxL;
+            }
+
+            _hasLaserLock = true;
+            return true;
+        }
+
+        if (allowR)
+        {
             aimRight = true;
             hitPoint = hitR;
+            _proximityAim = proxR;
+            _hasLaserLock = true;
+            return true;
         }
-        else
+
+        if (allowL)
         {
-            bool allowed = LaserMutex.TryClaim(this, false, scoreL);
-            _hasLaserLock = allowed;
-            if (!allowed) return false;
             aimRight = false;
             hitPoint = hitL;
+            _proximityAim = proxL;
+            _hasLaserLock = true;
+            return true;
         }
-        return true;
+
+        return false;
     }
 
-    bool TryAimHand(bool right, out Vector3 hitPoint, out float score)
+    bool TryAimHand(bool right, out Vector3 hitPoint, out float score, out bool usedProximity)
     {
         hitPoint = Vector3.zero;
         score = -1f;
+        usedProximity = false;
         Transform con = right ? player.conR?.transform : player.conL?.transform;
         if (con == null) return false;
 
         Vector3 origin = player.hmd.transform.position + Vector3.down * hmdDownOffset;
-        Vector3 dir = (con.position - origin).normalized;
+        Vector3 dir = con.position - origin;
+        if (dir.sqrMagnitude < 1e-6f)
+            dir = Vector3.forward;
+        else
+            dir.Normalize();
         Ray ray = new Ray(origin, dir);
 
-        // 1) Exact collider hit
         if (_col.Raycast(ray, out RaycastHit hit, raycastMaxDistance))
         {
             hitPoint = hit.point;
@@ -369,7 +463,6 @@ public class LaserUIButton : MonoBehaviour
             return true;
         }
 
-        // 2) Near-lock: if ray passes within lockDistance of collider, use closest point on collider
         Vector3 closest = _col.ClosestPoint(origin + dir * raycastMaxDistance);
         float d = DistancePointToRay(closest, origin, dir);
         if (d <= lockDistance)
@@ -377,6 +470,20 @@ public class LaserUIButton : MonoBehaviour
             hitPoint = closest;
             score = ComputeAlignmentScore(origin, dir, hitPoint);
             return true;
+        }
+
+        if (proximityRadius > 0f)
+        {
+            Vector3 controllerPos = con.position;
+            Vector3 closestController = _col.ClosestPoint(controllerPos);
+            float controllerDist = Vector3.Distance(closestController, controllerPos);
+            if (controllerDist <= proximityRadius)
+            {
+                hitPoint = closestController;
+                score = ComputeAlignmentScore(origin, dir, hitPoint);
+                usedProximity = true;
+                return true;
+            }
         }
 
         return false;
@@ -453,6 +560,19 @@ public class LaserUIButton : MonoBehaviour
 
     void Trigger()
     {
+        InvokeButtonAction();
+        ResetTriggerState();
+        // keep laser until sticky window expires
+    }
+
+    void TriggerWhileSelected()
+    {
+        InvokeButtonAction();
+        ResetTriggerState();
+    }
+
+    void InvokeButtonAction()
+    {
         if (surfaceDrawer == null)
             surfaceDrawer = FindObjectOfType<PlaneSurfaceDrawer>();
 
@@ -465,13 +585,23 @@ public class LaserUIButton : MonoBehaviour
         act?.Invoke();
         OnTriggered?.Invoke();
 
+        if (_audioManager == null || !_audioManager.isActiveAndEnabled)
+            _audioManager = FindObjectOfType<AudioManager>();
+        if (_audioManager && _audioManager.isActiveAndEnabled)
+            _audioManager.PlayPop();
+
         _triggerTimer = triggerPulseTime;
+    }
+
+    void ResetTriggerState()
+    {
         _selected = false;
         _lockedHand = null;
         _alignFrames = _misalignFrames = 0;
         if (_hasLaserLock) LaserMutex.Release(this);
         _hasLaserLock = false;
-        // keep laser until sticky window expires
+        _proximityAim = false;
+        _waitingForExit = true;
     }
 
     void SoftReset(bool clearLaser)
@@ -481,6 +611,8 @@ public class LaserUIButton : MonoBehaviour
         _alignFrames = _misalignFrames = 0;
         if (_hasLaserLock) LaserMutex.Release(this);
         _hasLaserLock = false;
+        _proximityAim = false;
+        _waitingForExit = false;
         if (clearLaser && _laser) _laser.positionCount = 0;
         transform.localScale = Vector3.Lerp(transform.localScale, _baseScale, Mathf.Clamp01(Time.deltaTime * scaleLerpSpeed));
     }
