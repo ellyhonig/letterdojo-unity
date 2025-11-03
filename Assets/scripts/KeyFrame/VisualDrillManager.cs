@@ -49,6 +49,15 @@ public class VisualDrillManager : MonoBehaviour
     [SerializeField] private LevelManager levelManager;
     [SerializeField] private AudioManager audioManager;
 
+    [Header("Board Label")]
+    [SerializeField] private GameObject boardLabel;
+
+    [Header("Multi-letter Display")]
+    [SerializeField] private Color multiLetterCorrectColor = new Color(0.2f, 0.84f, 0.45f);
+    [SerializeField] private Color multiLetterCurrentColor = new Color(1f, 0.82f, 0.3f);
+    [SerializeField] private Color multiLetterPendingColor = Color.white;
+    [SerializeField] private Color multiLetterErrorColor = new Color(0.95f, 0.33f, 0.31f);
+
     public event Action<string> OnLetterStarted;
     public event Action<string, bool> OnLetterCompleted;
 
@@ -83,6 +92,13 @@ public class VisualDrillManager : MonoBehaviour
     private string _lastRecognized = string.Empty;
     private string _lastSpokenLetter = string.Empty;
     private bool _loggedMissingAudioManager = false;
+
+    private string _currentWordRaw = string.Empty;
+    private readonly List<LetterStatus> _multiLetterProgress = new List<LetterStatus>(16);
+    private int _currentWordLetterIndex = 0;
+    private Coroutine _multiLetterFlashRoutine;
+
+    private const float MultiLetterErrorFlashSeconds = 0.2f;
 
     private string _cachedAccessToken;
     private double _tokenExpiry;
@@ -127,6 +143,8 @@ public class VisualDrillManager : MonoBehaviour
 
         return null;
     }
+
+    private bool IsMultiLetterActive => !string.IsNullOrEmpty(_currentWordRaw) && _currentWordRaw.Length > 1;
 
     private void LateUpdate()
     {
@@ -200,6 +218,12 @@ public class VisualDrillManager : MonoBehaviour
         public LineRenderer line;
         public float width;
         public Gradient gradient;
+    }
+
+    private enum LetterStatus
+    {
+        Pending,
+        Correct
     }
 
     [Serializable]
@@ -471,9 +495,8 @@ public class VisualDrillManager : MonoBehaviour
                 {
                     if (string.IsNullOrWhiteSpace(letter)) continue;
                     string trimmed = letter.Trim();
-                    if (trimmed.Length > 0)
-                        trimmed = trimmed.Substring(0, 1).ToLowerInvariant();
-                    list.Add(trimmed);
+                    if (trimmed.Length == 0) continue;
+                    list.Add(trimmed.ToLowerInvariant());
                 }
             }
 
@@ -485,6 +508,198 @@ public class VisualDrillManager : MonoBehaviour
             _letters = Array.Empty<string>();
         }
     }
+    private void CancelMultiLetterFlash()
+    {
+        if (_multiLetterFlashRoutine != null)
+        {
+            StopCoroutine(_multiLetterFlashRoutine);
+            _multiLetterFlashRoutine = null;
+        }
+    }
+
+    private void SetBoardLabelVisible(bool visible)
+    {
+        if (!boardLabel) return;
+        if (boardLabel.activeSelf != visible)
+            boardLabel.SetActive(visible);
+    }
+
+    private void InitializeMultiLetterWordState()
+    {
+        _multiLetterProgress.Clear();
+        if (string.IsNullOrEmpty(_currentWordRaw))
+        {
+            _currentWordLetterIndex = 0;
+            return;
+        }
+
+        for (int i = 0; i < _currentWordRaw.Length; i++)
+        {
+            char ch = _currentWordRaw[i];
+            _multiLetterProgress.Add(char.IsLetter(ch) ? LetterStatus.Pending : LetterStatus.Correct);
+        }
+
+        _currentWordLetterIndex = GetNextPendingLetterIndex(0);
+    }
+
+    private int GetNextPendingLetterIndex(int startIndex)
+    {
+        if (_multiLetterProgress.Count == 0)
+            return 0;
+
+        int index = Mathf.Clamp(startIndex, 0, _multiLetterProgress.Count);
+        while (index < _multiLetterProgress.Count && _multiLetterProgress[index] == LetterStatus.Correct)
+            index++;
+        return index;
+    }
+
+    private string GetCurrentEvaluationTarget()
+    {
+        if (!IsMultiLetterActive)
+            return _currentExpected;
+
+        if (_currentWordLetterIndex < 0 || _currentWordLetterIndex >= _currentWordRaw.Length)
+            return string.Empty;
+
+        char target = _currentWordRaw[_currentWordLetterIndex];
+        return char.IsLetter(target) ? target.ToString() : string.Empty;
+    }
+
+    private string GetCurrentAudioTarget()
+    {
+        string target = GetCurrentEvaluationTarget();
+        if (!string.IsNullOrEmpty(target))
+            return target;
+        return _currentExpected;
+    }
+
+    private void UpdatePromptDisplay(int flashIndex = -1, Color? flashColor = null)
+    {
+        if (!promptText) return;
+
+        if (!IsMultiLetterActive)
+        {
+            promptText.text = string.IsNullOrEmpty(_currentExpected)
+                ? string.Empty
+                : _currentExpected.ToLowerInvariant();
+            return;
+        }
+
+        var sb = new StringBuilder(_currentWordRaw.Length * 16);
+        string correctHex = ColorUtility.ToHtmlStringRGB(multiLetterCorrectColor);
+        string pendingHex = ColorUtility.ToHtmlStringRGB(multiLetterPendingColor);
+        string currentHex = ColorUtility.ToHtmlStringRGB(multiLetterCurrentColor);
+        string flashHex = flashColor.HasValue ? ColorUtility.ToHtmlStringRGB(flashColor.Value) : string.Empty;
+        bool hasFlash = flashColor.HasValue && flashIndex >= 0;
+
+        for (int i = 0; i < _currentWordRaw.Length; i++)
+        {
+            char raw = _currentWordRaw[i];
+            if (!char.IsLetter(raw))
+            {
+                sb.Append(raw);
+                continue;
+            }
+
+            string hex;
+            if (hasFlash && i == flashIndex)
+            {
+                hex = flashHex;
+            }
+            else if (_multiLetterProgress.Count > i && _multiLetterProgress[i] == LetterStatus.Correct)
+            {
+                hex = correctHex;
+            }
+            else if (i == _currentWordLetterIndex)
+            {
+                hex = currentHex;
+            }
+            else
+            {
+                hex = pendingHex;
+            }
+
+            sb.Append("<color=#");
+            sb.Append(hex);
+            sb.Append('>');
+            sb.Append(char.ToLowerInvariant(raw));
+            sb.Append("</color>");
+        }
+
+        promptText.text = sb.ToString();
+    }
+
+    private IEnumerator FlashMultiLetterError(int letterIndex)
+    {
+        UpdatePromptDisplay(letterIndex, multiLetterErrorColor);
+        yield return new WaitForSeconds(MultiLetterErrorFlashSeconds);
+        UpdatePromptDisplay();
+        _multiLetterFlashRoutine = null;
+    }
+
+    private void AdvanceToNextLetter()
+    {
+        _currentWordLetterIndex = GetNextPendingLetterIndex(_currentWordLetterIndex + 1);
+    }
+
+    private IEnumerator HandleMultiLetterCorrect(string displayRaw, string expectedDisplay)
+    {
+        if (_currentWordLetterIndex >= 0 && _currentWordLetterIndex < _multiLetterProgress.Count)
+            _multiLetterProgress[_currentWordLetterIndex] = LetterStatus.Correct;
+
+        UpdatePromptDisplay();
+        SetBoardLabelVisible(false);
+        planeDrawer?.ClearStrokes();
+
+        var manager = ResolveAudioManager();
+        manager?.PlaySoftCorrectChime();
+
+        AdvanceToNextLetter();
+
+        bool finished = _currentWordLetterIndex >= _multiLetterProgress.Count;
+        if (finished)
+        {
+            SetFeedback($"RIGHT: {displayRaw.ToLowerInvariant()} (word '{_currentExpected.ToLowerInvariant()}')");
+            yield return _waitAfterCorrectYield;
+            _gradeRoutine = null;
+            CompleteLetter(true);
+            yield break;
+        }
+
+        SetFeedback($"RIGHT: {expectedDisplay.ToLowerInvariant()}. Keep going!");
+        _state = DrillState.WaitingForDraw;
+        SetDrawerEnabled(true);
+        ScheduleGradeUnlock();
+        _gradeRoutine = null;
+
+        string audioKey = GetCurrentAudioTarget();
+        if (!string.IsNullOrEmpty(audioKey) &&
+            !string.Equals(_lastSpokenLetter, audioKey, StringComparison.OrdinalIgnoreCase))
+        {
+            if (TryPlayLetterAudio(audioKey))
+                _lastSpokenLetter = audioKey;
+        }
+    }
+
+    private IEnumerator HandleMultiLetterIncorrect(string displayRaw, string expectedDisplay)
+    {
+        var manager = ResolveAudioManager();
+        manager?.PlaySoftIncorrectChime();
+
+        if (_multiLetterFlashRoutine != null)
+            StopCoroutine(_multiLetterFlashRoutine);
+
+        planeDrawer?.ClearStrokes();
+        SetFeedback($"WRONG: {displayRaw.ToLowerInvariant()} (expected {expectedDisplay.ToLowerInvariant()})");
+        _multiLetterFlashRoutine = StartCoroutine(FlashMultiLetterError(_currentWordLetterIndex));
+
+        _state = DrillState.WaitingForDraw;
+        SetDrawerEnabled(true);
+        ScheduleGradeUnlock();
+        _gradeRoutine = null;
+        yield break;
+    }
+
     private void AdvanceLetter()
     {
         ReturnToBaseline();
@@ -515,21 +730,28 @@ public class VisualDrillManager : MonoBehaviour
         }
 
         _currentExpected = _letters[_currentLetterIndex];
+        _currentWordRaw = _currentExpected ?? string.Empty;
         _attempt = 0;
         _lastRecognized = string.Empty;
+        CancelMultiLetterFlash();
+        InitializeMultiLetterWordState();
 
-        if (promptText) promptText.text = _currentExpected.ToUpperInvariant();
+        if (promptText) UpdatePromptDisplay();
         SetFeedback(string.Empty);
         HideHintImmediate();
         planeDrawer?.ClearStrokes();
         SetDrawerEnabled(true);
+        SetBoardLabelVisible(true);
 
         _state = DrillState.WaitingForDraw;
         ScheduleGradeUnlock();
 
-        if (!string.Equals(_lastSpokenLetter, _currentExpected, StringComparison.OrdinalIgnoreCase))
+        string audioKey = GetCurrentAudioTarget();
+        if (!string.IsNullOrEmpty(audioKey) &&
+            !string.Equals(_lastSpokenLetter, audioKey, StringComparison.OrdinalIgnoreCase))
         {
-            TryPlayLetterAudio(_currentExpected);
+            if (TryPlayLetterAudio(audioKey))
+                _lastSpokenLetter = audioKey;
         }
 
         OnLetterStarted?.Invoke(_currentExpected);
@@ -548,6 +770,8 @@ public class VisualDrillManager : MonoBehaviour
             StopCoroutine(_hintRoutine);
             _hintRoutine = null;
         }
+        CancelMultiLetterFlash();
+        SetBoardLabelVisible(true);
 
         _state = DrillState.Inactive;
         _gradeUnlockAt = Time.time;
@@ -587,10 +811,21 @@ public class VisualDrillManager : MonoBehaviour
 
         _lastRecognized = recognized ?? string.Empty;
         string displayRaw = string.IsNullOrEmpty(_lastRecognized) ? "<none>" : _lastRecognized;
-        string expectedDisplay = string.IsNullOrEmpty(_currentExpected) ? "<none>" : _currentExpected;
-        Debug.Log($"[VisualDrill] Vision OCR returned '{displayRaw}' for expected '{expectedDisplay}'.");
+        string evaluationTarget = GetCurrentEvaluationTarget();
+        if (string.IsNullOrEmpty(evaluationTarget))
+            evaluationTarget = _currentExpected;
+        string expectedDisplay = string.IsNullOrEmpty(evaluationTarget) ? "<none>" : evaluationTarget;
+        Debug.Log($"[VisualDrill] Vision OCR returned '{displayRaw}' for expected '{expectedDisplay}' (word '{_currentExpected}').");
 
-        bool correct = EvaluateRecognition(_lastRecognized, _currentExpected);
+        bool correct = EvaluateRecognition(_lastRecognized, evaluationTarget);
+
+        if (IsMultiLetterActive)
+        {
+            yield return correct
+                ? HandleMultiLetterCorrect(displayRaw, expectedDisplay)
+                : HandleMultiLetterIncorrect(displayRaw, expectedDisplay);
+            yield break;
+        }
 
         if (correct)
         {
@@ -603,7 +838,7 @@ public class VisualDrillManager : MonoBehaviour
             yield break;
         }
 
-        SetFeedback($"WRONG: {displayRaw} (expected {expectedDisplay})");
+        SetFeedback($"WRONG: {displayRaw.ToLowerInvariant()} (expected {expectedDisplay.ToLowerInvariant()})");
         Debug.LogWarning($"[VisualDrill] Letter '{expectedDisplay}' incorrect on attempt {_attempt + 1} with OCR '{displayRaw}'.");
         _attempt++;
         planeDrawer?.ClearStrokes();

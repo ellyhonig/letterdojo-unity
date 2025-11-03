@@ -1,4 +1,5 @@
 using UnityEngine;
+using UnityEngine.Rendering;
 using System.Collections.Generic;
 using System;
 
@@ -147,6 +148,22 @@ public class PlaneSurfaceDrawer : MonoBehaviour
     [Tooltip("Laser width when charging")] [SerializeField]
     private float laserWidthCharging = 0.0045f;
 
+    [Header("Charging Crosshair")]
+    [Tooltip("Show a crosshair at the laser tip while charging")] [SerializeField]
+    private bool showChargingCrosshair = true;
+    [Tooltip("Optional crosshair plane for the right hand (assign a child of the board).")] [SerializeField]
+    private Transform crosshairPlaneRight;
+    [Tooltip("Optional crosshair plane for the left hand (assign a child of the board).")] [SerializeField]
+    private Transform crosshairPlaneLeft;
+    [Tooltip("Crosshair size as a fraction of the board's smaller dimension")] [SerializeField, Min(0.001f)]
+    private float crosshairSizeFraction = 1f / 15f;
+    [Tooltip("Offset from the board to avoid z-fighting (meters)")] [SerializeField, Range(0f, 0.01f)]
+    private float crosshairSurfaceOffset = 0.0004f;
+    [Tooltip("Optional texture to apply to the crosshair quad")] [SerializeField]
+    private Texture2D crosshairTexture;
+    [Tooltip("Optional material override for the crosshair quad (duplicate created at runtime)")] [SerializeField]
+    private Material crosshairMaterial;
+
     [Header("Hand Pose Gate")]
     [Tooltip("Require at least one non-thumb finger to point toward the board to draw")] [SerializeField]
     private bool requireExtendedFinger = true;
@@ -230,6 +247,15 @@ public class PlaneSurfaceDrawer : MonoBehaviour
     private LineRenderer _armLineR, _armLineL;
     private LineRenderer _laserR, _laserL;
     private LineRenderer _laserHaloR, _laserHaloL;
+
+    // Charging crosshair
+    private Transform _crosshairR, _crosshairL;
+    private MeshRenderer _crosshairRendererR, _crosshairRendererL;
+    private Material _crosshairRuntimeMat;
+    private bool _customCrosshairR, _customCrosshairL;
+    private bool _runtimeCrosshairR = true, _runtimeCrosshairL = true;
+    private Quaternion _crosshairBaseRotationR, _crosshairBaseRotationL;
+    private Quaternion _crosshairBaseLocalRotationR, _crosshairBaseLocalRotationL;
 
     // Lag state per hand
     private Vector3 _lagPosR, _lagPosL;
@@ -318,6 +344,213 @@ public class PlaneSurfaceDrawer : MonoBehaviour
         sParticleAlphaMat = new Material(shAlpha) { name = "__Shared_ParticleAlpha" };
         sParticleAlphaMat.hideFlags = HideFlags.DontSaveInEditor | HideFlags.DontSaveInBuild;
         if (sParticleAlphaMat.HasProperty(ID_Color)) sParticleAlphaMat.SetColor(ID_Color, new Color(0.2f,0.2f,0.2f,0.25f));
+    }
+
+    private void InitializeCrosshairs()
+    {
+        if (!showChargingCrosshair) return;
+
+        if (crosshairPlaneRight)
+        {
+            _crosshairR = crosshairPlaneRight;
+            _crosshairRendererR = crosshairPlaneRight.GetComponent<MeshRenderer>();
+            _customCrosshairR = true;
+            _runtimeCrosshairR = false;
+        }
+        else if (_customCrosshairR)
+        {
+            _crosshairR = null;
+            _crosshairRendererR = null;
+            _customCrosshairR = false;
+            _runtimeCrosshairR = true;
+        }
+
+        if (crosshairPlaneLeft)
+        {
+            _crosshairL = crosshairPlaneLeft;
+            _crosshairRendererL = crosshairPlaneLeft.GetComponent<MeshRenderer>();
+            _customCrosshairL = true;
+            _runtimeCrosshairL = false;
+        }
+        else if (_customCrosshairL)
+        {
+            _crosshairL = null;
+            _crosshairRendererL = null;
+            _customCrosshairL = false;
+            _runtimeCrosshairL = true;
+        }
+
+        EnsureCrosshairMaterial();
+
+        if (_crosshairR == null)
+        {
+            var existing = transform.Find("Crosshair_R");
+            if (existing)
+            {
+                _crosshairR = existing;
+                _crosshairRendererR = existing.GetComponent<MeshRenderer>();
+            }
+            else
+            {
+                CreateCrosshair(ref _crosshairR, ref _crosshairRendererR, "Crosshair_R");
+            }
+        }
+        if (_crosshairL == null)
+        {
+            var existing = transform.Find("Crosshair_L");
+            if (existing)
+            {
+                _crosshairL = existing;
+                _crosshairRendererL = existing.GetComponent<MeshRenderer>();
+            }
+            else
+            {
+                CreateCrosshair(ref _crosshairL, ref _crosshairRendererL, "Crosshair_L");
+            }
+        }
+
+        if (_customCrosshairR && _crosshairR)
+        {
+            _crosshairBaseLocalRotationR = _crosshairR.localRotation;
+            _crosshairBaseRotationR = _crosshairR.rotation;
+        }
+        if (_customCrosshairL && _crosshairL)
+        {
+            _crosshairBaseLocalRotationL = _crosshairL.localRotation;
+            _crosshairBaseRotationL = _crosshairL.rotation;
+        }
+
+        ApplyCrosshairMaterial();
+        UpdateCrosshairScale();
+        SetCrosshairActive(true, false);
+        SetCrosshairActive(false, false);
+    }
+
+    private void EnsureCrosshairMaterial()
+    {
+        if (!showChargingCrosshair) return;
+        if (!_runtimeCrosshairR && !_runtimeCrosshairL) return;
+        if (_crosshairRuntimeMat != null) return;
+
+        Material source = crosshairMaterial;
+        if (source)
+        {
+            _crosshairRuntimeMat = new Material(source);
+        }
+        else
+        {
+            var shader = Shader.Find("Universal Render Pipeline/Unlit") ?? Shader.Find("Unlit/Texture") ?? Shader.Find("Sprites/Default");
+            _crosshairRuntimeMat = new Material(shader);
+            _crosshairRuntimeMat.color = Color.white;
+        }
+        _crosshairRuntimeMat.name = "__CrosshairMat";
+        _crosshairRuntimeMat.hideFlags = HideFlags.DontSaveInEditor | HideFlags.DontSaveInBuild;
+
+        RefreshCrosshairTexture();
+    }
+
+    private void RefreshCrosshairTexture()
+    {
+        if (!_runtimeCrosshairR && !_runtimeCrosshairL) return;
+        if (_crosshairRuntimeMat == null) return;
+        Texture tex = crosshairTexture;
+        if (_crosshairRuntimeMat.HasProperty("_BaseMap")) _crosshairRuntimeMat.SetTexture("_BaseMap", tex);
+        if (_crosshairRuntimeMat.HasProperty("_MainTex")) _crosshairRuntimeMat.SetTexture("_MainTex", tex);
+    }
+
+    private void ApplyCrosshairMaterial()
+    {
+        if (!showChargingCrosshair) return;
+        EnsureCrosshairMaterial();
+        if (_crosshairRuntimeMat == null) return;
+        if (_runtimeCrosshairR && _crosshairRendererR) _crosshairRendererR.sharedMaterial = _crosshairRuntimeMat;
+        if (_runtimeCrosshairL && _crosshairRendererL) _crosshairRendererL.sharedMaterial = _crosshairRuntimeMat;
+    }
+
+    private void CreateCrosshair(ref Transform target, ref MeshRenderer renderer, string name)
+    {
+        var go = GameObject.CreatePrimitive(PrimitiveType.Quad);
+        go.name = name;
+        go.transform.SetParent(transform, false);
+        go.transform.localPosition = Vector3.zero;
+        go.transform.localRotation = Quaternion.identity;
+        go.transform.localScale = Vector3.one * 0.05f;
+        var col = go.GetComponent<Collider>();
+        if (col)
+        {
+            if (Application.isPlaying) Destroy(col);
+            else DestroyImmediate(col);
+        }
+        renderer = go.GetComponent<MeshRenderer>();
+        if (renderer)
+        {
+            renderer.shadowCastingMode = ShadowCastingMode.Off;
+            renderer.receiveShadows = false;
+            renderer.motionVectorGenerationMode = MotionVectorGenerationMode.ForceNoMotion;
+            renderer.enabled = true;
+        }
+        go.SetActive(false);
+        target = go.transform;
+    }
+
+    private void UpdateCrosshairScale()
+    {
+        if (!showChargingCrosshair) return;
+        float minDim = Mathf.Max(0.001f, GetPlaneMinDimension());
+        float size = Mathf.Max(0.0001f, minDim * crosshairSizeFraction);
+        Vector3 scale = new Vector3(size, size, 1f);
+        if (_runtimeCrosshairR && _crosshairR) _crosshairR.localScale = scale;
+        if (_runtimeCrosshairL && _crosshairL) _crosshairL.localScale = scale;
+    }
+
+    private void SetCrosshairActive(bool isRight, bool active)
+    {
+        Transform t = isRight ? _crosshairR : _crosshairL;
+        if (!t) return;
+        if (!showChargingCrosshair)
+        {
+            if (t.gameObject.activeSelf)
+                t.gameObject.SetActive(false);
+            return;
+        }
+        if (t.gameObject.activeSelf != active)
+            t.gameObject.SetActive(active);
+    }
+
+    private void UpdateCrosshairVisual(bool isRight, Vector3 position, Vector3 normal)
+    {
+        if (!showChargingCrosshair) return;
+        Transform t = isRight ? _crosshairR : _crosshairL;
+        if (!t) return;
+        Vector3 n = normal.sqrMagnitude > 1e-6f ? normal.normalized : transform.forward;
+        Vector3 worldPos = position + n * crosshairSurfaceOffset;
+        bool useCustom = isRight ? _customCrosshairR : _customCrosshairL;
+        if (useCustom)
+        {
+            Transform parent = t.parent;
+            if (parent)
+            {
+                t.localPosition = parent.InverseTransformPoint(worldPos);
+                t.localRotation = isRight ? _crosshairBaseLocalRotationR : _crosshairBaseLocalRotationL;
+            }
+            else
+            {
+                t.position = worldPos;
+                t.rotation = isRight ? _crosshairBaseRotationR : _crosshairBaseRotationL;
+            }
+        }
+        else
+        {
+            t.position = worldPos;
+            Vector3 up = transform.up.sqrMagnitude > 1e-6f ? transform.up.normalized : Vector3.up;
+            if (Mathf.Abs(Vector3.Dot(up, n)) > 0.99f)
+            {
+                up = transform.right.sqrMagnitude > 1e-6f ? transform.right.normalized : Vector3.right;
+                if (Mathf.Abs(Vector3.Dot(up, n)) > 0.99f)
+                    up = Vector3.Cross(n, Vector3.forward).sqrMagnitude > 1e-6f ? Vector3.Cross(n, Vector3.forward).normalized : Vector3.up;
+            }
+            t.rotation = Quaternion.LookRotation(n, up);
+        }
     }
 
     private void EnsureSupportSphere()
@@ -506,6 +739,23 @@ private void SetHandState(bool isRight, HandState newState)
     void OnValidate()
     {
         strokeLayer = string.IsNullOrEmpty(strokeLayerName) ? -1 : LayerMask.NameToLayer(strokeLayerName);
+        if (crosshairSizeFraction < 0.001f) crosshairSizeFraction = 0.001f;
+        crosshairSurfaceOffset = Mathf.Clamp(crosshairSurfaceOffset, 0f, 0.01f);
+        if (Application.isPlaying)
+        {
+            if (showChargingCrosshair)
+            {
+                InitializeCrosshairs();
+                RefreshCrosshairTexture();
+                ApplyCrosshairMaterial();
+                UpdateCrosshairScale();
+            }
+            else
+            {
+                SetCrosshairActive(true, false);
+                SetCrosshairActive(false, false);
+            }
+        }
     }
 
     /// <summary>
@@ -582,6 +832,8 @@ private void SetHandState(bool isRight, HandState newState)
         if (_laserHaloR) SetLineEnabled(_laserHaloR, false);
         if (_laserHaloL) SetLineEnabled(_laserHaloL, false);
 
+        InitializeCrosshairs();
+
         // Instantiate impact FX (use default if prefabs missing)
         if (useImpactFX)
         {
@@ -618,6 +870,9 @@ private void SetHandState(bool isRight, HandState newState)
         _hasLastDrawPosR = _hasLastDrawPosL = false;
         _smoothedPosR = _smoothedPosL = Vector3.zero;
 
+        SetCrosshairActive(true, false);
+        SetCrosshairActive(false, false);
+
         SetLineEnabled(_laserR, false);
         // Ensure advanced drawing features are active at runtime
         useControllerLaserOrigin = true;
@@ -642,6 +897,16 @@ private void SetHandState(bool isRight, HandState newState)
         else if (_supportSphereGO)
         {
             _supportSphereGO.SetActive(false);
+        }
+    }
+
+    void OnDestroy()
+    {
+        if (_crosshairRuntimeMat)
+        {
+            if (Application.isPlaying) Destroy(_crosshairRuntimeMat);
+            else DestroyImmediate(_crosshairRuntimeMat);
+            _crosshairRuntimeMat = null;
         }
     }
 
@@ -717,6 +982,7 @@ private void SetHandState(bool isRight, HandState newState)
         // Aim ray: direction is origin->controller (arm), start can be origin or controller
         bool aimedAtBoard = false;
         Vector3 hitPoint = default;
+        Vector3 hitNormal = transform.forward;
         if (extended)
         {
             Vector3 rayStart = useControllerLaserOrigin ? con.position : origin;
@@ -725,6 +991,7 @@ private void SetHandState(bool isRight, HandState newState)
             {
                 aimedAtBoard = true;
                 hitPoint = hit.point;
+                hitNormal = hit.normal;
             }
         }
 
@@ -738,6 +1005,7 @@ private void SetHandState(bool isRight, HandState newState)
                 var halo = isRight ? _laserHaloR : _laserHaloL;
                 if (halo) SetLineEnabled(halo, false);
             }
+            SetCrosshairActive(isRight, false);
             aimedAtBoard = false;
         }
 
@@ -857,6 +1125,19 @@ private void SetHandState(bool isRight, HandState newState)
                     fxWidth = laserWidthDrawing;
                 }
             }
+
+            bool showAimAssist = showChargingCrosshair && thisHandIsDrawing && aimedAtBoard && !fingerOk;
+            bool showCrosshairNow = showChargingCrosshair && thisHandIsDrawing && (hs == HandState.Charging || showAimAssist);
+            if (showCrosshairNow)
+            {
+                UpdateCrosshairVisual(isRight, lag, hitNormal);
+                SetCrosshairActive(isRight, true);
+            }
+            else
+            {
+                SetCrosshairActive(isRight, false);
+            }
+
             if (laser) laser.widthMultiplier = Mathf.Max(0.0008f, fxWidth * pulse);
             if (useCurvedLaser)
                 UpdateLaserCurve(laser, laserStart, lag, con, fxColor, true);
@@ -944,23 +1225,31 @@ private void SetHandState(bool isRight, HandState newState)
                     if (halo) SetLineEnabled(halo, false);
                 }
 
-                if (isRight)
+                if (!showCrosshairNow)
                 {
-                    _lagPosR = hitPoint;
-                    _lagVelR = Vector3.zero;
-                    _hasStableR = false;
-                    _hasPrevTargetR = false;
-                    _snapLagR = true;
-                    if (useMomentumLag) _momentumLockedR = false;
+                    if (isRight)
+                    {
+                        _lagPosR = hitPoint;
+                        _lagVelR = Vector3.zero;
+                        _hasStableR = false;
+                        _hasPrevTargetR = false;
+                        _snapLagR = true;
+                        if (useMomentumLag) _momentumLockedR = false;
+                    }
+                    else
+                    {
+                        _lagPosL = hitPoint;
+                        _lagVelL = Vector3.zero;
+                        _hasStableL = false;
+                        _hasPrevTargetL = false;
+                        _snapLagL = true;
+                        if (useMomentumLag) _momentumLockedL = false;
+                    }
                 }
                 else
                 {
-                    _lagPosL = hitPoint;
-                    _lagVelL = Vector3.zero;
-                    _hasStableL = false;
-                    _hasPrevTargetL = false;
-                    _snapLagL = true;
-                    if (useMomentumLag) _momentumLockedL = false;
+                    if (isRight) _snapLagR = false;
+                    else _snapLagL = false;
                 }
 
                 if (isRight && _isDrawingR) { StopDrawingFully(true); }
@@ -978,6 +1267,7 @@ private void SetHandState(bool isRight, HandState newState)
                 var halo = isRight ? _laserHaloR : _laserHaloL;
                 if (halo) SetLineEnabled(halo, false);
             }
+            SetCrosshairActive(isRight, false);
             if (isRight && _isDrawingR) { StopDrawingFully(true); }
             if (!isRight && _isDrawingL) { StopDrawingFully(false); }
             // Ensure impact FX are disabled when aim is lost

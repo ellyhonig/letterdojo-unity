@@ -57,6 +57,8 @@ public class DictationManager : MonoBehaviour
     [SerializeField] private int captureWidth  = 512;
     [SerializeField] private int captureHeight = 512;
     [SerializeField] private bool debugWriteCapture = false;
+    [SerializeField, Range(0f, 0.5f)] private float strokeFramePaddingFraction = 0.1f;
+    [SerializeField, Min(0f)] private float strokeFrameMinimumPadding = 0.005f;
 
     [Header("OCR (Vision API)")]
     [SerializeField] private BeamMode beamMode = BeamMode.BeamOn;
@@ -105,6 +107,13 @@ public class DictationManager : MonoBehaviour
     [SerializeField] private GameObject drawerHost;
 
     [SerializeField] private GameObject tmpLetter;
+    [SerializeField] private GameObject boardLabel;
+
+    [Header("Multi-letter Display")]
+    [SerializeField] private Color multiLetterCorrectColor = new Color(0.2f, 0.84f, 0.45f);
+    [SerializeField] private Color multiLetterCurrentColor = new Color(1f, 0.82f, 0.3f);
+    [SerializeField] private Color multiLetterPendingColor = Color.white;
+    [SerializeField] private Color multiLetterErrorColor = new Color(0.95f, 0.33f, 0.31f);
 
     [Header("Hint Display")]
     [SerializeField] private Letter3DDisplay hintDisplay;
@@ -132,6 +141,8 @@ public class DictationManager : MonoBehaviour
     private enum State { Idle, Drawing, WaitingForResponse, GradedAccept, GradedReject }
     private State state = State.Idle;
 
+    private enum MultiLetterStatus { Pending, Correct }
+
     private bool _lastDrawerActive = true;
     private LevelManager.GameMode _lastNotifiedMode = LevelManager.GameMode.PhonemeChecking;
     private bool _hasLastMode = false;
@@ -149,8 +160,17 @@ public class DictationManager : MonoBehaviour
     private HandState _leftHandState = HandState.Idle;
     private int _lastObservedStrokeTotal = 0;
     private bool _playedInitialAudio = false;
+    private string _multiLetterWordRaw = string.Empty;
+    private readonly List<MultiLetterStatus> _multiLetterStatuses = new List<MultiLetterStatus>(16);
+    private int _multiLetterIndex = 0;
+    private Coroutine _multiLetterErrorRoutine;
+    private Transform _confirmedStrokeRoot;
+    private readonly List<GameObject> _confirmedStrokeObjects = new List<GameObject>();
+    private const float MultiLetterErrorFlashSeconds = 0.2f;
     private static readonly HashSet<char> LettersRequiringTwoStrokes = new HashSet<char> { 'f', 't', 'k', 'x' };
     private bool ShouldUseRemoteGrading => useRemoteClassifier && !string.IsNullOrWhiteSpace(remoteClassifierBaseUrl);
+    private bool IsMultiLetterActive => _multiLetterWordRaw.Length > 1 && _multiLetterStatuses.Count > 0;
+    private bool _isFreeDrawingMode = false;
 
     public void ReleaseMemory()
     {
@@ -161,6 +181,7 @@ public class DictationManager : MonoBehaviour
         }
 
         ClearBoardVisuals();
+        ResetMultiLetterState();
 
         if (debugLocalButtonGO)
             debugLocalButtonGO.SetActive(false);
@@ -293,7 +314,8 @@ public class DictationManager : MonoBehaviour
         if (debugLocalBtn) debugLocalBtn.OnButtonPressed += HandleDebugLocalBtn;
         ClearBoardVisuals();
         UpdateUI();
-        TryPlayInitialLetterAudio();
+        if (!_isFreeDrawingMode)
+            TryPlayInitialLetterAudio();
     }
     void OnDisable()
     {
@@ -424,11 +446,13 @@ public class DictationManager : MonoBehaviour
     {
         if (string.IsNullOrEmpty(letter)) return "?";
         string trimmed = letter.Trim();
-        return trimmed.Length > 0 ? trimmed.Substring(0, 1).ToUpperInvariant() : "?";
+        return trimmed.Length > 0 ? trimmed.ToLowerInvariant() : "?";
     }
 
     private void TryPlayInitialLetterAudio()
     {
+        if (_isFreeDrawingMode)
+            return;
         if (_playedInitialAudio)
             return;
         if (!isActiveAndEnabled)
@@ -443,12 +467,419 @@ public class DictationManager : MonoBehaviour
     private void HandleLevelManagerLetterChanged(string newLetter)
     {
         _playedInitialAudio = false;
+        PrepareMultiLetterState();
         if (lvl != null && lvl.currentMode == LevelManager.GameMode.Dictation)
             TryPlayInitialLetterAudio();
     }
 
+    private void ResetMultiLetterState()
+    {
+        CancelMultiLetterFlash();
+        ClearConfirmedStrokes();
+        SetBoardLabelVisible(true);
+        _multiLetterWordRaw = string.Empty;
+        _multiLetterStatuses.Clear();
+        _multiLetterIndex = 0;
+    }
+
+    private void PrepareMultiLetterState()
+    {
+        ResetMultiLetterState();
+
+        _multiLetterWordRaw = lvl != null ? lvl.currentLetter ?? string.Empty : string.Empty;
+        if (string.IsNullOrWhiteSpace(_multiLetterWordRaw))
+        {
+            _multiLetterWordRaw = string.Empty;
+            _multiLetterIndex = 0;
+            return;
+        }
+
+        _multiLetterWordRaw = _multiLetterWordRaw.Trim();
+        for (int i = 0; i < _multiLetterWordRaw.Length; i++)
+        {
+            char ch = _multiLetterWordRaw[i];
+            _multiLetterStatuses.Add(char.IsLetter(ch) ? MultiLetterStatus.Pending : MultiLetterStatus.Correct);
+        }
+
+        _multiLetterIndex = GetNextPendingMultiLetterIndex(0);
+    }
+
+    private void CancelMultiLetterFlash()
+    {
+        if (_multiLetterErrorRoutine != null)
+        {
+            StopCoroutine(_multiLetterErrorRoutine);
+            _multiLetterErrorRoutine = null;
+        }
+    }
+
+    private int GetNextPendingMultiLetterIndex(int startIndex)
+    {
+        if (_multiLetterStatuses.Count == 0)
+            return 0;
+
+        int index = Mathf.Clamp(startIndex, 0, _multiLetterStatuses.Count);
+        while (index < _multiLetterStatuses.Count && _multiLetterStatuses[index] == MultiLetterStatus.Correct)
+            index++;
+        return index;
+    }
+
+    private string GetCurrentMultiLetterTarget()
+    {
+        if (string.IsNullOrEmpty(_multiLetterWordRaw))
+            return lvl != null ? lvl.currentLetter : null;
+
+        if (_multiLetterIndex < 0 || _multiLetterIndex >= _multiLetterWordRaw.Length)
+            return null;
+
+        char ch = _multiLetterWordRaw[_multiLetterIndex];
+        return char.IsLetter(ch) ? ch.ToString() : null;
+    }
+
+    private void MarkCurrentMultiLetterCorrect()
+    {
+        if (_multiLetterIndex >= 0 && _multiLetterIndex < _multiLetterStatuses.Count)
+            _multiLetterStatuses[_multiLetterIndex] = MultiLetterStatus.Correct;
+    }
+
+    private void AdvanceMultiLetterIndex()
+    {
+        _multiLetterIndex = GetNextPendingMultiLetterIndex(_multiLetterIndex + 1);
+    }
+
+    private void SetBoardLabelVisible(bool visible)
+    {
+        if (!boardLabel) return;
+        if (boardLabel.activeSelf != visible)
+            boardLabel.SetActive(visible);
+    }
+
+    private Transform EnsureConfirmedStrokeRoot()
+    {
+        if (_planeDrawer == null)
+            return null;
+
+        if (_confirmedStrokeRoot && _confirmedStrokeRoot.parent == _planeDrawer.transform)
+        {
+            int confirmedLayerExisting = Mathf.Max(0, LayerMask.NameToLayer("Default"));
+            SetLayerRecursive(_confirmedStrokeRoot, confirmedLayerExisting);
+            return _confirmedStrokeRoot;
+        }
+
+        var existing = _planeDrawer.transform.Find("__ConfirmedStrokes");
+        if (existing != null)
+        {
+            _confirmedStrokeRoot = existing;
+        }
+        else
+        {
+            var go = new GameObject("__ConfirmedStrokes");
+            go.transform.SetParent(_planeDrawer.transform, false);
+            _confirmedStrokeRoot = go.transform;
+        }
+
+        int confirmedLayer = Mathf.Max(0, LayerMask.NameToLayer("Default"));
+        SetLayerRecursive(_confirmedStrokeRoot, confirmedLayer);
+        return _confirmedStrokeRoot;
+    }
+
+    private void ClearConfirmedStrokes()
+    {
+        if (_confirmedStrokeRoot == null)
+        {
+            _confirmedStrokeObjects.Clear();
+            return;
+        }
+
+        var children = new List<GameObject>();
+        for (int i = 0; i < _confirmedStrokeRoot.childCount; i++)
+        {
+            var child = _confirmedStrokeRoot.GetChild(i);
+            if (child) children.Add(child.gameObject);
+        }
+
+        foreach (var go in children)
+        {
+            if (Application.isPlaying) Destroy(go);
+            else DestroyImmediate(go);
+        }
+
+        _confirmedStrokeObjects.Clear();
+    }
+
+    private void PreserveCurrentStrokesAsConfirmed()
+    {
+        if (_planeDrawer == null || _planeDrawer.StrokesRoot == null)
+            return;
+
+        var sourceRoot = _planeDrawer.StrokesRoot;
+        if (sourceRoot.childCount == 0)
+            return;
+
+        var targetRoot = EnsureConfirmedStrokeRoot();
+        if (!targetRoot)
+            return;
+
+        for (int i = 0; i < sourceRoot.childCount; i++)
+        {
+            var child = sourceRoot.GetChild(i);
+            if (!child) continue;
+            var clone = Instantiate(child.gameObject, targetRoot, true);
+            clone.name = $"Confirmed_{child.name}_{_confirmedStrokeObjects.Count}";
+            int confirmedLayer = Mathf.Max(0, LayerMask.NameToLayer("Default"));
+            SetLayerRecursive(clone.transform, confirmedLayer);
+            TintStrokeObject(clone, multiLetterCorrectColor);
+            _confirmedStrokeObjects.Add(clone);
+        }
+
+        _planeDrawer.ClearStrokes();
+    }
+
+    private static void TintStrokeObject(GameObject go, Color color)
+    {
+        if (!go) return;
+
+        var lineRenderers = go.GetComponentsInChildren<LineRenderer>(true);
+        foreach (var lr in lineRenderers)
+            ApplyLineRendererColor(lr, color);
+
+        var meshRenderers = go.GetComponentsInChildren<MeshRenderer>(true);
+        foreach (var mr in meshRenderers)
+            ApplyMeshRendererColor(mr, color);
+
+        var particleSystems = go.GetComponentsInChildren<ParticleSystem>(true);
+        foreach (var ps in particleSystems)
+        {
+            if (!ps) continue;
+            ps.Stop(true, ParticleSystemStopBehavior.StopEmittingAndClear);
+            ps.Clear(true);
+        }
+    }
+
+    private static void SetLayerRecursive(Transform root, int layer)
+    {
+        if (!root) return;
+        var stack = new Stack<Transform>();
+        stack.Push(root);
+        while (stack.Count > 0)
+        {
+            var current = stack.Pop();
+            if (!current) continue;
+            current.gameObject.layer = layer;
+            for (int i = 0; i < current.childCount; i++)
+                stack.Push(current.GetChild(i));
+        }
+    }
+
+    private static void ApplyLineRendererColor(LineRenderer lr, Color color)
+    {
+        if (!lr) return;
+        lr.startColor = color;
+        lr.endColor = color;
+        var mat = lr.material;
+        if (mat)
+        {
+            if (mat.HasProperty("_BaseColor"))
+                mat.SetColor("_BaseColor", color);
+            if (mat.HasProperty("_Color"))
+                mat.SetColor("_Color", color);
+        }
+        try
+        {
+            var gradient = new Gradient();
+            gradient.SetKeys(
+                new[] { new GradientColorKey(color, 0f), new GradientColorKey(color, 1f) },
+                new[] { new GradientAlphaKey(color.a, 0f), new GradientAlphaKey(color.a, 1f) });
+            lr.colorGradient = gradient;
+        }
+        catch (Exception) { }
+    }
+
+    private static void ApplyMeshRendererColor(MeshRenderer mr, Color color)
+    {
+        if (!mr) return;
+        var material = Application.isPlaying ? mr.material : mr.sharedMaterial;
+        if (!material) return;
+        if (material.HasProperty("_BaseColor"))
+            material.SetColor("_BaseColor", color);
+        if (material.HasProperty("_Color"))
+            material.SetColor("_Color", color);
+    }
+
+    private string BuildColoredMultiLetterWord(int flashIndex = -1, Color? flashColor = null)
+    {
+        if (string.IsNullOrEmpty(_multiLetterWordRaw))
+            return string.Empty;
+
+        var sb = new StringBuilder(_multiLetterWordRaw.Length * 16);
+        string correctHex = ColorUtility.ToHtmlStringRGB(multiLetterCorrectColor);
+        string pendingHex = ColorUtility.ToHtmlStringRGB(multiLetterPendingColor);
+        string currentHex = ColorUtility.ToHtmlStringRGB(multiLetterCurrentColor);
+        string flashHex = flashColor.HasValue ? ColorUtility.ToHtmlStringRGB(flashColor.Value) : string.Empty;
+        bool hasFlash = flashColor.HasValue && flashIndex >= 0;
+
+        for (int i = 0; i < _multiLetterWordRaw.Length; i++)
+        {
+            char raw = _multiLetterWordRaw[i];
+            if (!char.IsLetter(raw))
+            {
+                sb.Append(raw);
+                continue;
+            }
+
+            string hex;
+            if (hasFlash && i == flashIndex)
+            {
+                hex = flashHex;
+            }
+            else if (_multiLetterStatuses.Count > i && _multiLetterStatuses[i] == MultiLetterStatus.Correct)
+            {
+                hex = correctHex;
+            }
+            else if (i == _multiLetterIndex)
+            {
+                hex = currentHex;
+            }
+            else
+            {
+                hex = pendingHex;
+            }
+
+            sb.Append("<color=#");
+            sb.Append(hex);
+            sb.Append('>');
+            sb.Append(char.ToLowerInvariant(raw));
+            sb.Append("</color>");
+        }
+
+        return sb.ToString();
+    }
+
+    private void UpdateMultiLetterFeedback(string message, int flashIndex = -1, Color? flashColor = null)
+    {
+        if (!feedbackText) return;
+
+        if (!IsMultiLetterActive)
+        {
+            feedbackText.text = message ?? string.Empty;
+            return;
+        }
+
+        var sb = new StringBuilder();
+        if (!string.IsNullOrEmpty(message))
+        {
+            sb.AppendLine(message);
+        }
+
+        string colored = BuildColoredMultiLetterWord(flashIndex, flashColor);
+        if (!string.IsNullOrEmpty(colored))
+            sb.Append(colored);
+
+        feedbackText.text = sb.ToString();
+    }
+
+    private IEnumerator MultiLetterErrorRoutine(string message)
+    {
+        Transform strokesRoot = _planeDrawer != null ? _planeDrawer.StrokesRoot : null;
+        List<LineRenderer> lineRenderers = null;
+        List<MeshRenderer> meshRenderers = null;
+        if (strokesRoot != null)
+        {
+            lineRenderers = new List<LineRenderer>(strokesRoot.GetComponentsInChildren<LineRenderer>());
+            meshRenderers = new List<MeshRenderer>(strokesRoot.GetComponentsInChildren<MeshRenderer>());
+        }
+
+        UpdateMultiLetterFeedback(message, _multiLetterIndex, multiLetterErrorColor);
+
+        if (lineRenderers != null)
+        {
+            foreach (var lr in lineRenderers)
+            {
+                if (lr) ApplyLineRendererColor(lr, multiLetterErrorColor);
+            }
+        }
+
+        if (meshRenderers != null)
+        {
+            foreach (var mr in meshRenderers)
+            {
+                if (mr) ApplyMeshRendererColor(mr, multiLetterErrorColor);
+            }
+        }
+
+        yield return new WaitForSeconds(MultiLetterErrorFlashSeconds);
+
+        UpdateMultiLetterFeedback(message);
+
+        ClearActiveStrokesOnly();
+
+        _multiLetterErrorRoutine = null;
+    }
+
+    private IEnumerator HandleMultiLetterGradeResult(bool correct, string gotRaw, string expectedNormalized)
+    {
+        string expectedTarget = GetCurrentMultiLetterTarget();
+        if (string.IsNullOrEmpty(expectedTarget) && !string.IsNullOrEmpty(expectedNormalized))
+            expectedTarget = expectedNormalized;
+        string expectedDisplay = ToDisplayLetter(expectedTarget);
+        string gotDisplay = ToDisplayLetter(gotRaw);
+
+        if (correct)
+        {
+            MarkCurrentMultiLetterCorrect();
+            PreserveCurrentStrokesAsConfirmed();
+            SetBoardLabelVisible(false);
+
+            AdvanceMultiLetterIndex();
+
+            bool completed = _multiLetterIndex >= _multiLetterStatuses.Count;
+            var audioManager = ResolveAudioManager();
+            if (completed)
+            {
+                audioManager?.PlaySoftCorrectChime();
+                state = State.GradedAccept;
+                UpdateUI();
+                OnDictationGraded?.Invoke(100f);
+                SetFeedback($"Correct! Word '{_multiLetterWordRaw.ToLowerInvariant()}'");
+                yield return new WaitForSeconds(waitAfterCorrect);
+                Advance();
+                yield break;
+            }
+
+            audioManager?.PlaySoftCorrectChime();
+            state = State.Drawing;
+            UpdateUI();
+            _autoGradeTriggeredForStroke = false;
+            _autoGradeRunning = false;
+            _lastStrokeCount = 0;
+            _lastStrokeChangeTime = Time.time;
+
+            SetFeedback($"Correct! Next letter (saw '{gotDisplay}').");
+            if (TryPlayCurrentLetterAudio())
+                _playedInitialAudio = true;
+            yield break;
+        }
+
+        ResolveAudioManager()?.PlaySoftIncorrectChime();
+        state = State.Drawing;
+        UpdateUI();
+        _autoGradeTriggeredForStroke = false;
+        _autoGradeRunning = false;
+        _lastStrokeCount = 0;
+        _lastStrokeChangeTime = Time.time;
+
+        string message = $"Not yet. Try '{expectedDisplay}' again.";
+        SetFeedback(message);
+        if (_multiLetterErrorRoutine != null)
+            StopCoroutine(_multiLetterErrorRoutine);
+        _multiLetterErrorRoutine = StartCoroutine(MultiLetterErrorRoutine(message));
+        yield break;
+    }
+
     private bool TryPlayCurrentLetterAudio()
     {
+        if (_isFreeDrawingMode)
+            return false;
         var manager = ResolveAudioManager();
         if (manager == null)
         {
@@ -456,16 +887,20 @@ public class DictationManager : MonoBehaviour
             return false;
         }
 
-        char letter = ExtractFirstAsciiLetter(lvl != null ? lvl.currentLetter : null);
+        string target = GetCurrentMultiLetterTarget();
+        if (string.IsNullOrEmpty(target))
+            target = lvl != null ? lvl.currentLetter : null;
+
+        char letter = ExtractFirstAsciiLetter(target);
         if (letter != '\0')
         {
             if (manager.TryPlayLetterPronunciation(letter))
             {
-                Debug.Log($"[Dictation] Played pronunciation for letter '{char.ToUpperInvariant(letter)}'.");
+                Debug.Log($"[Dictation] Played pronunciation for letter '{char.ToLowerInvariant(letter)}'.");
                 return true;
             }
 
-            Debug.LogWarning($"[Dictation] Primary audio failed for letter '{char.ToUpperInvariant(letter)}'; attempting fallback.");
+            Debug.LogWarning($"[Dictation] Primary audio failed for letter '{char.ToLowerInvariant(letter)}'; attempting fallback.");
             bool fallback = manager.TryPlayCurrentLetterPronunciation();
             Debug.Log(fallback
                 ? "[Dictation] Fallback pronunciation succeeded."
@@ -503,7 +938,7 @@ public class DictationManager : MonoBehaviour
 
     private bool RequiresTwoStrokeLetter()
     {
-        string normalized = NormalizeAsciiStrict(lvl != null ? lvl.currentLetter : null);
+        string normalized = NormalizeAsciiStrict(GetCurrentMultiLetterTarget());
         if (string.IsNullOrEmpty(normalized))
             return false;
         return LettersRequiringTwoStrokes.Contains(normalized[0]);
@@ -554,7 +989,7 @@ public class DictationManager : MonoBehaviour
     {
         if (lvl != null && drawerHost != null)
         {
-            bool shouldBeOn = (lvl.currentMode == LevelManager.GameMode.Dictation);
+            bool shouldBeOn = (lvl.currentMode == LevelManager.GameMode.Dictation || lvl.currentMode == LevelManager.GameMode.FreeDrawing);
             if (_lastDrawerActive != shouldBeOn)
             {
                 drawerHost.SetActive(shouldBeOn);
@@ -567,6 +1002,8 @@ public class DictationManager : MonoBehaviour
 
     private void AutoGradeUpdate()
     {
+        if (_isFreeDrawingMode)
+            return;
         if (!autoGradeOnIdle || _planeDrawer == null || _planeDrawer.StrokesRoot == null || state != State.Drawing)
             return;
 
@@ -609,28 +1046,28 @@ public class DictationManager : MonoBehaviour
     // ===== Public hooks =====
     public void PrepareForMode(LevelManager.GameMode mode)
     {
-        bool isDict = (mode == LevelManager.GameMode.Dictation);
-        if (drawerHost) drawerHost.SetActive(isDict);
+        bool isDict = mode == LevelManager.GameMode.Dictation;
+        bool isFree = mode == LevelManager.GameMode.FreeDrawing;
+        bool isDictLike = isDict || isFree;
 
-        // Clear visuals when leaving Dictation mode OR when entering Dictation mode
-        if (_hasLastMode && _lastNotifiedMode == LevelManager.GameMode.Dictation && mode != LevelManager.GameMode.Dictation)
+        _isFreeDrawingMode = isFree;
+
+        if (drawerHost) drawerHost.SetActive(isDictLike);
+
+        bool wasDictLike = _hasLastMode && (_lastNotifiedMode == LevelManager.GameMode.Dictation || _lastNotifiedMode == LevelManager.GameMode.FreeDrawing);
+        if (wasDictLike && !isDictLike)
             ClearBoardVisuals();
-        else if (isDict)
-            ClearBoardVisuals(); // Clear any existing visuals when entering Dictation mode
+        else if (isDictLike)
+            ClearBoardVisuals();
 
         _lastNotifiedMode = mode;
         _hasLastMode = true;
 
         if (tmpLetter != null)
-        {
-            if (isDict)
-                tmpLetter.SetActive(false);
-            else
-                tmpLetter.SetActive(true);
-        }
+            tmpLetter.SetActive(!isDictLike);
 
         UpdateUI();
-        if (!isDict) SetFeedback("");
+        if (!isDictLike) SetFeedback("");
     }
 
     public void StartDictation()
@@ -656,12 +1093,25 @@ public class DictationManager : MonoBehaviour
 
         if (tmpLetter != null) tmpLetter.SetActive(false);
 
+        PrepareMultiLetterState();
+
         state = State.Drawing;
         UpdateUI();
-        string displayLetter = ToDisplayLetter(lvl.currentLetter);
-        SetFeedback(displayLetter != "?" ? $"Write '{displayLetter}'" : "Write the letter");
+        if (_isFreeDrawingMode)
+        {
+            SetFeedback("Free draw mode");
+        }
+        else
+        {
+            string displayLetter = ToDisplayLetter(lvl.currentLetter);
+            if (IsMultiLetterActive)
+                SetFeedback("Write the word");
+            else
+                SetFeedback(displayLetter != "?" ? $"Write '{displayLetter}'" : "Write the letter");
+        }
+
         OnDictationStart?.Invoke();
-        if (TryPlayCurrentLetterAudio())
+        if (!_isFreeDrawingMode && TryPlayCurrentLetterAudio())
             _playedInitialAudio = true;
         ClearBoardVisuals();
     }
@@ -669,19 +1119,26 @@ public class DictationManager : MonoBehaviour
     // ===== Buttons =====
     private void HandleGradeBtn()
     {
+        if (_isFreeDrawingMode)
+        {
+            SetFeedback("Grading disabled in free draw");
+            return;
+        }
         if (state == State.Drawing)
             StartCoroutine(GradeFlow());
     }
 
     private void HandleEraseBtn()
     {
-        ClearBoardVisuals();
+        ClearActiveStrokesOnly();
         SetFeedback("Board cleared");
     }
 
     
     private void HandleRepeatBtn()
     {
+        if (_isFreeDrawingMode)
+            return;
         if (!isActiveAndEnabled)
             return;
         PlayRepeatAudio();
@@ -689,6 +1146,7 @@ public class DictationManager : MonoBehaviour
 
     private void PlayRepeatAudio()
     {
+        if (_isFreeDrawingMode) return;
         if (!isActiveAndEnabled) return;
 
         char letter = ExtractFirstAsciiLetter(lvl != null ? lvl.currentLetter : null);
@@ -697,8 +1155,8 @@ public class DictationManager : MonoBehaviour
         if (letter != '\0')
         {
             SetFeedback(played
-                ? $"Listen: '{char.ToUpperInvariant(letter)}'"
-                : $"Letter: '{char.ToUpperInvariant(letter)}'");
+                ? $"Listen: '{char.ToLowerInvariant(letter)}'"
+                : $"Letter: '{char.ToLowerInvariant(letter)}'");
         }
         else if (!played)
         {
@@ -833,6 +1291,8 @@ public class DictationManager : MonoBehaviour
         bool acceptTop1 = topCorrect && topConfidence >= requiredTopConfidence;
         bool acceptTop2 = hasMatch && matchCorrect && matchRank <= 1 && matchConfidence >= requiredSecondConfidence;
         bool shouldForceWrong = !topCorrect && topConfidence >= wrongConfidenceThreshold && (!hasMatch || !matchCorrect || matchConfidence < requiredSecondConfidence);
+        if (shouldForceWrong && ShouldSuppressAmbiguousWrong(expectedNormalized, topNormalized))
+            shouldForceWrong = false;
 
         if (acceptTop2 && hasMatch && matchCorrect && matchRank <= 1)
         {
@@ -1045,6 +1505,12 @@ public class DictationManager : MonoBehaviour
     // ===== Flow =====
     private IEnumerator GradeFlow()
     {
+        if (_isFreeDrawingMode)
+        {
+            SetFeedback("Grading disabled in free draw");
+            UpdateUI();
+            yield break;
+        }
         if (gradingButtonGO) gradingButtonGO.SetActive(false);
         if (eraseButtonGO)   eraseButtonGO.SetActive(false);
 
@@ -1127,8 +1593,11 @@ public class DictationManager : MonoBehaviour
 
         Destroy(snap);
 
-        string expected = NormalizeAsciiStrict(lvl != null ? lvl.currentLetter : null);
-        string targetLetter = lvl?.currentLetter ?? "?";
+        string evaluationTarget = GetCurrentMultiLetterTarget();
+        if (string.IsNullOrEmpty(evaluationTarget))
+            evaluationTarget = lvl != null ? lvl.currentLetter : null;
+        string expected = NormalizeAsciiStrict(evaluationTarget);
+        string targetLetter = evaluationTarget ?? "?";
         string displayTargetLetter = ToDisplayLetter(targetLetter);
         string gotRaw;
         string gotNormalized;
@@ -1202,6 +1671,12 @@ public class DictationManager : MonoBehaviour
             state = State.Drawing;
             UpdateUI();
             SetFeedback("Looks like a stray mark. Erase it or keep writing.");
+            yield break;
+        }
+
+        if (IsMultiLetterActive)
+        {
+            yield return HandleMultiLetterGradeResult(correct, gotRaw, expected);
             yield break;
         }
 
@@ -1291,6 +1766,12 @@ public class DictationManager : MonoBehaviour
             _autoGradeTriggeredForStroke = false;
             yield break;
         }
+        if (_isFreeDrawingMode)
+        {
+            _autoGradeRunning = false;
+            _autoGradeTriggeredForStroke = false;
+            yield break;
+        }
 
         bool canRemote = ShouldUseRemoteGrading;
         bool canLocal = false;
@@ -1349,7 +1830,10 @@ public class DictationManager : MonoBehaviour
                 yield break;
             }
 
-            string expectedRemote = NormalizeAsciiStrict(lvl != null ? lvl.currentLetter : null);
+            string remoteTarget = GetCurrentMultiLetterTarget();
+            if (string.IsNullOrEmpty(remoteTarget))
+                remoteTarget = lvl != null ? lvl.currentLetter : null;
+            string expectedRemote = NormalizeAsciiStrict(remoteTarget);
             var remoteEval = EvaluateLocalPrediction(remotePrediction, expectedRemote);
             bool hasAnyWriting = remoteEval.HasWriting;
 
@@ -1376,17 +1860,30 @@ public class DictationManager : MonoBehaviour
             bool acceptTop1 = topCorrect && topConfidence >= requiredTopConfidence;
             bool acceptTop2 = hasMatch && matchCorrect && matchRank <= 1 && matchConfidence >= requiredSecondConfidence;
             bool shouldForceWrong = !topCorrect && topConfidence >= wrongConfidenceThreshold && (!hasMatch || !matchCorrect || matchConfidence < requiredSecondConfidence);
+            if (shouldForceWrong && ShouldSuppressAmbiguousWrong(expectedRemote, remoteEval.Top1Normalized))
+                shouldForceWrong = false;
 
             DebugCodepoint("[Auto][Remote] RAW", remotePrediction.TopLetter ?? string.Empty);
             Debug.Log($"[Dictation][AutoGrade] REMOTE top1='{remoteEval.Top1Normalized}' expected='{expectedRemote}' confTop1={topConfidence:F3} matchRank={matchRank} matchConf={matchConfidence:F3} strokes={_lastObservedStrokeTotal}");
 
             if ((acceptTop1 || acceptTop2) && hasEnoughStrokes)
             {
+                if (IsMultiLetterActive)
+                {
+                    string rawCandidate = acceptTop2 && hasMatch && matchCorrect && matchRank <= 1
+                        ? (remoteEval.Raw ?? remotePrediction.TopLetter ?? string.Empty)
+                        : (remotePrediction.TopLetter ?? string.Empty);
+                    yield return HandleMultiLetterGradeResult(true, rawCandidate, expectedRemote);
+                    _lastStrokeChangeTime = Time.time;
+                    _autoGradeRunning = false;
+                    _autoGradeTriggeredForStroke = false;
+                    yield break;
+                }
+
                 state = State.GradedAccept;
                 UpdateUI();
                 OnDictationGraded?.Invoke(100f);
                 OnLetterCorrect?.Invoke();
-
                 string display;
                 float displayConfidence;
                 if (acceptTop2 && hasMatch && matchCorrect && matchRank <= 1)
@@ -1408,6 +1905,16 @@ public class DictationManager : MonoBehaviour
             else if (shouldForceWrong && (hasEnoughStrokes || allowEarlyWrongCheck))
             {
                 string display = ToDisplayLetter(string.IsNullOrEmpty(remotePrediction.TopLetter) ? expectedRemote : remotePrediction.TopLetter);
+
+                if (IsMultiLetterActive)
+                {
+                    string rawCandidate = remotePrediction.TopLetter ?? string.Empty;
+                    yield return HandleMultiLetterGradeResult(false, rawCandidate, expectedRemote);
+                    _lastStrokeChangeTime = Time.time;
+                    _autoGradeRunning = false;
+                    _autoGradeTriggeredForStroke = false;
+                    yield break;
+                }
 
                 if (attemptCount <= 0)
                 {
@@ -1555,6 +2062,7 @@ public class DictationManager : MonoBehaviour
     {
         state = State.Idle;
         UpdateUI();
+        ResetMultiLetterState();
         SetFeedback("");
 
         if (!suppressTmpOnAdvance && tmpLetter != null) tmpLetter.SetActive(true);
@@ -1566,19 +2074,28 @@ public class DictationManager : MonoBehaviour
     // ===== UI helpers =====
     private void UpdateUI()
     {
-        bool inDict = (lvl != null && lvl.currentMode == LevelManager.GameMode.Dictation);
+        bool inDictLike = (lvl != null && (lvl.currentMode == LevelManager.GameMode.Dictation || lvl.currentMode == LevelManager.GameMode.FreeDrawing));
         bool canDraw = (state == State.Drawing);
 
-        if (gradingButtonGO) gradingButtonGO.SetActive(inDict && canDraw);
-        if (eraseButtonGO)   eraseButtonGO.SetActive(inDict && canDraw);
-        if (repeatButtonGO)  repeatButtonGO.SetActive(inDict);
-        if (debugLocalButtonGO) debugLocalButtonGO.SetActive(inDict && localClassifier != null && localClassifier.HasModelAsset);
-        if (feedbackText)    feedbackText.gameObject.SetActive(inDict);
+        bool allowGrade = inDictLike && !_isFreeDrawingMode && canDraw;
+        bool allowErase = inDictLike && canDraw;
+        bool showRepeat = inDictLike && !_isFreeDrawingMode;
+        bool showDebugLocal = inDictLike && !_isFreeDrawingMode && localClassifier != null && localClassifier.HasModelAsset;
+
+        if (gradingButtonGO) gradingButtonGO.SetActive(allowGrade);
+        if (eraseButtonGO)   eraseButtonGO.SetActive(allowErase);
+        if (repeatButtonGO)  repeatButtonGO.SetActive(showRepeat);
+        if (debugLocalButtonGO) debugLocalButtonGO.SetActive(showDebugLocal);
+        if (feedbackText)    feedbackText.gameObject.SetActive(inDictLike);
     }
 
     private void SetFeedback(string msg)
     {
-        if (feedbackText) feedbackText.text = msg ?? "";
+        if (!feedbackText) return;
+        if (IsMultiLetterActive)
+            UpdateMultiLetterFeedback(msg);
+        else
+            feedbackText.text = msg ?? "";
     }
 
     private IEnumerator ShowReplayPrompt(string letter)
@@ -1637,12 +2154,15 @@ public class DictationManager : MonoBehaviour
     }
 
     // ===== Board ops =====
-    private void ClearBoardVisuals()
+    private void ClearActiveStrokesOnly()
     {
-        if (canvas != null) canvas.ClearVisualization();
-        if (_planeDrawer != null) _planeDrawer.ClearStrokes();
-        HideReplayPrompt();
+        if (_planeDrawer != null)
+            _planeDrawer.ClearStrokes();
+        ResetStrokeTracking();
+    }
 
+    private void ResetStrokeTracking()
+    {
         _autoGradeTriggeredForStroke = false;
         _autoGradeRunning = false;
         _lastStrokeCount = 0;
@@ -1650,6 +2170,17 @@ public class DictationManager : MonoBehaviour
         _lastObservedStrokeTotal = 0;
         _rightHandState = HandState.Idle;
         _leftHandState = HandState.Idle;
+    }
+
+    private void ClearBoardVisuals()
+    {
+        if (canvas != null) canvas.ClearVisualization();
+        if (_planeDrawer != null) _planeDrawer.ClearStrokes();
+        ClearConfirmedStrokes();
+        SetBoardLabelVisible(true);
+        HideReplayPrompt();
+
+        ResetStrokeTracking();
 
         // Also clear VisualEffectManager visuals (spheres, cylinders, etc.)
         var visualEffectManager = GetComponent<VisualEffectManager>();
@@ -2037,11 +2568,166 @@ public class DictationManager : MonoBehaviour
         // aspect mismatch will letterbox in the RT
     }
 
+    private bool TryGetRendererCameraBounds(Camera cam, Renderer target, Matrix4x4 w2c, out Vector2 min, out Vector2 max, out float centerZ)
+    {
+        min = new Vector2(float.PositiveInfinity, float.PositiveInfinity);
+        max = new Vector2(float.NegativeInfinity, float.NegativeInfinity);
+        centerZ = 0f;
+
+        if (!cam || !target) return false;
+
+        Bounds b = target.bounds;
+        Vector3 c = b.center; Vector3 e = b.extents;
+
+        Vector3[] corners = new Vector3[8];
+        corners[0] = c + new Vector3(-e.x, -e.y, -e.z);
+        corners[1] = c + new Vector3( e.x, -e.y, -e.z);
+        corners[2] = c + new Vector3(-e.x,  e.y, -e.z);
+        corners[3] = c + new Vector3( e.x,  e.y, -e.z);
+        corners[4] = c + new Vector3(-e.x, -e.y,  e.z);
+        corners[5] = c + new Vector3( e.x, -e.y,  e.z);
+        corners[6] = c + new Vector3(-e.x,  e.y,  e.z);
+        corners[7] = c + new Vector3( e.x,  e.y,  e.z);
+
+        float minZ = float.PositiveInfinity, maxZ = float.NegativeInfinity;
+
+        for (int i = 0; i < 8; i++)
+        {
+            Vector3 v = w2c.MultiplyPoint(corners[i]);
+            if (v.x < min.x) min.x = v.x;
+            if (v.y < min.y) min.y = v.y;
+            if (v.x > max.x) max.x = v.x;
+            if (v.y > max.y) max.y = v.y;
+            if (v.z < minZ) minZ = v.z;
+            if (v.z > maxZ) maxZ = v.z;
+        }
+
+        if (float.IsPositiveInfinity(min.x) || float.IsPositiveInfinity(min.y) ||
+            float.IsNegativeInfinity(max.x) || float.IsNegativeInfinity(max.y))
+            return false;
+
+        centerZ = (minZ + maxZ) * 0.5f;
+        return true;
+    }
+
+    private bool TryFrameCameraToStrokes(Camera cam, Renderer board, float paddingFraction, float minPadding)
+    {
+        if (!cam) return false;
+
+        Transform strokesRoot = _planeDrawer != null ? _planeDrawer.StrokesRoot : null;
+        if (strokesRoot == null) return false;
+
+        var lineRenderers = strokesRoot.GetComponentsInChildren<LineRenderer>(true);
+        if (lineRenderers == null || lineRenderers.Length == 0) return false;
+
+        int captureMask = boardLayer.value;
+        bool restrictToLayer = captureMask != 0;
+
+        Matrix4x4 w2c = cam.worldToCameraMatrix;
+        Vector2 minXY = new Vector2(float.PositiveInfinity, float.PositiveInfinity);
+        Vector2 maxXY = new Vector2(float.NegativeInfinity, float.NegativeInfinity);
+        float minZ = float.PositiveInfinity, maxZ = float.NegativeInfinity;
+        bool hasPoints = false;
+
+        foreach (var line in lineRenderers)
+        {
+            if (!line) continue;
+            if (!line.enabled || !line.gameObject.activeInHierarchy) continue;
+            if (restrictToLayer)
+            {
+                if (((1 << line.gameObject.layer) & captureMask) == 0)
+                    continue;
+            }
+            int count = line.positionCount;
+            if (count <= 0) continue;
+
+            Transform lt = line.transform;
+            for (int i = 0; i < count; i++)
+            {
+                Vector3 world = lt.TransformPoint(line.GetPosition(i));
+                Vector3 camSpace = w2c.MultiplyPoint(world);
+
+                if (!hasPoints)
+                {
+                    minXY = new Vector2(camSpace.x, camSpace.y);
+                    maxXY = new Vector2(camSpace.x, camSpace.y);
+                    minZ = maxZ = camSpace.z;
+                    hasPoints = true;
+                }
+                else
+                {
+                    if (camSpace.x < minXY.x) minXY.x = camSpace.x;
+                    if (camSpace.y < minXY.y) minXY.y = camSpace.y;
+                    if (camSpace.x > maxXY.x) maxXY.x = camSpace.x;
+                    if (camSpace.y > maxXY.y) maxXY.y = camSpace.y;
+                    if (camSpace.z < minZ) minZ = camSpace.z;
+                    if (camSpace.z > maxZ) maxZ = camSpace.z;
+                }
+            }
+        }
+
+        if (!hasPoints) return false;
+
+        Vector2 boardMin = Vector2.zero;
+        Vector2 boardMax = Vector2.zero;
+        float boardCenterZ = 0f;
+        bool hasBoardBounds = board != null &&
+                              TryGetRendererCameraBounds(cam, board, w2c, out boardMin, out boardMax, out boardCenterZ);
+
+        float width = maxXY.x - minXY.x;
+        float height = maxXY.y - minXY.y;
+
+        if (width <= 1e-4f) width = Mathf.Max(height, 1e-3f);
+        if (height <= 1e-4f) height = Mathf.Max(width, 1e-3f);
+
+        float padX = Mathf.Max(width * paddingFraction, minPadding);
+        float padY = Mathf.Max(height * paddingFraction, minPadding);
+
+        minXY.x -= padX;
+        minXY.y -= padY;
+        maxXY.x += padX;
+        maxXY.y += padY;
+
+        if (hasBoardBounds)
+        {
+            if (minXY.x < boardMin.x) minXY.x = boardMin.x;
+            if (minXY.y < boardMin.y) minXY.y = boardMin.y;
+            if (maxXY.x > boardMax.x) maxXY.x = boardMax.x;
+            if (maxXY.y > boardMax.y) maxXY.y = boardMax.y;
+
+            if (minXY.x > maxXY.x || minXY.y > maxXY.y)
+            {
+                minXY = boardMin;
+                maxXY = boardMax;
+            }
+        }
+
+        float sizeX = Mathf.Max(maxXY.x - minXY.x, 1e-3f);
+        float sizeY = Mathf.Max(maxXY.y - minXY.y, 1e-3f);
+
+        float halfHeight = sizeY * 0.5f;
+        float halfWidth = sizeX * 0.5f;
+        float newOrtho = Mathf.Max(halfHeight, halfWidth / Mathf.Max(0.01f, cam.aspect));
+
+        cam.orthographic = true;
+        cam.orthographicSize = newOrtho;
+
+        Vector3 centerCam = new Vector3((minXY.x + maxXY.x) * 0.5f,
+                                        (minXY.y + maxXY.y) * 0.5f,
+                                        hasBoardBounds ? boardCenterZ : (minZ + maxZ) * 0.5f);
+
+        Vector3 centerWorld = cam.cameraToWorldMatrix.MultiplyPoint(centerCam);
+        cam.transform.position = centerWorld;
+
+        return true;
+    }
+
     private IEnumerator CaptureBoardExactCo(Action<Texture2D> done)
     {
         if (!boardCamera) { done?.Invoke(null); yield break; }
 
-        if (boardRenderer != null)
+        bool framedStrokes = TryFrameCameraToStrokes(boardCamera, boardRenderer, strokeFramePaddingFraction, strokeFrameMinimumPadding);
+        if (!framedStrokes && boardRenderer != null)
             FitOrthoToRenderer(boardCamera, boardRenderer, 1.02f);
 
         int w = Mathf.Max(64, captureWidth);
@@ -2418,6 +3104,19 @@ public class DictationManager : MonoBehaviour
         ['\u039C'] = 'm', ['\u039D'] = 'n', ['\u039F'] = 'o', ['\u03A1'] = 'p', ['\u03A4'] = 't', ['\u03A5'] = 'y', ['\u03A7'] = 'x', ['\u039B'] = 'l',
     };
 
+    private static bool ShouldSuppressAmbiguousWrong(string expectedNormalized, string predictedNormalized)
+    {
+        if (string.IsNullOrEmpty(expectedNormalized) || string.IsNullOrEmpty(predictedNormalized))
+            return false;
+
+        char expected = char.ToLowerInvariant(expectedNormalized[0]);
+        if (!LettersRequiringTwoStrokes.Contains(expected))
+            return false;
+
+        char predicted = char.ToLowerInvariant(predictedNormalized[0]);
+        return predicted == 'i' || predicted == 'l';
+    }
+
     private static string NormalizeAsciiStrict(string s)
     {
         if (string.IsNullOrEmpty(s)) return "";
@@ -2571,3 +3270,4 @@ private static class PemKeyUtil
     }
 }
 }
+

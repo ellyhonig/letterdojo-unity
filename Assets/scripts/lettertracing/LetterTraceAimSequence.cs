@@ -40,6 +40,14 @@ public class LetterTraceAimSequence : MonoBehaviour
     [SerializeField] private bool useControllerLaserOrigin = true;
     [SerializeField, Range(1f, 3f)] private float hitRadiusMultiplier = 1.4f;
 
+    private const float AutoAimBendWeight = 0.95f;
+    private const float AutoAimCompletionRadiusMultiplier = 1.2f;
+    private const float AutoAimAlignmentThreshold = 0.70f;
+    private const float AutoAimReleaseThreshold = -0.60f;
+    private const float AutoAimReleaseGraceSeconds = 0.35f;
+    private const float AutoAdvanceCompletionFraction = 0.6f;
+    private const float AutoAdvanceMinimumDistance = 0.015f;
+
     [Header("Generated Markers")]
     [SerializeField] private GameObject markerPrefab;
     [SerializeField] private Material markerMaterialOverride;
@@ -85,6 +93,20 @@ public class LetterTraceAimSequence : MonoBehaviour
     private Vector3 lagTip;
     private Vector3 lagVelocity;
     private bool hasLag;
+    private bool autoAimActive;
+    private Vector3 autoAimCurrentTarget;
+    private float autoAimCurrentRadius;
+    private bool autoAimLatched;
+    private bool hasLatestControllerPos;
+    private Vector3 latestControllerPos;
+    private bool autoAdvanceHasTarget;
+    private Vector3 autoAdvanceDirection;
+    private float autoAdvanceSegmentLength;
+    private float autoAdvanceProgress;
+    private float autoAdvanceTargetDistance;
+    private Vector3 autoAdvanceStartWorld;
+    private bool hasHitCurrentDot;
+    private float autoAimReleaseTimer;
     private Transform cachedMarkerParent;
     private Transform activePlaneTransform;
     private Vector3 activePlaneNormal = Vector3.up;
@@ -343,15 +365,14 @@ private class PointState
             return;
         }
 
-        PointState state = points[currentIndex];
-        if (state == null)
+        if (points[currentIndex] == null)
         {
             return;
         }
 
-        if (TryGetSphereHit(state, origin, direction, out _))
+        if (hasLatestControllerPos && ProcessAutoAdvance(latestControllerPos))
         {
-            CompleteCurrentPoint();
+            return;
         }
     }
 
@@ -837,6 +858,16 @@ private class PointState
         currentIndex = 0;
         laserEnabled = false;
         ResetLaser();
+        autoAdvanceHasTarget = false;
+        autoAdvanceDirection = Vector3.zero;
+        autoAdvanceSegmentLength = 0f;
+        autoAdvanceProgress = 0f;
+        autoAdvanceTargetDistance = 0f;
+        hasLatestControllerPos = false;
+        autoAdvanceStartWorld = Vector3.zero;
+        autoAimLatched = false;
+        hasHitCurrentDot = false;
+        autoAimReleaseTimer = 0f;
 
         ReleaseCylinders();
         RecyclePointStates(keepVisible: visualsVisible);
@@ -863,6 +894,16 @@ private class PointState
             currentIndex = 0;
             cachedMarkerBaseScale = -1f;
             cachedAnchorHash = 0;
+            autoAdvanceHasTarget = false;
+            autoAdvanceDirection = Vector3.zero;
+            autoAdvanceSegmentLength = 0f;
+            autoAdvanceProgress = 0f;
+            autoAdvanceTargetDistance = 0f;
+            hasLatestControllerPos = false;
+            autoAdvanceStartWorld = Vector3.zero;
+            autoAimLatched = false;
+            hasHitCurrentDot = false;
+            autoAimReleaseTimer = 0f;
             return;
         }
 
@@ -884,6 +925,120 @@ private class PointState
         }
 
         ApplyVisual(points[currentIndex], activeColor, hitDotScaleMultiplier);
+        PrepareAutoAdvanceForCurrentPoint();
+        MaybeAutoCompleteTerminalPoint();
+    }
+
+    private void PrepareAutoAdvanceForCurrentPoint()
+    {
+        autoAdvanceProgress = 0f;
+        autoAdvanceDirection = Vector3.zero;
+        autoAdvanceSegmentLength = 0f;
+        autoAdvanceTargetDistance = 0f;
+        autoAdvanceHasTarget = false;
+        autoAdvanceStartWorld = Vector3.zero;
+
+        if (!IsValidPointIndex(currentIndex))
+        {
+            return;
+        }
+
+        int nextIndex = currentIndex + 1;
+        if (!IsValidPointIndex(nextIndex))
+        {
+            return;
+        }
+
+        PointState currentState = points[currentIndex];
+        PointState nextState = points[nextIndex];
+        if (currentState == null || nextState == null)
+        {
+            return;
+        }
+
+        Vector3 currentWorld = GetStateWorldPosition(currentState);
+        Vector3 nextWorld = GetStateWorldPosition(nextState);
+        Vector3 segment = nextWorld - currentWorld;
+        float length = segment.magnitude;
+        if (length <= 1e-5f)
+        {
+            autoAdvanceHasTarget = false;
+            autoAdvanceDirection = Vector3.zero;
+            autoAdvanceSegmentLength = 0f;
+            autoAdvanceTargetDistance = 0f;
+            CompleteCurrentPoint();
+            return;
+        }
+
+        autoAdvanceDirection = segment / length;
+        autoAdvanceSegmentLength = length;
+        float fraction = AutoAdvanceCompletionFraction;
+        float fractionalTarget = Mathf.Max(0f, length * fraction);
+        float minTarget = AutoAdvanceMinimumDistance;
+        float baseTarget = Mathf.Max(minTarget, fractionalTarget);
+        autoAdvanceTargetDistance = Mathf.Clamp(baseTarget, minTarget, length);
+        autoAdvanceStartWorld = currentWorld;
+        autoAdvanceHasTarget = true;
+        hasHitCurrentDot = autoAimLatched;
+        autoAimReleaseTimer = 0f;
+    }
+
+    private void MaybeAutoCompleteTerminalPoint()
+    {
+        if (autoAdvanceHasTarget)
+        {
+            return;
+        }
+
+        if (!IsValidPointIndex(currentIndex))
+        {
+            return;
+        }
+
+        if (currentIndex == points.Count - 1)
+        {
+            CompleteCurrentPoint();
+        }
+    }
+
+    private bool ProcessAutoAdvance(Vector3 controllerPosition)
+    {
+        if (!autoAdvanceHasTarget)
+        {
+            return false;
+        }
+
+        if (autoAdvanceSegmentLength <= 1e-5f)
+        {
+            CompleteCurrentPoint();
+            return true;
+        }
+
+        if (!hasHitCurrentDot)
+        {
+            return false;
+        }
+
+        Vector3 controllerOnPlane = ProjectOntoActivePlane(controllerPosition);
+        Vector3 offset = controllerOnPlane - autoAdvanceStartWorld;
+        if (offset.sqrMagnitude <= 1e-8f)
+        {
+            return false;
+        }
+
+        float along = Vector3.Dot(offset, autoAdvanceDirection);
+        along = Mathf.Clamp(along, 0f, autoAdvanceSegmentLength);
+
+        autoAdvanceProgress = Mathf.Max(autoAdvanceProgress, along);
+
+        float target = Mathf.Max(1e-5f, autoAdvanceTargetDistance);
+        if (autoAdvanceProgress >= target)
+        {
+            CompleteCurrentPoint();
+            return true;
+        }
+
+        return false;
     }
 
     private void CompleteCurrentPoint()
@@ -898,6 +1053,11 @@ private class PointState
         {
             return;
         }
+
+        autoAdvanceHasTarget = false;
+        autoAdvanceProgress = 0f;
+        hasHitCurrentDot = autoAimLatched;
+        autoAimReleaseTimer = 0f;
 
         if (logSequenceEvents)
         {
@@ -1030,6 +1190,7 @@ anchors.Count)
     {
         origin = Vector3.zero;
         direction = Vector3.forward;
+        hasLatestControllerPos = false;
 
         if (player == null)
         {
@@ -1060,15 +1221,19 @@ anchors.Count)
         float threshold = Mathf.Max(0f, extendDistanceThreshold);
         if (distance < Mathf.Max(threshold, 1e-5f))
         {
+            hasLatestControllerPos = false;
             return false;
         }
+
+        latestControllerPos = controller.position;
+        hasLatestControllerPos = true;
 
         origin = useControllerLaserOrigin ? controller.position : loweredOrigin;
         direction = toController / distance;
         return true;
     }
 
-    private bool TryGetSphereHit(PointState state, Vector3 origin, Vector3 direction, out float hitDistance)
+    private bool TryGetSphereHit(PointState state, Vector3 origin, Vector3 direction, out float hitDistance, float radiusMultiplier = 1f)
     {
         hitDistance = 0f;
         if (state == null)
@@ -1077,7 +1242,7 @@ anchors.Count)
         }
 
         Vector3 center = GetStateWorldPosition(state);
-        float radius = GetPointRadius(state);
+        float radius = GetPointRadius(state) * Mathf.Max(0.0001f, radiusMultiplier);
 
         Vector3 oc = origin - center;
         float b = Vector3.Dot(oc, direction);
@@ -1148,11 +1313,80 @@ pathRenderer.MarkerBaseScale);
 
         EnsureLaser();
 
+        autoAimActive = false;
+        autoAimCurrentTarget = Vector3.zero;
+        autoAimCurrentRadius = 0f;
+
         Vector3 desiredTip = origin + direction * laserLength;
-        if (TryGetCurrentTarget(out PointState state, out _, out _) && TryGetSphereHit(state, origin, direction, out
-float distance))
+        PointState state;
+        if (TryGetCurrentTarget(out state, out Vector3 targetCenter, out float targetRadius))
         {
-            desiredTip = origin + direction * distance;
+            bool hit = TryGetSphereHit(state, origin, direction, out float distance);
+
+            Vector3 dirNorm = direction;
+            float dirMag = dirNorm.magnitude;
+            if (dirMag > 1e-5f) dirNorm /= dirMag;
+            else dirNorm = Vector3.forward;
+
+            Vector3 toTarget = targetCenter - origin;
+            float toTargetMag = toTarget.magnitude;
+            bool alignmentValid = toTargetMag > 1e-5f;
+            float alignment = alignmentValid ? Vector3.Dot(dirNorm, toTarget.normalized) : -1f;
+
+            if (!autoAimLatched && hit && alignmentValid && alignment >= AutoAimAlignmentThreshold)
+            {
+                autoAimLatched = true;
+                hasHitCurrentDot = true;
+                autoAimReleaseTimer = 0f;
+            }
+
+            if (autoAimLatched)
+            {
+                if (!alignmentValid || alignment <= AutoAimReleaseThreshold)
+                    autoAimReleaseTimer += Time.deltaTime;
+                else
+                    autoAimReleaseTimer = 0f;
+
+                if (autoAimReleaseTimer >= AutoAimReleaseGraceSeconds)
+                {
+                    autoAimLatched = false;
+                    hasHitCurrentDot = false;
+                    autoAimReleaseTimer = 0f;
+                }
+            }
+            else
+            {
+                autoAimReleaseTimer = 0f;
+            }
+
+            if (autoAimLatched && alignmentValid)
+            {
+                autoAimActive = true;
+                autoAimCurrentTarget = targetCenter;
+                autoAimCurrentRadius = targetRadius * Mathf.Max(1f, AutoAimCompletionRadiusMultiplier);
+
+                Vector3 baseTip = hit ? (origin + direction * distance) : (origin + direction * laserLength);
+                float weight = Mathf.Clamp01(AutoAimBendWeight + 0.1f);
+                desiredTip = (weight >= 0.999f) ? targetCenter :
+                             (weight <= 0.001f) ? baseTip :
+                             Vector3.Lerp(baseTip, targetCenter, weight);
+
+                if (hit) hasHitCurrentDot = true;
+            }
+            else if (hit)
+            {
+                desiredTip = origin + direction * distance;
+            }
+            else
+            {
+                desiredTip = origin + direction * laserLength;
+            }
+        }
+        else
+        {
+            autoAimLatched = false;
+            hasHitCurrentDot = false;
+            desiredTip = origin + direction * laserLength;
         }
 
         if (!hasLag)
@@ -1163,7 +1397,8 @@ float distance))
         }
         else
         {
-            lagTip = Vector3.SmoothDamp(lagTip, desiredTip, ref lagVelocity, Mathf.Max(0.0001f, laserLag));
+            float lag = autoAimActive ? Mathf.Max(0.00005f, laserLag * 0.35f) : Mathf.Max(0.0001f, laserLag);
+            lagTip = Vector3.SmoothDamp(lagTip, desiredTip, ref lagVelocity, lag);
         }
 
         laserRenderer.enabled = true;
@@ -1199,6 +1434,13 @@ float distance))
     {
         hasLag = false;
         lagVelocity = Vector3.zero;
+        autoAimActive = false;
+        autoAimCurrentTarget = Vector3.zero;
+        autoAimCurrentRadius = 0f;
+        autoAimLatched = false;
+        hasLatestControllerPos = false;
+        hasHitCurrentDot = false;
+        autoAimReleaseTimer = 0f;
         if (laserRenderer != null)
         {
             laserRenderer.enabled = false;

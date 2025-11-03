@@ -464,195 +464,193 @@ public class PhonemeManager : MonoBehaviour
     };
 
     /* ultra-lenient IPA map */
-    // UTF-8, super‑lenient guesses for letter → possible pronunciations (IPA + some practical shorthands).
-// Intention: catch noisy inputs & L2 accents; includes letter names ("keɪ", "eks", "waɪ", "zɛd/ziː").
-// Note: duplicates kept minimal; both tied and untied affricates included (t͡ʃ/tʃ, d͡ʒ/dʒ), plus spaced forms.
-private readonly Dictionary<string, List<string>> letterToIPA = new()
-{
-    { "A", new()
-        {
-            "a", "æ", "ɑ", "ɑː", "ɒ", "ɔ", "ɔː",
-            "e", "ɛ", "eɪ", "ə",
-            "aɪ", "aj",
-            "æɹ", "ɑɹ", "eə", "eɚ"
-        }
-    },
-    { "B", new()
-        {
-            "b", "p",
-            "bi", "biː", "bɪ", "b i", "b iː"
-        }
-    },
-    { "C", new()
-        {
-            "k", "s",
-            "t͡ʃ", "tʃ", "ʃ",
-            "ts", "t͡s", "t s",
-            "θ",  // lenient (Spanish C before e/i)
-            "si", "siː", "s i", "s iː"
-        }
-    },
-    { "D", new()
-        {
-            "d", "t", "ð", "ɾ",
-            "di", "diː", "d i", "d iː"
-        }
-    },
-    { "E", new()
-        {
-            "e", "eɪ",
-            "i", "iː", "ɪ",
-            "ɛ", "ə"
-        }
-    },
-    { "F", new()
-        {
-            "f", "v",
-            "ef", "ɛf"
-        }
-    },
-    { "G", new()
-        {
-            "g", "ɡ", "k",
-            "d͡ʒ", "dʒ", "ʒ",
-            "dʒi", "dʒiː", "ɡi", "ɡiː",
-            "g i", "g iː"
-        }
-    },
-    { "H", new()
-        {
-            "h", "∅", // silent h
-            "heɪtʃ", "eɪtʃ"
-        }
-    },
-    { "I", new()
-        {
-            "i", "iː", "ɪ",
-            "aɪ", "aj",
-            "e", "ə"
-        }
-    },
-    { "J", new()
-        {
-            "d͡ʒ", "dʒ", "ʒ", "j", // lenient: some L2 say /j/
-            "dʒeɪ"
-        }
-    },
-    { "K", new()
-        {
-            "k", "g", // lenient confusion
-            "keɪ", "k eɪ"
-        }
-    },
-    { "L", new()
-        {
-            "l", "ɫ", "l̩",
-            "əl", "el", "ɛl"
-        }
-    },
-    { "M", new()
-        {
-            "m", "ɱ", "m̩",
-            "n", // lenient confusion
-            "em", "ɛm", "əm"
-        }
-    },
-    { "N", new()
-        {
-            "n", "ŋ", "n̩",
-            "ɲ", // lenient
-            "en", "ɛn", "ən"
-        }
-    },
-    { "O", new()
-        {
-            "o", "oʊ", "əʊ",
-            "ɒ", "ɔ", "ɔː", "ɑ",
-            "aʊ", "ow", "ou" // shorthands commonly seen
-        }
-    },
-    { "P", new()
-        {
-            "p", "b",
-            "pi", "piː", "p i", "p iː"
-        }
-    },
-    { "Q", new()
-        {
-            "k", "kw", "kʷ", "k w",
-            "kju", "kjuː", "kjʊ",
-            "q" // ultra-lenient fallback token
-        }
-    },
-    { "R", new()
-        {
-            "ɹ", "r", "ɾ", "ɻ", "ɽ",
-            "ʀ", "ʁ",
-            "ɚ", "ɝ", "əɹ", "ɑɹ", "ɜː", "ar", "r̩"
-        }
-    },
-    { "S", new()
-        {
-            "s", "z", "ʃ", "ʒ",
-            "ts", "t͡s", // lenient for /s/→/ts/
-            "es", "ɛs"
-        }
-    },
-    { "T", new()
-        {
-            "t", "d", "ɾ", "ʔ",
-            "t͡ʃ", "tʃ", "ʃ", // ti/tu/tion → /ʃ/
-            "ts", "t s",
-            "ti", "tiː"
-        }
-    },
-    { "U", new()
-        {
-            "u", "uː", "ʊ",
-            "ju", "juː",
-            "ʌ", "ə", "a" // lenient for L2 confusions
-        }
-    },
-    { "V", new()
-        {
-            "v", "f", "w", // common L2 swaps
-            "vi", "viː", "v i", "v iː"
-        }
-    },
-    { "W", new()
-        {
-            "w", "v", "ʍ",
-            "u", // sometimes perceived as vowel
-            "wu", "wʊ", // shorthands
-            "dʌbəlju", "dʌbəljuː", "ˈdʌbəlju", "ˈdʌbəljuː"
-        }
-    },
-    { "X", new()
-        {
-            "ks", "k s", "k͡s",
-            "ɡz", "g z", "ɡ͡z",
-            "z",
-            "ɛks", "eks", "egz",
-            "ik s", "i ks"
-        }
-    },
-    { "Y", new()
-        {
-            "j",
-            "i", "ɪ", "iː",
-            "aɪ",
-            "waɪ",
-            "ji", "jiː", "j i"
-        }
-    },
-    { "Z", new()
-        {
-            "z", "s", "dz", "d͡z",
-            "zi", "ziː", "z i", "z iː",
-            "zɛd", "zed"
-        }
-    },
-};
+    // UTF-8, super-lenient guesses for letter -> possible pronunciations (IPA + shorthands).
+    // Intention: catch noisy inputs & L2 accents; includes letter names ("keɪ", "eks", "waɪ", "zɛd/ziː").
+    // Note: duplicates kept minimal; both tied and untied affricates included (tʃ/tʃ, dʒ/dʒ), plus spaced forms.
+    private readonly Dictionary<string, List<string>> letterToIPA = new()
+    {
+        { "A", new()
+            {
+                "a", "æ", "ɑ", "ɑː", "ɒ", "ɔ", "ɔː",
+                "e", "ɛ", "eɪ", "ə",
+                "aɪ", "aj",
+                "æɹ", "ɑɹ", "eə", "eɚ"
+            }
+        },
+        { "B", new()
+            {
+                "b", "p",
+                "bi", "biː", "bɪ", "b i", "b iː"
+            }
+        },
+        { "C", new()
+            {
+                "k", "s",
+                "tʃ", "ʃ",
+                "ts", "t s",
+                "θ",
+                "si", "siː", "s i", "s iː"
+            }
+        },
+        { "D", new()
+            {
+                "d", "t", "ð", "ɾ",
+                "di", "diː", "d i", "d iː"
+            }
+        },
+        { "E", new()
+            {
+                "e", "eɪ",
+                "i", "iː", "ɪ",
+                "ɛ", "ə"
+            }
+        },
+        { "F", new()
+            {
+                "f", "v",
+                "ef", "ɛf"
+            }
+        },
+        { "G", new()
+            {
+                "g", "ɡ", "k",
+                "dʒ", "ʒ",
+                "dʒi", "dʒiː", "ɡi", "ɡiː",
+                "g i", "g iː"
+            }
+        },
+        { "H", new()
+            {
+                "h",
+                "heɪtʃ", "eɪtʃ"
+            }
+        },
+        { "I", new()
+            {
+                "i", "iː", "ɪ",
+                "aɪ", "aj",
+                "e", "ə"
+            }
+        },
+        { "J", new()
+            {
+                "dʒ", "ʒ", "j",
+                "dʒeɪ"
+            }
+        },
+        { "K", new()
+            {
+                "k", "g",
+                "keɪ", "k eɪ"
+            }
+        },
+        { "L", new()
+            {
+                "l", "ɫ",
+                "əl", "el", "ɛl"
+            }
+        },
+        { "M", new()
+            {
+                "m", "ɱ", "n",
+                "em", "ɛm", "əm"
+            }
+        },
+        { "N", new()
+            {
+                "n", "ŋ", "ɲ",
+                "en", "ɛn", "ən"
+            }
+        },
+        { "O", new()
+            {
+                "o", "oʊ", "əʊ",
+                "ɒ", "ɔ", "ɔː", "ɑ",
+                "aʊ", "ow", "ou"
+            }
+        },
+        { "P", new()
+            {
+                "p", "b",
+                "pi", "piː", "p i", "p iː"
+            }
+        },
+        { "Q", new()
+            {
+                "k", "kw", "kʷ", "k w",
+                "kju", "kjuː", "kjʊ",
+                "q"
+            }
+        },
+        { "R", new()
+            {
+                "ɹ", "r", "ɾ", "ɻ", "ɽ",
+                "ʀ", "ʁ",
+                "ɚ", "ɝ", "əɹ", "ɑɹ", "ɜː", "ar"
+            }
+        },
+        { "S", new()
+            {
+                "s", "z", "ʃ", "ʒ",
+                "ts", "t s",
+                "es", "ɛs"
+            }
+        },
+        { "T", new()
+            {
+                "t", "d", "ɾ", "ʔ",
+                "tʃ", "ʃ",
+                "ts", "t s",
+                "ti", "tiː"
+            }
+        },
+        { "U", new()
+            {
+                "u", "uː", "ʊ",
+                "ju", "juː",
+                "ʌ", "ə", "a"
+            }
+        },
+        { "V", new()
+            {
+                "v", "f", "w",
+                "vi", "viː", "v i", "v iː"
+            }
+        },
+        { "W", new()
+            {
+                "w", "v", "ʍ",
+                "u",
+                "wu", "wʊ",
+                "dʌbəlju", "dʌbəljuː"
+            }
+        },
+        { "X", new()
+            {
+                "ks", "k s",
+                "ɡz", "g z",
+                "z",
+                "ɛks", "eks", "egz",
+                "ik s", "i ks"
+            }
+        },
+        { "Y", new()
+            {
+                "j",
+                "i", "ɪ", "iː",
+                "aɪ",
+                "waɪ",
+                "ji", "jiː", "j i"
+            }
+        },
+        { "Z", new()
+            {
+                "z", "s", "dz",
+                "zi", "ziː", "z i", "z iː",
+                "zɛd", "zed"
+            }
+        },
+    };
 
 
     // Downmix a segment from micClip (handles wrap at call site) with REUSED buffer
@@ -1306,12 +1304,12 @@ private readonly Dictionary<string, List<string>> letterToIPA = new()
     private void ParseBeam(string json)
     {
         string payload = json ?? string.Empty;
-        var match = ipaFieldRegex.Match(payload);
-        if (!match.Success)
-            match = textFieldRegex.Match(payload);
-        lastBeamText = match.Success ? match.Groups["value"].Value : string.Empty;
-        var rawMatch = rawTextFieldRegex.Match(payload);
-        lastBeamRawText = rawMatch.Success ? rawMatch.Groups["value"].Value : string.Empty;
+        var ipaMatch = ipaFieldRegex.Match(payload);
+        if (!ipaMatch.Success)
+            ipaMatch = textFieldRegex.Match(payload);
+        lastBeamText = ipaMatch.Success ? ipaMatch.Groups["value"].Value : string.Empty;
+        var rawTextMatch = rawTextFieldRegex.Match(payload);
+        lastBeamRawText = rawTextMatch.Success ? rawTextMatch.Groups["value"].Value : string.Empty;
         if (!string.IsNullOrEmpty(lastBeamRawText))
             lastBeamRawText = lastBeamRawText.Trim();
 
@@ -1323,7 +1321,7 @@ private readonly Dictionary<string, List<string>> letterToIPA = new()
         }
 
         string currentLetter = levelManager != null ? levelManager.currentLetter : string.Empty;
-        string L = string.IsNullOrEmpty(currentLetter) ? string.Empty : currentLetter.ToUpperInvariant();
+        string L = string.IsNullOrEmpty(currentLetter) ? string.Empty : currentLetter.ToLowerInvariant();
         if (!TryGetExpectedVariants(L, out var wants) || wants.Count == 0)
         {
             Debug.LogWarning($"[Phoneme] No expectations for letter '{currentLetter}'.");
@@ -1588,14 +1586,14 @@ private readonly Dictionary<string, List<string>> letterToIPA = new()
     {
         if (!letterPrompt || levelManager == null) return;
         string letter = levelManager.currentLetter ?? string.Empty;
-        letterPrompt.text = string.IsNullOrEmpty(letter) ? string.Empty : letter.ToUpperInvariant();
+        letterPrompt.text = string.IsNullOrEmpty(letter) ? string.Empty : letter.ToLowerInvariant();
     }
 
     private void HandleLetterChanged(string letter)
     {
         if (!letterPrompt) return;
 
-        string display = string.IsNullOrEmpty(letter) ? string.Empty : letter.ToUpperInvariant();
+        string display = string.IsNullOrEmpty(letter) ? string.Empty : letter.ToLowerInvariant();
         letterPrompt.text = display;
 
         if (levelManager != null && levelManager.currentMode == LevelManager.GameMode.PhonemeChecking)

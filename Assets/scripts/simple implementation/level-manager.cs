@@ -7,17 +7,14 @@ using System.Collections.Generic;
 using System.Reflection;
 using Newtonsoft.Json;
 using System.Linq;
-
 public class LevelManager : MonoBehaviour
 {
-    public enum GameMode { PhonemeChecking, TraceChecking, ObjectPlacing, Dictation }
-
+    public enum GameMode { PhonemeChecking, TraceChecking, ObjectPlacing, Dictation, FreeDrawing }
     public event Action<GameMode> OnGameModeChanged;
     public event Action OnPhonemeCheckStart;
     public event Action OnAllPhasesCompleted;
     public event Action<string> OnLetterChanged;
     public event Action<string> OnDrillChanged;
-
     public GameMode currentMode { get; private set; }
     public string currentLetter { get; private set; }
     public string currentPhoneme { get; private set; }
@@ -25,7 +22,6 @@ public class LevelManager : MonoBehaviour
     public int currentLevel { get; private set; }
     public string currentDrill { get; private set; } = "Audio";
     public bool IsPaused { get; private set; }
-
     [Header("References (set in Inspector)")]
     [SerializeField] private SimpleRecorder recorder;
     [SerializeField] private LetterTracingSystem tracingSystem;
@@ -35,11 +31,9 @@ public class LevelManager : MonoBehaviour
     [SerializeField] private PlaneSurfaceDrawer planeSurfaceDrawer;
     [SerializeField] private SaveManager saveManager;
     [SerializeField] private AudioManager audioManager;
-
     [Header("Pause (optional)")]
     [SerializeField] private GameObject pauseButtonGO;
     private ProximityButton pauseBtn;
-
     [Header("Memory Management")]
     [FormerlySerializedAs("reloadSceneAfterLetters")]
     [SerializeField, Tooltip("Perform a lightweight cleanup after this many completed letters. 0 disables cadence-based sweeps.")]
@@ -61,7 +55,6 @@ public class LevelManager : MonoBehaviour
     private bool logMemorySweeps = true;
     [SerializeField, Tooltip("Seconds after scene load before sweeps may run (gives systems time to warm up).")]
     private float sweepWarmupSeconds = 3f;
-
     private readonly List<Phase> levelPlan = new List<Phase>();
     private readonly List<IMemoryBudgetConsumer> memoryConsumers = new List<IMemoryBudgetConsumer>();
     private int phaseIndex;
@@ -72,43 +65,33 @@ public class LevelManager : MonoBehaviour
     private bool sweepWarmupElapsed;
     private string lastReportedLetter = string.Empty;
     private string bootstrapLetterFromPlan;
-
     private Coroutine memoryGuardRoutine;
     private Coroutine memorySweepRoutine;
     private float lastMemorySweepTime;
     private float lastMemoryWarningTime;
     private string lastSpokenLetter = string.Empty;
     private bool loggedMissingAudioManager = false;
-
     private void Start()
     {
         InitializeComponents();
         WirePauseButton();
         RefreshMemoryConsumers();
-
         LoadLevelPlan();
-
         bool started = false;
         if (!string.IsNullOrEmpty(bootstrapLetterFromPlan))
             started = TrySetLevelByLetter(bootstrapLetterFromPlan, false);
-
         if (!started)
             started = TryRestoreLetterFromPrefs();
-
         if (!started)
             StartCurrentLetter();
-
         if ((memoryCheckIntervalSeconds > 0f || memoryDangerThresholdMB > 0f) && memoryGuardRoutine == null)
             memoryGuardRoutine = StartCoroutine(MemorySafeguardLoop());
-
         if (sweepWarmupSeconds > 0f)
             StartCoroutine(SweepWarmupTimer());
         else
             sweepWarmupElapsed = true;
-
         OnDrillChanged?.Invoke(currentDrill);
     }
-
     private void InitializeComponents()
     {
         if (!recorder)        recorder        = GetComponent<SimpleRecorder>();
@@ -125,12 +108,10 @@ public class LevelManager : MonoBehaviour
             if (!planeSurfaceDrawer)
                 planeSurfaceDrawer = FindObjectOfType<PlaneSurfaceDrawer>();
         }
-
         if (!audioManager)
             audioManager = GetComponent<AudioManager>() ?? GetComponentInChildren<AudioManager>(true);
         if (!audioManager)
             audioManager = FindObjectOfType<AudioManager>();
-
         if (phonemeManager != null)
         {
             phonemeManager.OnPhonemeCorrect += HandlePhonemeCorrect;
@@ -143,7 +124,6 @@ public class LevelManager : MonoBehaviour
         if (dictationManager != null)
             dictationManager.OnDictationComplete += OnDictationComplete;
     }
-
     private void WirePauseButton()
     {
         if (!pauseButtonGO) return;
@@ -151,12 +131,10 @@ public class LevelManager : MonoBehaviour
         if (pauseBtn != null)
             pauseBtn.OnButtonPressed += HandlePausePressed;
     }
-
     private void HandlePausePressed()
     {
         SetPaused(!IsPaused);
     }
-
     private AudioManager ResolveAudioManager()
     {
         if (audioManager && audioManager.isActiveAndEnabled)
@@ -164,29 +142,24 @@ public class LevelManager : MonoBehaviour
             loggedMissingAudioManager = false;
             return audioManager;
         }
-
         var managers = Resources.FindObjectsOfTypeAll<AudioManager>()
             .Where(a => a != null && a.gameObject.scene.IsValid())
             .ToArray();
         audioManager = managers.FirstOrDefault(a => a != null && a.isActiveAndEnabled);
         if (!audioManager && managers.Length > 0)
             audioManager = managers[0];
-
         if (audioManager && audioManager.isActiveAndEnabled)
         {
             loggedMissingAudioManager = false;
             return audioManager;
         }
-
         if (!loggedMissingAudioManager)
         {
             Debug.LogWarning("[LevelManager] AudioManager not available; skipping letter audio.");
             loggedMissingAudioManager = true;
         }
-
         return null;
     }
-
     private static char ExtractFirstAsciiLetter(string value)
     {
         if (string.IsNullOrEmpty(value)) return '\0';
@@ -197,45 +170,36 @@ public class LevelManager : MonoBehaviour
         }
         return '\0';
     }
-
     private void TryPlayLetterAudio(string letter)
     {
         if (string.IsNullOrEmpty(letter))
             return;
-
         if (string.Equals(lastSpokenLetter, letter, StringComparison.OrdinalIgnoreCase))
             return;
-
         var manager = ResolveAudioManager();
         if (manager == null)
             return;
-
         char c = ExtractFirstAsciiLetter(letter);
         if (c == '\0')
             return;
-
         if (manager.TryPlayLetterPronunciation(c))
             lastSpokenLetter = letter;
     }
-
     private IEnumerator SweepWarmupTimer()
     {
         yield return new WaitForSeconds(sweepWarmupSeconds);
         sweepWarmupElapsed = true;
     }
-
     public void LoadLevelPlan()
     {
         levelPlan.Clear();
         bootstrapLetterFromPlan = null;
-
         var ta = Resources.Load<TextAsset>("LevelPlan");
         if (ta == null)
         {
             Debug.LogError("LevelPlan resource not found!");
             return;
         }
-
         try
         {
             var wrapper = JsonConvert.DeserializeObject<LevelPlanWrapper>(ta.text);
@@ -244,14 +208,11 @@ public class LevelManager : MonoBehaviour
                 foreach (var phaseData in wrapper.levelplan)
                 {
                     if (phaseData == null) continue;
-
                     var phase = new Phase();
                     if (phaseData.Letters != null) phase.Letters.AddRange(phaseData.Letters);
                     if (phaseData.Phonemes != null) phase.Phonemes.AddRange(phaseData.Phonemes);
-
                     var parsedModes = ConvertModes(phaseData.Modes);
                     phase.Modes = NormalizeModes(parsedModes);
-
                     EnsurePhonemeCoverage(phase);
                     levelPlan.Add(phase);
                 }
@@ -262,36 +223,28 @@ public class LevelManager : MonoBehaviour
         {
             Debug.LogError($"Failed to parse LevelPlan: {ex.Message}");
         }
-
         Debug.Log($"Level plan loaded. Phases: {levelPlan.Count}. Bootstrap letter: {bootstrapLetterFromPlan ?? "(none)"}");
     }
-
     private static void EnsurePhonemeCoverage(Phase phase)
     {
         if (phase.Letters == null)
             phase.Letters = new List<string>();
         if (phase.Phonemes == null)
             phase.Phonemes = new List<string>();
-
         for (int i = 0; i < phase.Letters.Count; i++)
         {
             string raw = phase.Letters[i] ?? string.Empty;
             raw = raw.Trim();
-            string upper = raw.Length > 0 ? raw.Substring(0, 1).ToUpperInvariant() : string.Empty;
-            string lower = upper.ToLowerInvariant();
-
-            phase.Letters[i] = upper;
-
+            string lower = raw.ToLowerInvariant();
+            phase.Letters[i] = lower;
             if (phase.Phonemes.Count <= i)
                 phase.Phonemes.Add(lower);
             else
                 phase.Phonemes[i] = lower;
         }
-
         if (phase.Phonemes.Count > phase.Letters.Count)
             phase.Phonemes.RemoveRange(phase.Letters.Count, phase.Phonemes.Count - phase.Letters.Count);
     }
-
     private static List<GameMode> ConvertModes(List<string> modes)
     {
         if (modes == null || modes.Count == 0) return null;
@@ -303,27 +256,35 @@ public class LevelManager : MonoBehaviour
         }
         return result;
     }
-
     private static List<GameMode> NormalizeModes(List<GameMode> modes)
     {
-        var normalized = new List<GameMode>(Mathf.Max(2, modes?.Count ?? 0));
-        normalized.Add(GameMode.PhonemeChecking);
-        normalized.Add(GameMode.TraceChecking);
+        if (modes == null || modes.Count == 0)
+            return new List<GameMode> { GameMode.PhonemeChecking, GameMode.TraceChecking };
 
-        if (modes != null)
+        var normalized = new List<GameMode>(modes.Count);
+        foreach (var mode in modes)
         {
-            foreach (var mode in modes)
+            if (!normalized.Contains(mode))
+                normalized.Add(mode);
+        }
+
+        bool containsFreeDrawing = normalized.Contains(GameMode.FreeDrawing);
+        bool dictationOnly = normalized.Count == 1 && normalized[0] == GameMode.Dictation;
+
+        if (!containsFreeDrawing && !dictationOnly)
+        {
+            if (!normalized.Contains(GameMode.PhonemeChecking))
+                normalized.Insert(0, GameMode.PhonemeChecking);
+
+            if (!normalized.Contains(GameMode.TraceChecking))
             {
-                if (mode == GameMode.PhonemeChecking || mode == GameMode.TraceChecking)
-                    continue;
-                if (!normalized.Contains(mode))
-                    normalized.Add(mode);
+                int insertIndex = normalized.Contains(GameMode.PhonemeChecking) ? 1 : 0;
+                normalized.Insert(insertIndex, GameMode.TraceChecking);
             }
         }
 
         return normalized;
     }
-
     private bool TryRestoreLetterFromPrefs()
     {
         try
@@ -344,7 +305,6 @@ public class LevelManager : MonoBehaviour
         }
         return false;
     }
-
     private void StartCurrentLetter()
     {
         if (phaseIndex >= levelPlan.Count)
@@ -352,7 +312,6 @@ public class LevelManager : MonoBehaviour
             FinishAll();
             return;
         }
-
         var currentPhase = levelPlan[phaseIndex];
         if (currentPhase.Letters == null || currentPhase.Letters.Count == 0)
         {
@@ -360,24 +319,20 @@ public class LevelManager : MonoBehaviour
             StartNextPhase();
             return;
         }
-
         if (letterIndex >= currentPhase.Letters.Count)
         {
             StartNextPhase();
             return;
         }
-
         currentLetter = currentPhase.Letters[letterIndex];
         currentPhoneme = SafeGet(currentPhase.Phonemes, letterIndex) ?? currentLetter;
         currentLevel = ComputeAbsoluteLevel(phaseIndex, letterIndex);
         if (modeIndex >= currentPhase.Modes.Count) modeIndex = 0;
-
         NotifyLetterChanged();
         LoadLevelData();
         hasBootstrapped = false;
         StartCurrentMode();
     }
-
     private void StartNextPhase()
     {
         phaseIndex++;
@@ -390,13 +345,11 @@ public class LevelManager : MonoBehaviour
         modeIndex = 0;
         StartCurrentLetter();
     }
-
     private void FinishAll()
     {
         OnAllPhasesCompleted?.Invoke();
         Debug.Log("All phases completed. Game finished!");
     }
-
     private void StartCurrentMode()
     {
         if (phaseIndex >= levelPlan.Count) { FinishAll(); return; }
@@ -405,25 +358,20 @@ public class LevelManager : MonoBehaviour
         {
             phase.Modes = NormalizeModes(null);
         }
-
         if (modeIndex >= phase.Modes.Count)
         {
             CompleteLetter();
             return;
         }
-
         SetGameMode(phase.Modes[modeIndex]);
     }
-
     private void CompleteLetter()
     {
         modeIndex = 0;
         letterIndex++;
         currentLevel++;
-
         lettersSinceLastSweep++;
         ReleaseMemoryConsumers();
-
         bool cadenceReached = lettersBeforeMemorySweep > 0 && lettersSinceLastSweep >= lettersBeforeMemorySweep;
         if (cadenceReached)
         {
@@ -434,24 +382,19 @@ public class LevelManager : MonoBehaviour
         {
             MaybeScheduleMemorySweep("Letter complete", false);
         }
-
         StartCurrentLetter();
     }
-
     public void SkipToNextLetterManual()
     {
         RunModeExitCleanup(currentMode);
         CompleteLetter();
     }
-
     public void ReturnToPreviousLetterManual()
     {
         if (levelPlan.Count == 0)
             return;
-
         RunModeExitCleanup(currentMode);
         ReleaseMemoryConsumers();
-
         if (letterIndex > 0)
         {
             letterIndex--;
@@ -468,36 +411,29 @@ public class LevelManager : MonoBehaviour
         {
             return;
         }
-
         lettersSinceLastSweep = Mathf.Max(0, lettersSinceLastSweep - 1);
         currentLevel = ComputeAbsoluteLevel(Mathf.Clamp(phaseIndex, 0, levelPlan.Count - 1), letterIndex);
         modeIndex = 0;
         hasBootstrapped = false;
         StartCurrentLetter();
     }
-
     private void SetGameMode(GameMode mode)
     {
         if (currentMode == mode && hasBootstrapped) return;
-
         var previousMode = currentMode;
         bool firstEntry = !hasBootstrapped;
         currentMode = mode;
         hasBootstrapped = true;
-
         if (!firstEntry)
         {
             RunModeExitCleanup(previousMode);
             if (sweepOnModeSwitch)
                 MaybeScheduleMemorySweep($"Mode switch {previousMode} -> {mode}", false);
         }
-
         OnGameModeChanged?.Invoke(currentMode);
         UpdateComponentStates();
-
         bool traceActive = currentMode == GameMode.TraceChecking;
         tracingSystem?.SetVisualizationActive(traceActive);
-
         if (phonemeManager != null)
         {
             try
@@ -515,7 +451,6 @@ public class LevelManager : MonoBehaviour
             }
             catch { }
         }
-
         switch (currentMode)
         {
             case GameMode.PhonemeChecking:
@@ -539,19 +474,24 @@ public class LevelManager : MonoBehaviour
                     dictationManager.StartDictation();
                 }
                 break;
+            case GameMode.FreeDrawing:
+                if (dictationManager != null)
+                {
+                    dictationManager.PrepareForMode(GameMode.FreeDrawing);
+                    dictationManager.StartDictation();
+                }
+                break;
         }
-
         if (logMemorySweeps)
             Debug.Log($"[LevelManager] Mode -> {currentMode} | Letter {currentLetter}");
     }
-
     private void RunModeExitCleanup(GameMode mode)
     {
         if (mode == GameMode.PhonemeChecking && phonemeManager != null)
         {
             phonemeManager.ReleaseMemory();
         }
-        else if (mode == GameMode.Dictation && dictationManager != null)
+        else if ((mode == GameMode.Dictation || mode == GameMode.FreeDrawing) && dictationManager != null)
         {
             dictationManager.ReleaseMemory();
         }
@@ -560,70 +500,58 @@ public class LevelManager : MonoBehaviour
             planeSurfaceDrawer.ForceStopAllAudio();
         }
     }
-
     private void UpdateComponentStates()
     {
         bool isPhoneme = currentMode == GameMode.PhonemeChecking;
-
         if (phonemeManager)  phonemeManager.enabled  = isPhoneme;
         if (tracingSystem)   tracingSystem.enabled   = true;
         if (objectManager)   objectManager.enabled   = true;
         if (dictationManager)dictationManager.PrepareForMode(currentMode);
     }
-
     private void LoadLevelData()
     {
         StartCoroutine(LoadAfterStart());
     }
-
     private IEnumerator LoadAfterStart()
     {
         yield return null;
-        // Only load fallback strokes for trace modes; skip in Dictation to avoid unnecessary memory churn.
-        if (recorder && currentMode != GameMode.Dictation)
+        // Only load fallback strokes for trace modes; skip in Dictation/FreeDrawing to avoid unnecessary memory churn.
+        if (recorder && currentMode != GameMode.Dictation && currentMode != GameMode.FreeDrawing)
             recorder.LoadRecording(currentLetter);
     }
-
     private void HandlePhonemeCorrect()
     {
         if (currentMode == GameMode.PhonemeChecking)
             ProceedToNextMode();
     }
-
     private void HandlePhonemeTriesExhausted()
     {
         // Ensure the pronunciation can replay when we advance to trace checking.
         lastSpokenLetter = string.Empty;
         ProceedToNextMode();
     }
-
     private void OnTraceCompleted()
     {
         if (currentMode == GameMode.TraceChecking)
             ProceedToNextMode();
     }
-
     private void OnObjectCollected()
     {
         if (currentMode == GameMode.ObjectPlacing)
             ProceedToNextMode();
     }
-
     private void OnDictationComplete()
     {
         if (currentMode == GameMode.Dictation)
             ProceedToNextMode();
     }
-
     public void ProceedToNextMode()
     {
         if (phaseIndex >= levelPlan.Count)
             return;
-
         var phase = levelPlan[phaseIndex];
         modeIndex++;
         if (dictationManager) dictationManager.PrepareForMode(GameMode.PhonemeChecking);
-
         if (modeIndex < phase.Modes.Count)
         {
             StartCurrentMode();
@@ -633,7 +561,6 @@ public class LevelManager : MonoBehaviour
             CompleteLetter();
         }
     }
-
     public void Restart()
     {
         phaseIndex = 0;
@@ -644,7 +571,6 @@ public class LevelManager : MonoBehaviour
         hasBootstrapped = false;
         StartCurrentLetter();
     }
-
     public void SetLevel(int level)
     {
         if (level < 0)
@@ -652,7 +578,6 @@ public class LevelManager : MonoBehaviour
             Debug.LogWarning("Level must be >= 0.");
             return;
         }
-
         int total = 0;
         for (int p = 0; p < levelPlan.Count; p++)
         {
@@ -677,16 +602,17 @@ public class LevelManager : MonoBehaviour
                 total++;
             }
         }
-
         Debug.LogWarning($"Attempted to set level to {level}, but it does not exist.");
     }
-
     public void SetLevelByLetter(string letter)
     {
         TrySetLevelByLetter(letter, true);
     }
-
-    private bool TrySetLevelByLetter(string letter, bool logIfMissing)
+    public bool TrySetLevelByLetter(string letter, int preferredPhaseIndex)
+    {
+        return TrySetLevelByLetter(letter, true, preferredPhaseIndex);
+    }
+    private bool TrySetLevelByLetter(string letter, bool logIfMissing, int preferredPhaseIndex = -1)
     {
         if (string.IsNullOrEmpty(letter))
         {
@@ -694,12 +620,40 @@ public class LevelManager : MonoBehaviour
             return false;
         }
 
-        string normalized = letter.Trim();
-        if (normalized.Length > 0)
-            normalized = normalized.Substring(0, 1).ToLowerInvariant();
+        string trimmed = letter.Trim();
+        string normalized = trimmed.ToLowerInvariant();
+
+        if (preferredPhaseIndex >= 0 && preferredPhaseIndex < levelPlan.Count)
+        {
+            var preferredPhase = levelPlan[preferredPhaseIndex];
+            if (preferredPhase?.Letters != null)
+            {
+                int preferredLetterIndex = preferredPhase.Letters.FindIndex(l => string.Equals(l, normalized, StringComparison.OrdinalIgnoreCase));
+                if (preferredLetterIndex >= 0)
+                {
+                    phaseIndex = preferredPhaseIndex;
+                    letterIndex = preferredLetterIndex;
+                    modeIndex = 0;
+                    currentLetter = preferredPhase.Letters[preferredLetterIndex];
+                    if (preferredPhase.Phonemes.Count <= preferredLetterIndex)
+                        preferredPhase.Phonemes.Add(currentLetter);
+                    currentPhoneme = preferredPhase.Phonemes[preferredLetterIndex];
+                    currentLevel = ComputeAbsoluteLevel(preferredPhaseIndex, preferredLetterIndex);
+                    lettersSinceLastSweep = 0;
+
+                    NotifyLetterChanged();
+                    LoadLevelData();
+                    hasBootstrapped = false;
+                    StartCurrentMode();
+                    Debug.Log($"Set level to letter '{letter}': Phase {preferredPhaseIndex}, LetterIndex {preferredLetterIndex}");
+                    return true;
+                }
+            }
+        }
 
         for (int p = 0; p < levelPlan.Count; p++)
         {
+            if (p == preferredPhaseIndex) continue;
             var phase = levelPlan[p];
             if (phase?.Letters == null) continue;
 
@@ -711,7 +665,7 @@ public class LevelManager : MonoBehaviour
                 modeIndex = 0;
                 currentLetter = phase.Letters[li];
                 if (phase.Phonemes.Count <= li)
-                    phase.Phonemes.Add(currentLetter.ToLowerInvariant());
+                    phase.Phonemes.Add(currentLetter);
                 currentPhoneme = phase.Phonemes[li];
                 currentLevel = ComputeAbsoluteLevel(p, li);
                 lettersSinceLastSweep = 0;
@@ -725,11 +679,14 @@ public class LevelManager : MonoBehaviour
             }
         }
 
-        // Letter not present in plan; inject it into the current phase so downstream systems still work.
         if (levelPlan.Count == 0)
             levelPlan.Add(new Phase());
 
-        var targetPhase = levelPlan[Mathf.Clamp(phaseIndex, 0, levelPlan.Count - 1)];
+        int injectionPhaseIndex = (preferredPhaseIndex >= 0 && preferredPhaseIndex < levelPlan.Count)
+            ? preferredPhaseIndex
+            : Mathf.Clamp(phaseIndex, 0, levelPlan.Count - 1);
+
+        var targetPhase = levelPlan[injectionPhaseIndex];
         if (targetPhase.Letters == null) targetPhase.Letters = new List<string>();
         if (targetPhase.Phonemes == null) targetPhase.Phonemes = new List<string>();
 
@@ -738,17 +695,19 @@ public class LevelManager : MonoBehaviour
         int phonemeInsert = Mathf.Clamp(insertIndex, 0, targetPhase.Phonemes.Count);
         targetPhase.Phonemes.Insert(phonemeInsert, normalized);
 
-        phaseIndex = Mathf.Clamp(phaseIndex, 0, levelPlan.Count - 1);
+        phaseIndex = Mathf.Clamp(injectionPhaseIndex, 0, levelPlan.Count - 1);
         letterIndex = Mathf.Clamp(insertIndex, 0, targetPhase.Letters.Count - 1);
         modeIndex = 0;
         currentLetter = normalized;
         currentPhoneme = normalized;
+        currentLevel = ComputeAbsoluteLevel(phaseIndex, letterIndex);
         lettersSinceLastSweep = 0;
+
         NotifyLetterChanged();
         LoadLevelData();
         hasBootstrapped = false;
         StartCurrentMode();
-        Debug.LogWarning($"Letter '{letter}' was missing from the plan; injecting it into phase {phaseIndex}.");
+        Debug.Log($"[LevelManager] Injected new letter '{normalized}' into current phase (was missing).");
         return true;
     }
 
@@ -768,7 +727,6 @@ public class LevelManager : MonoBehaviour
         }
         return total;
     }
-
     public void SetCurrentDrill(string drill)
     {
         if (string.IsNullOrEmpty(drill)) return;
@@ -785,18 +743,15 @@ public class LevelManager : MonoBehaviour
         RestartSubsystemsForDrill();
         OnDrillChanged?.Invoke(currentDrill);
     }
-
     private void RestartSubsystemsForDrill()
     {
         bool isAudio = string.Equals(currentDrill, "Audio", StringComparison.OrdinalIgnoreCase);
-
         if (phonemeManager)
         {
             if (phonemeManager is IMemoryBudgetConsumer consumer && !isAudio)
             {
                 consumer.ReleaseMemory();
             }
-
             if (isAudio)
             {
                 var warmMethod = phonemeManager.GetType().GetMethod("WarmUpMic", BindingFlags.Instance | BindingFlags.NonPublic);
@@ -807,19 +762,16 @@ public class LevelManager : MonoBehaviour
                 }
             }
         }
-
         if (!isAudio)
         {
             dictationManager?.ReleaseMemory();
         }
     }
-
     private void NotifyLetterChanged()
     {
         string letter = currentLetter ?? string.Empty;
         tracingSystem?.SetLetter(letter);
         tracingSystem?.SetVisualizationActive(currentMode == GameMode.TraceChecking);
-
         if (!string.Equals(lastReportedLetter, letter, StringComparison.OrdinalIgnoreCase))
         {
             lastReportedLetter = letter;
@@ -833,13 +785,10 @@ public class LevelManager : MonoBehaviour
                 catch { }
             }
         }
-
         // Reset so the upcoming mode switch can replay the pronunciation.
         lastSpokenLetter = string.Empty;
-
         OnLetterChanged?.Invoke(letter);
     }
-
     private void RefreshMemoryConsumers()
     {
         memoryConsumers.Clear();
@@ -847,7 +796,6 @@ public class LevelManager : MonoBehaviour
         if (found != null && found.Length > 0)
             memoryConsumers.AddRange(found);
     }
-
     private void ReleaseMemoryConsumers()
     {
         RefreshMemoryConsumers();
@@ -861,43 +809,34 @@ public class LevelManager : MonoBehaviour
             }
         }
     }
-
     private void MaybeScheduleMemorySweep(string reason, bool force)
     {
         if (!sweepWarmupElapsed && !force) return;
         if (memorySweepRoutine != null) return;
-
         float now = Time.realtimeSinceStartup;
         if (!force && minSecondsBetweenSweeps > 0f && now - lastMemorySweepTime < minSecondsBetweenSweeps)
             return;
-
         memorySweepRoutine = StartCoroutine(MemorySweepRoutine(reason, force));
     }
-
     private IEnumerator MemorySweepRoutine(string reason, bool forced)
     {
         if (logMemorySweeps)
             Debug.Log($"[LevelManager] Memory sweep starting ({reason}){(forced ? " [forced]" : string.Empty)}.");
-
         ReleaseMemoryConsumers();
         lettersSinceLastSweep = 0;
         yield return null;
-
         var unload = Resources.UnloadUnusedAssets();
         if (unload != null)
         {
             while (!unload.isDone)
                 yield return null;
         }
-
         System.GC.Collect();
         lastMemorySweepTime = Time.realtimeSinceStartup;
         memorySweepRoutine = null;
-
         if (logMemorySweeps)
             Debug.Log("[LevelManager] Memory sweep finished.");
     }
-
     private IEnumerator MemorySafeguardLoop()
     {
         var wait = new WaitForSeconds(Mathf.Max(1f, memoryCheckIntervalSeconds));
@@ -905,10 +844,8 @@ public class LevelManager : MonoBehaviour
         {
             yield return wait;
             if (!sweepWarmupElapsed && Time.realtimeSinceStartup < sweepWarmupSeconds) continue;
-
             long reservedBytes = Profiler.GetTotalReservedMemoryLong();
             float reservedMB = reservedBytes / (1024f * 1024f);
-
             if (memoryWarningThresholdMB > 0f && reservedMB >= memoryWarningThresholdMB)
             {
                 if (Time.realtimeSinceStartup - lastMemoryWarningTime >= Mathf.Max(2f, memoryCheckIntervalSeconds))
@@ -917,42 +854,33 @@ public class LevelManager : MonoBehaviour
                     lastMemoryWarningTime = Time.realtimeSinceStartup;
                 }
             }
-
             if (memoryDangerThresholdMB > 0f && reservedMB >= memoryDangerThresholdMB)
             {
                 MaybeScheduleMemorySweep($"Reserved memory {reservedMB:0} MB >= {memoryDangerThresholdMB:0} MB", true);
             }
         }
     }
-
     public void SetPaused(bool paused)
     {
         if (IsPaused == paused) return;
         IsPaused = paused;
-
         Time.timeScale = IsPaused ? 0f : 1f;
-
         if (dictationManager) dictationManager.enabled = !IsPaused;
         if (phonemeManager)  phonemeManager.enabled  = !IsPaused;
         if (tracingSystem)   tracingSystem.enabled   = !IsPaused;
         if (objectManager)   objectManager.enabled   = !IsPaused;
-
         Debug.Log($"[LevelManager] {(IsPaused ? "Paused" : "Resumed")}");
     }
-
     public void RequestSceneReload(string reason, bool preserveState = true)
     {
         Debug.LogWarning($"[LevelManager] Scene reload requested ({reason}) but reloads are disabled; scheduling memory sweep instead.");
         MaybeScheduleMemorySweep(reason, true);
     }
-
     private static string SafeGet(List<string> list, int i) =>
         (list != null && i >= 0 && i < list.Count) ? list[i] : null;
-
     private void OnDestroy()
     {
         if (pauseBtn) pauseBtn.OnButtonPressed -= HandlePausePressed;
-
         if (phonemeManager != null)
         {
             phonemeManager.OnPhonemeCorrect -= HandlePhonemeCorrect;
@@ -961,7 +889,6 @@ public class LevelManager : MonoBehaviour
         if (tracingSystem != null) tracingSystem.OnTraceCompleted -= OnTraceCompleted;
         if (objectManager != null) objectManager.OnObjectCollected -= OnObjectCollected;
         if (dictationManager != null) dictationManager.OnDictationComplete -= OnDictationComplete;
-
         if (memoryGuardRoutine != null)
         {
             StopCoroutine(memoryGuardRoutine);
@@ -973,7 +900,6 @@ public class LevelManager : MonoBehaviour
             memorySweepRoutine = null;
         }
     }
-
     [Serializable]
     public class Phase
     {
@@ -981,7 +907,6 @@ public class LevelManager : MonoBehaviour
         public List<string> Phonemes = new List<string>();
         public List<GameMode> Modes = new List<GameMode>();
     }
-
     [Serializable]
     private class PhaseData
     {
@@ -989,7 +914,6 @@ public class LevelManager : MonoBehaviour
         public List<string> Phonemes;
         public List<string> Modes;
     }
-
     [Serializable]
     private class LevelPlanWrapper
     {
@@ -997,3 +921,7 @@ public class LevelManager : MonoBehaviour
         public string currentLetter;
     }
 }
+
+
+
+
