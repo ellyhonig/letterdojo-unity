@@ -1,3 +1,4 @@
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
@@ -97,6 +98,8 @@ public class GestureWordGameController : MonoBehaviour
 
     List<Texture2D> _hintTextures = new();
     List<AudioClip> _wordClips = new();
+    readonly HashSet<string> _usedAsTarget = new(StringComparer.OrdinalIgnoreCase);
+    readonly HashSet<string> _lastRoundWordSet = new(StringComparer.OrdinalIgnoreCase);
 
     void Awake()
     {
@@ -144,6 +147,16 @@ public class GestureWordGameController : MonoBehaviour
 
     void Update()
     {
+        if (_awaitNeutral)
+        {
+            if (IsNeutral())
+            {
+                _awaitNeutral = false;
+                StartCoroutine(StartRoundRoutine(true));
+            }
+            return;
+        }
+
         if (!_roundActive) return;
 
         // Repeat hint every N seconds during round
@@ -151,16 +164,6 @@ public class GestureWordGameController : MonoBehaviour
         {
             StartCoroutine(PlayHintBurst());
             _nextHintAt = Time.time + Mathf.Max(1f, hintRepeatSeconds);
-        }
-
-        if (_awaitNeutral)
-        {
-            if (IsNeutral())
-            {
-                _awaitNeutral = false;
-                _ = StartRoundRoutine(true);
-            }
-            return;
         }
 
         // Detect gestures
@@ -203,17 +206,37 @@ public class GestureWordGameController : MonoBehaviour
             p.root.gameObject.SetActive(true);
         }
 
-        // Assign 4 distinct words (one per plane)
-        var pick = SampleDistinct(_wordPool, 4).ToArray();
-        _planes[Gesture.RightHandUp].label.text = pick[0];
-        _planes[Gesture.LeftHandUp].label.text  = pick[1];
-        _planes[Gesture.Squat].label.text       = pick[2];
-        _planes[Gesture.Clap].label.text        = pick[3];
+        if (thumbsUp) thumbsUp.SetActive(false);
 
-        // Pick target gesture at random among the 4
-        var allGestures = new[] { Gesture.RightHandUp, Gesture.LeftHandUp, Gesture.Squat, Gesture.Clap };
-        _activeGesture = allGestures[_rng.Next(allGestures.Length)];
-        _activeWord = _planes[_activeGesture].label.text;
+        // Assign fresh words with random plane mapping
+        var gestureOrder = new[] { Gesture.RightHandUp, Gesture.LeftHandUp, Gesture.Squat, Gesture.Clap };
+        var shuffledGestures = gestureOrder.OrderBy(_ => _rng.Next()).ToList();
+
+        string targetWord = PickTargetWord();
+        var fillerWords = PickFillerWords(targetWord, shuffledGestures.Count - 1);
+
+        int targetIndex = _rng.Next(shuffledGestures.Count);
+        _activeGesture = shuffledGestures[targetIndex];
+        _activeWord = targetWord;
+        if (!string.IsNullOrEmpty(_activeWord)) _usedAsTarget.Add(_activeWord);
+
+        int fillerIdx = 0;
+        for (int i = 0; i < shuffledGestures.Count; i++)
+        {
+            string wordForSlot = (i == targetIndex)
+                ? targetWord
+                : (fillerIdx < fillerWords.Count ? fillerWords[fillerIdx++] : string.Empty);
+
+            var slot = _planes[shuffledGestures[i]];
+            if (slot.label) slot.label.text = wordForSlot;
+        }
+
+        _lastRoundWordSet.Clear();
+        if (!string.IsNullOrWhiteSpace(targetWord)) _lastRoundWordSet.Add(targetWord);
+        foreach (var w in fillerWords)
+        {
+            if (!string.IsNullOrWhiteSpace(w)) _lastRoundWordSet.Add(w);
+        }
 
         // Smooth shuffle plane positions
         yield return SmoothShufflePlanes();
@@ -234,14 +257,29 @@ public class GestureWordGameController : MonoBehaviour
         targets = targets.OrderBy(_ => _rng.Next()).ToList();
 
         var startPositions = planeList.Select(p => p.root.position).ToArray();
+        var arcOffsets = new Vector3[planeList.Count];
+        for (int i = 0; i < planeList.Count; i++)
+        {
+            float height = Mathf.Lerp(0.15f, 0.3f, (float)_rng.NextDouble());
+            float lateral = (float)(_rng.NextDouble() * 0.2f - 0.1f);
+            var moveDir = (targets[i] - startPositions[i]).normalized;
+            var sideways = Vector3.Cross(Vector3.up, moveDir);
+            if (sideways.sqrMagnitude < 0.001f) sideways = Vector3.right;
+            arcOffsets[i] = Vector3.up * height + sideways.normalized * lateral;
+        }
+
         float t = 0f;
         while (t < shuffleSeconds)
         {
             t += Time.deltaTime;
-            var a = Mathf.Clamp01(t / shuffleSeconds);
+            var normalized = Mathf.Clamp01(t / shuffleSeconds);
+            var eased = normalized * normalized * (3f - 2f * normalized); // smoothstep easing
             for (int i = 0; i < planeList.Count; i++)
             {
-                planeList[i].root.position = Vector3.Lerp(startPositions[i], targets[i], a);
+                var p0 = startPositions[i];
+                var p2 = targets[i];
+                var p1 = Vector3.Lerp(p0, p2, 0.5f) + arcOffsets[i];
+                planeList[i].root.position = BezierPoint(p0, p1, p2, eased);
             }
             yield return null;
         }
@@ -250,23 +288,20 @@ public class GestureWordGameController : MonoBehaviour
 
     IEnumerator PlayHintBurst()
     {
-        // Image (flash on plane)
         if (hintPlaneRenderer)
         {
             var tex = FindHintTexture(_activeWord);
             if (tex)
             {
-                var wasActive = hintPlaneRenderer.gameObject.activeSelf;
                 hintPlaneRenderer.material.mainTexture = tex;
                 hintPlaneRenderer.gameObject.SetActive(true);
-                yield return new WaitForSeconds(hintFlashSeconds);
-                hintPlaneRenderer.gameObject.SetActive(wasActive); // “gone other time”
             }
         }
 
-        // Word audio
         var clip = FindHintClip(_activeWord);
         if (sfx && clip) sfx.PlayOneShot(clip);
+
+        yield break;
     }
 
     // ---------- Detection ----------
@@ -341,6 +376,52 @@ public class GestureWordGameController : MonoBehaviour
         }
     }
 
+    string PickTargetWord()
+    {
+        var candidates = _wordPool.Where(w => !_usedAsTarget.Contains(w) && !_lastRoundWordSet.Contains(w)).ToList();
+        if (candidates.Count == 0)
+        {
+            candidates = _wordPool.Where(w => !_usedAsTarget.Contains(w)).ToList();
+        }
+        if (candidates.Count == 0)
+        {
+            _usedAsTarget.Clear();
+            candidates = _wordPool.Where(w => !_lastRoundWordSet.Contains(w)).ToList();
+            if (candidates.Count == 0)
+            {
+                candidates = new List<string>(_wordPool);
+            }
+        }
+        if (candidates.Count == 0) return string.Empty;
+        return candidates[_rng.Next(candidates.Count)];
+    }
+
+    List<string> PickFillerWords(string targetWord, int count)
+    {
+        var exclude = new HashSet<string>(_lastRoundWordSet, StringComparer.OrdinalIgnoreCase);
+        if (!string.IsNullOrWhiteSpace(targetWord)) exclude.Add(targetWord);
+
+        var pool = _wordPool.Where(w => !exclude.Contains(w)).ToList();
+        if (pool.Count < count)
+        {
+            pool = _wordPool.Where(w => !string.Equals(w, targetWord, StringComparison.OrdinalIgnoreCase)).ToList();
+        }
+
+        var selection = SampleDistinct(pool, count).ToList();
+        while (selection.Count < count && pool.Count > 0)
+        {
+            selection.Add(pool[_rng.Next(pool.Count)]);
+        }
+
+        return selection;
+    }
+
+    static Vector3 BezierPoint(Vector3 p0, Vector3 p1, Vector3 p2, float t)
+    {
+        float u = 1f - t;
+        return (u * u * p0) + (2f * u * t * p1) + (t * t * p2);
+    }
+
     Texture2D FindHintTexture(string word)
     {
         if (_hintTextures.Count == 0) return null;
@@ -367,3 +448,4 @@ public class GestureWordGameController : MonoBehaviour
         go.SetActive(false);
     }
 }
+
