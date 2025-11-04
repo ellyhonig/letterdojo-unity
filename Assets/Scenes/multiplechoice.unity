@@ -134,6 +134,7 @@ GameObject:
   - component: {fileID: 184562389}
   - component: {fileID: 184562388}
   - component: {fileID: 184562390}
+  - component: {fileID: 184562391}
   m_Layer: 0
   m_Name: script
   m_TagString: Untagged
@@ -173,6 +174,14 @@ MonoBehaviour:
   hintPlaneRenderer: {fileID: 1308805773}
   hintFlashSeconds: 0.75
   hintRepeatSeconds: 7
+  boardRoot: {fileID: 1363701062}
+  anchorRecenterAngle: 35
+  anchorRecenterDistance: 0.2
+  anchorPositionSmoothTime: 0.25
+  anchorRotationLerpSpeed: 8
+  anchorRecenterCooldown: 0.75
+  anchorStopDistance: 0.01
+  anchorStopAngle: 1
   raiseAboveHead: 0.15
   squatDelta: 0.15
   neutralHeadTolerance: 0.05
@@ -292,6 +301,24 @@ AudioSource:
     m_PreInfinity: 2
     m_PostInfinity: 2
     m_RotationOrder: 4
+--- !u!114 &184562391
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 184562387}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: fd674360775b7254ea6f62007ca24bba, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  projectId: homedojo-dashboard
+  apiKey: AIzaSyA_f94XSrBcmuge4VSD8avpgJ6iWRpOC3g
+  room: default
+  pollInterval: 0.5
+  minigameSceneId: multiplechoice
+  mainSceneName: simpleLetterTrace
 --- !u!1 &253107128
 GameObject:
   m_ObjectHideFlags: 0

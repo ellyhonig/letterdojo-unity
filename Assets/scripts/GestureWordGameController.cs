@@ -52,6 +52,24 @@ public class GestureWordGameController : MonoBehaviour
     public float hintFlashSeconds = 0.75f;
     public float hintRepeatSeconds = 7f;
 
+    [Header("Board Anchor")]
+    [Tooltip("Root transform that should stay in front of the player. Defaults to this object.")]
+    [SerializeField] private Transform boardRoot;
+    [Tooltip("Recenter when rotation deviates beyond this many degrees.")]
+    [SerializeField, Range(0f, 180f)] private float anchorRecenterAngle = 35f;
+    [Tooltip("Recenter when distance from desired anchor exceeds this many meters.")]
+    [SerializeField] private float anchorRecenterDistance = 0.2f;
+    [Tooltip("Seconds used by SmoothDamp for anchor reposition.")]
+    [SerializeField] private float anchorPositionSmoothTime = 0.25f;
+    [Tooltip("Speed factor for anchor rotation easing.")]
+    [SerializeField] private float anchorRotationLerpSpeed = 8f;
+    [Tooltip("Cooldown between anchor recenter operations.")]
+    [SerializeField] private float anchorRecenterCooldown = 0.75f;
+    [Tooltip("Stop moving anchor when closer than this many meters to the target.")]
+    [SerializeField] private float anchorStopDistance = 0.01f;
+    [Tooltip("Stop rotating anchor when within this many degrees of the target.")]
+    [SerializeField] private float anchorStopAngle = 1f;
+
     [Header("Gesture Thresholds (tweak in play mode)")]
     [Tooltip("Meters hand must be above head.y for Right/Left gesture.")]
     public float raiseAboveHead = 0.15f;
@@ -101,6 +119,16 @@ public class GestureWordGameController : MonoBehaviour
     readonly HashSet<string> _usedAsTarget = new(StringComparer.OrdinalIgnoreCase);
     readonly HashSet<string> _lastRoundWordSet = new(StringComparer.OrdinalIgnoreCase);
 
+    Transform Anchor => boardRoot ? boardRoot : transform;
+    bool _anchorOffsetsCaptured;
+    Vector3 _anchorLocalOffset;
+    Quaternion _anchorLocalRotation;
+    Vector3 _anchorVelocity;
+    Vector3 _anchorTargetPos;
+    Quaternion _anchorTargetRot;
+    bool _anchorRepositioning;
+    float _lastAnchorRecenterAt;
+
     void Awake()
     {
         // Map planes + pull TMP
@@ -142,11 +170,14 @@ public class GestureWordGameController : MonoBehaviour
 
     void Start()
     {
+        CaptureAnchorOffsets();
         StartCoroutine(StartRoundRoutine());
     }
 
     void Update()
     {
+        UpdateAnchorTracking();
+
         if (_awaitNeutral)
         {
             if (IsNeutral())
@@ -351,6 +382,80 @@ public class GestureWordGameController : MonoBehaviour
     }
 
     // ---------- Utils ----------
+    void CaptureAnchorOffsets()
+    {
+        var anchor = Anchor;
+        if (!anchor || !head) return;
+
+        var headRotation = head.rotation;
+        _anchorLocalOffset = Quaternion.Inverse(headRotation) * (anchor.position - head.position);
+        _anchorLocalRotation = (Quaternion.Inverse(headRotation) * anchor.rotation).normalized;
+        _anchorTargetPos = anchor.position;
+        _anchorTargetRot = anchor.rotation;
+        _anchorOffsetsCaptured = true;
+        _anchorRepositioning = false;
+        _anchorVelocity = Vector3.zero;
+        _lastAnchorRecenterAt = Time.time;
+    }
+
+    void UpdateAnchorTracking()
+    {
+        var anchor = Anchor;
+        if (!anchor || !head) return;
+
+        if (!_anchorOffsetsCaptured)
+        {
+            CaptureAnchorOffsets();
+            return;
+        }
+
+        Vector3 desiredPos = head.position + head.rotation * _anchorLocalOffset;
+        Quaternion desiredRot = head.rotation * _anchorLocalRotation;
+
+        float angleDelta = Quaternion.Angle(anchor.rotation, desiredRot);
+        float distanceDeltaSqr = (anchor.position - desiredPos).sqrMagnitude;
+
+        if ((angleDelta >= anchorRecenterAngle ||
+             distanceDeltaSqr >= anchorRecenterDistance * anchorRecenterDistance) &&
+            Time.time - _lastAnchorRecenterAt >= anchorRecenterCooldown)
+        {
+            SetAnchorTarget(desiredPos, desiredRot);
+        }
+
+        if (_anchorRepositioning)
+        {
+            anchor.position = Vector3.SmoothDamp(
+                anchor.position,
+                _anchorTargetPos,
+                ref _anchorVelocity,
+                anchorPositionSmoothTime);
+
+            anchor.rotation = Quaternion.Slerp(
+                anchor.rotation,
+                _anchorTargetRot,
+                anchorRotationLerpSpeed * Time.deltaTime);
+
+            bool posSettled = (anchor.position - _anchorTargetPos).sqrMagnitude <= (anchorStopDistance * anchorStopDistance);
+            bool rotSettled = Quaternion.Angle(anchor.rotation, _anchorTargetRot) <= anchorStopAngle;
+
+            if (posSettled && rotSettled)
+            {
+                anchor.position = _anchorTargetPos;
+                anchor.rotation = _anchorTargetRot;
+                _anchorRepositioning = false;
+            }
+        }
+    }
+
+    void SetAnchorTarget(Vector3 position, Quaternion rotation)
+    {
+        _anchorTargetPos = position;
+        _anchorTargetRot = rotation;
+        _anchorVelocity = Vector3.zero;
+        _anchorRepositioning = true;
+        _lastAnchorRecenterAt = Time.time;
+    }
+
     void RegisterPlane(Gesture g, Transform t)
     {
         var slot = new PlaneSlot
