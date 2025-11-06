@@ -1,6 +1,7 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
@@ -350,9 +351,14 @@ public class FirebaseLevelSyncSinglePlan : MonoBehaviour
         try { dto = JsonConvert.DeserializeObject<WrapperDTO>(basePlanJson.text); }
         catch (Exception ex) { Debug.LogError("[HttpSync] Bad base plan JSON: " + ex.Message); return false; }
 
-        var letterSequence = LooksLikeLetterList(remoteLetters)
-            ? NormalizeLetterSequence(remoteLetters)
-            : ExtractBaseLetters(dto);
+        var letterSequence = NormalizeLetterSequence(remoteLetters);
+        if (letterSequence.Count > 0)
+        {
+            letterSequence = letterSequence
+                .Where(l => !string.IsNullOrEmpty(l))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
         if (letterSequence.Count == 0)
             letterSequence = ExtractBaseLetters(dto);
         if (letterSequence.Count == 0)
@@ -502,23 +508,6 @@ public class FirebaseLevelSyncSinglePlan : MonoBehaviour
                 return false;
         }
         return true;
-    }
-
-    private static bool LooksLikeLetterList(List<string> values)
-    {
-        if (values == null) return false;
-        bool seenEntry = false;
-        foreach (var entry in values)
-        {
-            string trimmed = (entry ?? string.Empty).Trim();
-            if (trimmed.Length == 0) continue;
-            seenEntry = true;
-            if (trimmed.Length != 1)
-                return false;
-            if (!char.IsLetter(trimmed[0]))
-                return false;
-        }
-        return seenEntry;
     }
 
     private static List<string> ExtractBaseLetters(WrapperDTO dto)
