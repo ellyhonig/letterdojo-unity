@@ -21,11 +21,29 @@ public static class SharedWordLibrary
     public const string DefaultHintFolder = "wordphotos";
     public const string DefaultAudioFolder = "wordaudio";
 
-    static readonly List<Texture2D> s_hintTextures = new();
-    static readonly HashSet<string> s_loadedHintFolders = new(StringComparer.OrdinalIgnoreCase);
+    sealed class HintEntry
+    {
+        public string normalizedName;
+        public string resourcePath;
+    }
 
-    static readonly List<AudioClip> s_wordClips = new();
-    static readonly HashSet<string> s_loadedAudioFolders = new(StringComparer.OrdinalIgnoreCase);
+    sealed class AudioEntry
+    {
+        public string normalizedName;
+        public string resourcePath;
+    }
+
+    static readonly Dictionary<string, List<HintEntry>> s_hintEntriesByFolder = new(StringComparer.OrdinalIgnoreCase);
+    static readonly List<HintEntry> s_allHintEntries = new();
+    static readonly Dictionary<string, Texture2D> s_loadedHintTextures = new(StringComparer.OrdinalIgnoreCase);
+    static readonly Dictionary<Texture2D, string> s_hintTextureToPath = new();
+    static readonly HashSet<string> s_indexedHintFolders = new(StringComparer.OrdinalIgnoreCase);
+
+    static readonly Dictionary<string, List<AudioEntry>> s_audioEntriesByFolder = new(StringComparer.OrdinalIgnoreCase);
+    static readonly List<AudioEntry> s_allAudioEntries = new();
+    static readonly Dictionary<string, AudioClip> s_loadedAudioClips = new(StringComparer.OrdinalIgnoreCase);
+    static readonly Dictionary<AudioClip, string> s_audioClipToPath = new();
+    static readonly HashSet<string> s_indexedAudioFolders = new(StringComparer.OrdinalIgnoreCase);
 
     public static IReadOnlyList<string> Words => DefaultWords;
 
@@ -37,15 +55,26 @@ public static class SharedWordLibrary
         EnsureHintFolders(additionalFolders);
         string query = NormalizeKey(word);
 
-        var matches = s_hintTextures
-            .Where(t => t && NormalizeKey(t.name).Contains(query))
+        var candidates = GatherHintEntries(additionalFolders);
+        var matches = candidates
+            .Where(e => e.normalizedName.Contains(query))
             .ToList();
 
         if (matches.Count == 0)
             return null;
 
         int index = UnityEngine.Random.Range(0, matches.Count);
-        return matches[index];
+        var entry = matches[index];
+        if (s_loadedHintTextures.TryGetValue(entry.resourcePath, out var cached) && cached)
+            return cached;
+
+        var texture = Resources.Load<Texture2D>(entry.resourcePath);
+        if (texture)
+        {
+            s_loadedHintTextures[entry.resourcePath] = texture;
+            s_hintTextureToPath[texture] = entry.resourcePath;
+        }
+        return texture;
     }
 
     public static AudioClip FindWordClip(string word, params string[] additionalFolders)
@@ -56,70 +85,182 @@ public static class SharedWordLibrary
         EnsureAudioFolders(additionalFolders);
         string query = NormalizeKey(word);
 
-        var matches = s_wordClips
-            .Where(c => c && NormalizeKey(c.name).Contains(query))
+        var candidates = GatherAudioEntries(additionalFolders);
+        var matches = candidates
+            .Where(e => e.normalizedName.Contains(query))
             .ToList();
 
         if (matches.Count == 0)
             return null;
 
         int index = UnityEngine.Random.Range(0, matches.Count);
-        return matches[index];
+        var entry = matches[index];
+        if (s_loadedAudioClips.TryGetValue(entry.resourcePath, out var cached) && cached)
+            return cached;
+
+        var clip = Resources.Load<AudioClip>(entry.resourcePath);
+        if (clip)
+        {
+            s_loadedAudioClips[entry.resourcePath] = clip;
+            s_audioClipToPath[clip] = entry.resourcePath;
+        }
+        return clip;
+    }
+
+    public static void ReleaseHintTexture(Texture2D texture)
+    {
+        if (!texture)
+            return;
+
+        if (s_hintTextureToPath.TryGetValue(texture, out var path))
+        {
+            s_hintTextureToPath.Remove(texture);
+            s_loadedHintTextures.Remove(path);
+            Resources.UnloadAsset(texture);
+        }
+    }
+
+    public static void ReleaseWordClip(AudioClip clip)
+    {
+        if (!clip)
+            return;
+
+        if (s_audioClipToPath.TryGetValue(clip, out var path))
+        {
+            s_audioClipToPath.Remove(clip);
+            s_loadedAudioClips.Remove(path);
+            Resources.UnloadAsset(clip);
+        }
     }
 
     static void EnsureHintFolders(IEnumerable<string> extraFolders)
     {
-        EnsureFolderLoaded(DefaultHintFolder, s_loadedHintFolders, folder =>
-        {
-            var loaded = Resources.LoadAll<Texture2D>(folder);
-            if (loaded != null && loaded.Length > 0)
-                s_hintTextures.AddRange(loaded.Where(t => t));
-        });
+        EnsureHintFolderIndexed(DefaultHintFolder);
 
         if (extraFolders == null) return;
         foreach (var folder in extraFolders)
         {
-            EnsureFolderLoaded(folder, s_loadedHintFolders, f =>
-            {
-                var loaded = Resources.LoadAll<Texture2D>(f);
-                if (loaded != null && loaded.Length > 0)
-                    s_hintTextures.AddRange(loaded.Where(t => t));
-            });
+            EnsureHintFolderIndexed(folder);
         }
     }
 
     static void EnsureAudioFolders(IEnumerable<string> extraFolders)
     {
-        EnsureFolderLoaded(DefaultAudioFolder, s_loadedAudioFolders, folder =>
-        {
-            var loaded = Resources.LoadAll<AudioClip>(folder);
-            if (loaded != null && loaded.Length > 0)
-                s_wordClips.AddRange(loaded.Where(c => c));
-        });
+        EnsureAudioFolderIndexed(DefaultAudioFolder);
 
         if (extraFolders == null) return;
         foreach (var folder in extraFolders)
         {
-            EnsureFolderLoaded(folder, s_loadedAudioFolders, f =>
-            {
-                var loaded = Resources.LoadAll<AudioClip>(f);
-                if (loaded != null && loaded.Length > 0)
-                    s_wordClips.AddRange(loaded.Where(c => c));
-            });
+            EnsureAudioFolderIndexed(folder);
         }
     }
 
-    static void EnsureFolderLoaded(string folder, HashSet<string> loadedSet, Action<string> loader)
+    static void EnsureHintFolderIndexed(string folder)
     {
         if (string.IsNullOrWhiteSpace(folder))
             return;
 
         folder = folder.Trim();
-        if (loadedSet.Contains(folder))
+        if (s_indexedHintFolders.Contains(folder))
             return;
 
-        loader(folder);
-        loadedSet.Add(folder);
+        var loaded = Resources.LoadAll<Texture2D>(folder);
+        if (loaded != null && loaded.Length > 0)
+        {
+            if (!s_hintEntriesByFolder.TryGetValue(folder, out var list))
+            {
+                list = new List<HintEntry>();
+                s_hintEntriesByFolder[folder] = list;
+            }
+
+            foreach (var tex in loaded)
+            {
+                if (!tex) continue;
+                var entry = new HintEntry
+                {
+                    normalizedName = NormalizeKey(tex.name),
+                    resourcePath = $"{folder}/{tex.name}"
+                };
+                list.Add(entry);
+                s_allHintEntries.Add(entry);
+                Resources.UnloadAsset(tex);
+            }
+        }
+
+        s_indexedHintFolders.Add(folder);
+    }
+
+    static void EnsureAudioFolderIndexed(string folder)
+    {
+        if (string.IsNullOrWhiteSpace(folder))
+            return;
+
+        folder = folder.Trim();
+        if (s_indexedAudioFolders.Contains(folder))
+            return;
+
+        var loaded = Resources.LoadAll<AudioClip>(folder);
+        if (loaded != null && loaded.Length > 0)
+        {
+            if (!s_audioEntriesByFolder.TryGetValue(folder, out var list))
+            {
+                list = new List<AudioEntry>();
+                s_audioEntriesByFolder[folder] = list;
+            }
+
+            foreach (var clip in loaded)
+            {
+                if (!clip) continue;
+                var entry = new AudioEntry
+                {
+                    normalizedName = NormalizeKey(clip.name),
+                    resourcePath = $"{folder}/{clip.name}"
+                };
+                list.Add(entry);
+                s_allAudioEntries.Add(entry);
+                Resources.UnloadAsset(clip);
+            }
+        }
+
+        s_indexedAudioFolders.Add(folder);
+    }
+
+    static List<HintEntry> GatherHintEntries(IEnumerable<string> extraFolders)
+    {
+        var result = new List<HintEntry>();
+        if (s_hintEntriesByFolder.TryGetValue(DefaultHintFolder, out var defaults))
+            result.AddRange(defaults);
+
+        if (extraFolders != null)
+        {
+            foreach (var folder in extraFolders)
+            {
+                if (string.IsNullOrWhiteSpace(folder)) continue;
+                if (s_hintEntriesByFolder.TryGetValue(folder.Trim(), out var entries))
+                    result.AddRange(entries);
+            }
+        }
+
+        return result.Count > 0 ? result : s_allHintEntries;
+    }
+
+    static List<AudioEntry> GatherAudioEntries(IEnumerable<string> extraFolders)
+    {
+        var result = new List<AudioEntry>();
+        if (s_audioEntriesByFolder.TryGetValue(DefaultAudioFolder, out var defaults))
+            result.AddRange(defaults);
+
+        if (extraFolders != null)
+        {
+            foreach (var folder in extraFolders)
+            {
+                if (string.IsNullOrWhiteSpace(folder)) continue;
+                if (s_audioEntriesByFolder.TryGetValue(folder.Trim(), out var entries))
+                    result.AddRange(entries);
+            }
+        }
+
+        return result.Count > 0 ? result : s_allAudioEntries;
     }
 
     static string NormalizeKey(string value)

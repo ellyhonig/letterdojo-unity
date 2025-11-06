@@ -129,8 +129,7 @@ public class GestureWordGameController : MonoBehaviour
 
     List<string> _wordPool;
 
-    List<Texture2D> _hintTextures = new();
-    List<AudioClip> _wordClips = new();
+    Texture2D _activeHintTexture;
     readonly HashSet<string> _usedAsTarget = new(StringComparer.OrdinalIgnoreCase);
     readonly HashSet<string> _lastRoundWordSet = new(StringComparer.OrdinalIgnoreCase);
 
@@ -187,19 +186,6 @@ public class GestureWordGameController : MonoBehaviour
             "Get","Red","Bed","Yes","Men","Wet","Pen","Ten","Jet","Pet","Leg","Met","Fed","Let","Yet"
         });
 
-        // Load hint textures
-        if (hintImageFolders != null)
-        {
-            foreach (var f in hintImageFolders.Where(s => !string.IsNullOrWhiteSpace(s)))
-                _hintTextures.AddRange(Resources.LoadAll<Texture2D>(f));
-        }
-
-        // Load audio clips
-        if (hintAudioFolders != null)
-        {
-            foreach (var f in hintAudioFolders.Where(s => !string.IsNullOrWhiteSpace(s)))
-                _wordClips.AddRange(Resources.LoadAll<AudioClip>(f));
-        }
     }
 
     void Start()
@@ -418,8 +404,22 @@ public class GestureWordGameController : MonoBehaviour
             var tex = FindHintTexture(_activeWord);
             if (tex)
             {
+                var previous = _activeHintTexture;
+                _activeHintTexture = tex;
                 hintPlaneRenderer.material.mainTexture = tex;
                 hintPlaneRenderer.gameObject.SetActive(true);
+                if (previous && previous != tex)
+                    SharedWordLibrary.ReleaseHintTexture(previous);
+            }
+            else
+            {
+                if (_activeHintTexture)
+                {
+                    SharedWordLibrary.ReleaseHintTexture(_activeHintTexture);
+                    _activeHintTexture = null;
+                }
+                if (hintPlaneRenderer.gameObject.activeSelf)
+                    hintPlaneRenderer.gameObject.SetActive(false);
             }
         }
 
@@ -695,20 +695,23 @@ public class GestureWordGameController : MonoBehaviour
 
     Texture2D FindHintTexture(string word)
     {
-        if (_hintTextures.Count == 0) return null;
-        string w = word.ToLowerInvariant();
-        var matches = _hintTextures.Where(t => t && t.name.ToLowerInvariant().Contains(w)).ToList();
-        if (matches.Count == 0) return null;
-        return matches[_rng.Next(matches.Count)];
+        if (string.IsNullOrWhiteSpace(word)) return null;
+        return SharedWordLibrary.FindHintTexture(word, hintImageFolders);
     }
 
     AudioClip FindHintClip(string word)
     {
-        if (_wordClips.Count == 0) return null;
-        string w = word.ToLowerInvariant();
-        var matches = _wordClips.Where(c => c && c.name.ToLowerInvariant().Contains(w)).ToList();
-        if (matches.Count == 0) return null;
-        return matches[_rng.Next(matches.Count)];
+        if (string.IsNullOrWhiteSpace(word)) return null;
+        return SharedWordLibrary.FindWordClip(word, hintAudioFolders);
+    }
+
+    void OnDisable()
+    {
+        if (_activeHintTexture)
+        {
+            SharedWordLibrary.ReleaseHintTexture(_activeHintTexture);
+            _activeHintTexture = null;
+        }
     }
 
     IEnumerator FlashFor(GameObject go, float secs)

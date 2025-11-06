@@ -86,11 +86,22 @@ public class GestureGameFirebaseWatcher : MonoBehaviour
 
     bool IsMiniGameScene(string sceneId) => NormalizeSceneId(sceneId) == _minigameSceneIdNormalized;
 
+    static readonly string[] MiniGameSceneAliases =
+    {
+        "multiplechoice",
+        "minigame",
+        "mini-game",
+        "mini_game",
+        "multiple_choice",
+        "mini"
+    };
+
     static string NormalizeSceneId(string sceneId)
     {
         if (string.IsNullOrWhiteSpace(sceneId)) return string.Empty;
         string lowered = sceneId.Trim().ToLowerInvariant();
         if (lowered == "simplelettertrace") return "main";
+        if (Array.Exists(MiniGameSceneAliases, alias => alias == lowered)) return "multiplechoice";
         return lowered;
     }
 }

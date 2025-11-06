@@ -735,6 +735,16 @@ public class FirebaseLevelSyncSinglePlan : MonoBehaviour
         }
     }
 
+    private static readonly string[] MinigameSceneAliases =
+    {
+        SceneIdMinigame,
+        "minigame",
+        "mini-game",
+        "mini_game",
+        "multiple_choice",
+        "mini"
+    };
+
     private static string NormalizeSceneId(string sceneName)
     {
         if (string.IsNullOrWhiteSpace(sceneName))
@@ -747,7 +757,7 @@ public class FirebaseLevelSyncSinglePlan : MonoBehaviour
             return SceneIdMain;
         if (lowered == SceneIdMain)
             return SceneIdMain;
-        if (lowered == SceneIdMinigame)
+        if (IsMinigameSceneAlias(lowered))
             return SceneIdMinigame;
 
         return lowered;
@@ -761,10 +771,13 @@ public class FirebaseLevelSyncSinglePlan : MonoBehaviour
         string lowered = sceneId.Trim().ToLowerInvariant();
         if (lowered == SceneIdMain || lowered == "simplelettertrace")
             return UnitySceneMainName;
-        if (lowered == SceneIdMinigame)
+        if (IsMinigameSceneAlias(lowered))
             return UnitySceneMinigameName;
         return sceneId.Trim();
     }
+
+    private static bool IsMinigameSceneAlias(string lowered) =>
+        Array.Exists(MinigameSceneAliases, alias => alias == lowered);
 
     private static List<string> NormalizeWordList(List<string> words)
     {
