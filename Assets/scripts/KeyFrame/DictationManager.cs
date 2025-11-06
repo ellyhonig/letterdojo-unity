@@ -50,6 +50,16 @@ public class DictationManager : MonoBehaviour
     [SerializeField] private float waitAfterReplay  = 0.5f;
     [SerializeField] private float waitAfterCorrect = 0.5f;
 
+    [Header("Word Hints")]
+    [SerializeField] private Renderer wordHintRenderer;
+    [SerializeField] private string[] wordHintImageFolders;
+    [SerializeField] private string[] wordAudioFolders;
+    [SerializeField, Tooltip("Seconds between automatic word audio repeats.")] private float wordAudioRepeatSeconds = 7f;
+    [SerializeField, Tooltip("Seconds between automatic letter audio repeats.")] private float letterAudioRepeatSeconds = 7f;
+    [SerializeField] private AudioSource wordAudioSource;
+    [SerializeField, Tooltip("If true, automatically pull dictation words from SharedWordLibrary when the level plan only supplies single letters.")]
+    private bool useSharedWordLibraryForDictation = true;
+
     [Header("Board Capture (no crop/rotate)")]
     [SerializeField] private Camera   boardCamera;
     [SerializeField] private Renderer boardRenderer;
@@ -160,6 +170,15 @@ public class DictationManager : MonoBehaviour
     private HandState _leftHandState = HandState.Idle;
     private int _lastObservedStrokeTotal = 0;
     private bool _playedInitialAudio = false;
+    private bool _playedInitialWordAudio = false;
+    private bool _loopWordAudio = false;
+    private bool _loopLetterAudio = false;
+    private float _nextWordAudioAt = -1f;
+    private float _nextLetterAudioAt = -1f;
+    private string _activeWordForHint = string.Empty;
+    private string _activeWordForAudio = string.Empty;
+    private readonly HashSet<string> _missingWordAudio = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    private MaterialPropertyBlock _wordHintBlock;
     private string _multiLetterWordRaw = string.Empty;
     private readonly List<MultiLetterStatus> _multiLetterStatuses = new List<MultiLetterStatus>(16);
     private int _multiLetterIndex = 0;
@@ -171,6 +190,24 @@ public class DictationManager : MonoBehaviour
     private bool ShouldUseRemoteGrading => useRemoteClassifier && !string.IsNullOrWhiteSpace(remoteClassifierBaseUrl);
     private bool IsMultiLetterActive => _multiLetterWordRaw.Length > 1 && _multiLetterStatuses.Count > 0;
     private bool _isFreeDrawingMode = false;
+    private bool _suppressDictationLetterHandling = false;
+    private readonly List<string> _sharedDictationWords = new List<string>();
+    private readonly HashSet<string> _sharedDictationWordSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    private int _sharedDictationWordCursor = 0;
+    private readonly System.Random _sharedDictationWordRng = new System.Random();
+
+    public bool IsWordDictationActive =>
+        !_isFreeDrawingMode &&
+        lvl != null &&
+        lvl.currentMode == LevelManager.GameMode.Dictation &&
+        IsMultiLetterActive &&
+        _multiLetterWordRaw.Length > 1;
+
+    public bool IsLetterDictationActive =>
+        !_isFreeDrawingMode &&
+        lvl != null &&
+        lvl.currentMode == LevelManager.GameMode.Dictation &&
+        !IsWordDictationActive;
 
     public void ReleaseMemory()
     {
@@ -182,6 +219,7 @@ public class DictationManager : MonoBehaviour
 
         ClearBoardVisuals();
         ResetMultiLetterState();
+        ResetAudioLoops();
 
         if (debugLocalButtonGO)
             debugLocalButtonGO.SetActive(false);
@@ -200,6 +238,18 @@ public class DictationManager : MonoBehaviour
         saver  = GetComponent<SaveManager>();
         ResolveAudioManager();
         ResolveHintDisplay();
+        if (!wordAudioSource)
+        {
+            var holder = new GameObject("DictationWordAudio");
+            holder.transform.SetParent(transform, false);
+            wordAudioSource = holder.AddComponent<AudioSource>();
+        }
+        if (wordAudioSource)
+        {
+            wordAudioSource.playOnAwake = false;
+            wordAudioSource.spatialBlend = 0f;
+            wordAudioSource.loop = false;
+        }
         if (lvl != null)
             lvl.OnLetterChanged += HandleLevelManagerLetterChanged;
 
@@ -314,8 +364,7 @@ public class DictationManager : MonoBehaviour
         if (debugLocalBtn) debugLocalBtn.OnButtonPressed += HandleDebugLocalBtn;
         ClearBoardVisuals();
         UpdateUI();
-        if (!_isFreeDrawingMode)
-            TryPlayInitialLetterAudio();
+        RefreshWordHintAndAudio(false);
     }
     void OnDisable()
     {
@@ -329,6 +378,8 @@ public class DictationManager : MonoBehaviour
             _debugLocalRoutine = null;
         }
         _playedInitialAudio = false;
+        _playedInitialWordAudio = false;
+        ResetAudioLoops();
     }
 
     void OnDestroy()
@@ -449,27 +500,15 @@ public class DictationManager : MonoBehaviour
         return trimmed.Length > 0 ? trimmed.ToLowerInvariant() : "?";
     }
 
-    private void TryPlayInitialLetterAudio()
-    {
-        if (_isFreeDrawingMode)
-            return;
-        if (_playedInitialAudio)
-            return;
-        if (!isActiveAndEnabled)
-            return;
-        if (lvl == null || string.IsNullOrEmpty(lvl.currentLetter))
-            return;
-
-        if (TryPlayCurrentLetterAudio())
-            _playedInitialAudio = true;
-    }
-
     private void HandleLevelManagerLetterChanged(string newLetter)
     {
+        if (_suppressDictationLetterHandling)
+            return;
+
         _playedInitialAudio = false;
+        _playedInitialWordAudio = false;
         PrepareMultiLetterState();
-        if (lvl != null && lvl.currentMode == LevelManager.GameMode.Dictation)
-            TryPlayInitialLetterAudio();
+        RefreshWordHintAndAudio(IsWordDictationActive);
     }
 
     private void ResetMultiLetterState()
@@ -486,7 +525,31 @@ public class DictationManager : MonoBehaviour
     {
         ResetMultiLetterState();
 
-        _multiLetterWordRaw = lvl != null ? lvl.currentLetter ?? string.Empty : string.Empty;
+        string resolved = lvl != null ? lvl.currentLetter ?? string.Empty : string.Empty;
+        resolved = string.IsNullOrWhiteSpace(resolved) ? string.Empty : resolved.Trim();
+
+        if (useSharedWordLibraryForDictation && ShouldAdoptSharedWord(resolved))
+        {
+            string sharedWord = GetNextSharedDictationWord();
+            if (!string.IsNullOrEmpty(sharedWord))
+            {
+                resolved = sharedWord;
+                if (lvl != null)
+                {
+                    _suppressDictationLetterHandling = true;
+                    try
+                    {
+                        lvl.OverrideCurrentLetterForDictation(sharedWord);
+                    }
+                    finally
+                    {
+                        _suppressDictationLetterHandling = false;
+                    }
+                }
+            }
+        }
+
+        _multiLetterWordRaw = resolved;
         if (string.IsNullOrWhiteSpace(_multiLetterWordRaw))
         {
             _multiLetterWordRaw = string.Empty;
@@ -522,6 +585,61 @@ public class DictationManager : MonoBehaviour
         while (index < _multiLetterStatuses.Count && _multiLetterStatuses[index] == MultiLetterStatus.Correct)
             index++;
         return index;
+    }
+
+    private bool ShouldAdoptSharedWord(string currentValue)
+    {
+        if (!useSharedWordLibraryForDictation)
+            return false;
+        if (string.IsNullOrEmpty(currentValue))
+            return true;
+        return currentValue.Length <= 1;
+    }
+
+    private string GetNextSharedDictationWord()
+    {
+        EnsureSharedDictationWordPool();
+        if (_sharedDictationWords.Count == 0)
+            return string.Empty;
+        if (_sharedDictationWordCursor >= _sharedDictationWords.Count)
+        {
+            ShuffleSharedDictationWords();
+            _sharedDictationWordCursor = 0;
+        }
+        return _sharedDictationWords[_sharedDictationWordCursor++];
+    }
+
+    private void EnsureSharedDictationWordPool()
+    {
+        if (_sharedDictationWords.Count == 0)
+        {
+            _sharedDictationWordSet.Clear();
+            var source = SharedWordLibrary.Words;
+            if (source != null)
+            {
+                foreach (var word in source)
+                {
+                    string trimmed = word?.Trim();
+                    if (string.IsNullOrEmpty(trimmed) || trimmed.Length <= 1)
+                        continue;
+                    if (_sharedDictationWordSet.Add(trimmed))
+                        _sharedDictationWords.Add(trimmed);
+                }
+            }
+            if (_sharedDictationWords.Count > 1)
+                ShuffleSharedDictationWords();
+            _sharedDictationWordCursor = 0;
+        }
+    }
+
+    private void ShuffleSharedDictationWords()
+    {
+        int count = _sharedDictationWords.Count;
+        for (int i = count - 1; i > 0; i--)
+        {
+            int j = _sharedDictationWordRng.Next(i + 1);
+            (_sharedDictationWords[i], _sharedDictationWords[j]) = (_sharedDictationWords[j], _sharedDictationWords[i]);
+        }
     }
 
     private string GetCurrentMultiLetterTarget()
@@ -855,8 +973,7 @@ public class DictationManager : MonoBehaviour
             _lastStrokeChangeTime = Time.time;
 
             SetFeedback($"Correct! Next letter (saw '{gotDisplay}').");
-            if (TryPlayCurrentLetterAudio())
-                _playedInitialAudio = true;
+            _loopLetterAudio = false;
             yield break;
         }
 
@@ -873,6 +990,11 @@ public class DictationManager : MonoBehaviour
         if (_multiLetterErrorRoutine != null)
             StopCoroutine(_multiLetterErrorRoutine);
         _multiLetterErrorRoutine = StartCoroutine(MultiLetterErrorRoutine(message));
+        if (TryPlayCurrentLetterAudio())
+        {
+            _loopLetterAudio = true;
+            _nextLetterAudioAt = Time.time + Mathf.Max(1f, letterAudioRepeatSeconds);
+        }
         yield break;
     }
 
@@ -998,6 +1120,7 @@ public class DictationManager : MonoBehaviour
         }
 
         AutoGradeUpdate();
+        UpdateAutomaticAudioLoops();
     }
 
     private void AutoGradeUpdate()
@@ -1051,6 +1174,7 @@ public class DictationManager : MonoBehaviour
         bool isDictLike = isDict || isFree;
 
         _isFreeDrawingMode = isFree;
+        ResetAudioLoops();
 
         if (drawerHost) drawerHost.SetActive(isDictLike);
 
@@ -1076,6 +1200,9 @@ public class DictationManager : MonoBehaviour
 
         attemptCount = 0; // reset tries
         ClearBoardVisuals();
+        ResetAudioLoops();
+        _playedInitialAudio = false;
+        _playedInitialWordAudio = false;
         _autoGradeTriggeredForStroke = false;
         _autoGradeRunning = false;
         _lastStrokeCount = 0;
@@ -1094,6 +1221,7 @@ public class DictationManager : MonoBehaviour
         if (tmpLetter != null) tmpLetter.SetActive(false);
 
         PrepareMultiLetterState();
+        RefreshWordHintAndAudio(IsWordDictationActive);
 
         state = State.Drawing;
         UpdateUI();
@@ -1111,8 +1239,6 @@ public class DictationManager : MonoBehaviour
         }
 
         OnDictationStart?.Invoke();
-        if (!_isFreeDrawingMode && TryPlayCurrentLetterAudio())
-            _playedInitialAudio = true;
         ClearBoardVisuals();
     }
 
@@ -1149,8 +1275,28 @@ public class DictationManager : MonoBehaviour
         if (_isFreeDrawingMode) return;
         if (!isActiveAndEnabled) return;
 
+        if (IsWordDictationActive)
+        {
+            if (PlayCurrentWordAudio())
+            {
+                string word = GetCurrentWordForAudio();
+                if (!string.IsNullOrEmpty(word))
+                    SetFeedback($"Listen: '{word.ToLowerInvariant()}'");
+            }
+            else
+            {
+                SetFeedback("Word audio unavailable.");
+            }
+            return;
+        }
+
         char letter = ExtractFirstAsciiLetter(lvl != null ? lvl.currentLetter : null);
         bool played = TryPlayCurrentLetterAudio();
+        if (played)
+        {
+            _loopLetterAudio = true;
+            _nextLetterAudioAt = Time.time + Mathf.Max(1f, letterAudioRepeatSeconds);
+        }
 
         if (letter != '\0')
         {
@@ -1197,6 +1343,171 @@ public class DictationManager : MonoBehaviour
             string letter = lvl != null ? lvl.currentLetter : null;
             display.ShowHintForLetter(letter, resetAttempts: true);
         }
+    }
+
+    private void RefreshWordHintAndAudio(bool playImmediately)
+    {
+        StartAutomaticAudio(playImmediately);
+        UpdateWordHintTexture();
+    }
+
+    private void UpdateWordHintTexture()
+    {
+        if (!wordHintRenderer)
+            return;
+
+        if (!IsWordDictationActive)
+        {
+            if (wordHintRenderer.gameObject.activeSelf)
+                wordHintRenderer.gameObject.SetActive(false);
+            _activeWordForHint = string.Empty;
+            return;
+        }
+
+        string key = DetermineWordHintKey();
+        if (string.Equals(key, _activeWordForHint, StringComparison.OrdinalIgnoreCase))
+            return;
+
+        _activeWordForHint = key ?? string.Empty;
+
+        if (string.IsNullOrEmpty(key) || key.Length <= 1)
+        {
+            if (wordHintRenderer.gameObject.activeSelf)
+                wordHintRenderer.gameObject.SetActive(false);
+            return;
+        }
+
+        var texture = SharedWordLibrary.FindHintTexture(key, wordHintImageFolders);
+        if (!texture)
+        {
+            if (wordHintRenderer.gameObject.activeSelf)
+                wordHintRenderer.gameObject.SetActive(false);
+            return;
+        }
+
+        if (_wordHintBlock == null)
+            _wordHintBlock = new MaterialPropertyBlock();
+
+        _wordHintBlock.SetTexture("_MainTex", texture);
+        wordHintRenderer.SetPropertyBlock(_wordHintBlock);
+        if (!wordHintRenderer.gameObject.activeSelf)
+            wordHintRenderer.gameObject.SetActive(true);
+    }
+
+    private string DetermineWordHintKey()
+    {
+        if (IsMultiLetterActive && !string.IsNullOrEmpty(_multiLetterWordRaw))
+            return _multiLetterWordRaw;
+        return lvl != null ? lvl.currentLetter : null;
+    }
+
+    private void ResetAudioLoops()
+    {
+        _loopWordAudio = false;
+        _loopLetterAudio = false;
+        _nextWordAudioAt = -1f;
+        _nextLetterAudioAt = -1f;
+        if (wordAudioSource && wordAudioSource.isPlaying)
+            wordAudioSource.Stop();
+        _activeWordForAudio = string.Empty;
+        _activeWordForHint = string.Empty;
+        if (wordHintRenderer && wordHintRenderer.gameObject.activeSelf)
+            wordHintRenderer.gameObject.SetActive(false);
+        _playedInitialWordAudio = false;
+    }
+
+    private void StartAutomaticAudio(bool playImmediately)
+    {
+        ResetAudioLoops();
+
+        if (_isFreeDrawingMode || !isActiveAndEnabled)
+            return;
+        if (lvl == null || lvl.currentMode != LevelManager.GameMode.Dictation)
+            return;
+
+        bool hasWord = IsWordDictationActive;
+        if (hasWord)
+        {
+            if (playImmediately)
+                _playedInitialWordAudio = PlayCurrentWordAudio() || _playedInitialWordAudio;
+            _loopWordAudio = true;
+            _loopLetterAudio = false;
+            _nextWordAudioAt = Time.time + Mathf.Max(1f, wordAudioRepeatSeconds);
+        }
+        else
+        {
+            if (playImmediately && TryPlayCurrentLetterAudio())
+                _playedInitialAudio = true;
+            _loopLetterAudio = true;
+            _nextLetterAudioAt = Time.time + Mathf.Max(1f, letterAudioRepeatSeconds);
+        }
+    }
+
+    private void UpdateAutomaticAudioLoops()
+    {
+        if (_isFreeDrawingMode || lvl == null || lvl.currentMode != LevelManager.GameMode.Dictation)
+            return;
+
+        float now = Time.time;
+
+        if (_loopWordAudio && now >= _nextWordAudioAt)
+        {
+            if (PlayCurrentWordAudio())
+                _nextWordAudioAt = now + Mathf.Max(1f, wordAudioRepeatSeconds);
+            else
+                _loopWordAudio = false;
+        }
+
+        if (_loopLetterAudio && now >= _nextLetterAudioAt)
+        {
+            if (TryPlayCurrentLetterAudio())
+            {
+                _playedInitialAudio = true;
+                _nextLetterAudioAt = now + Mathf.Max(1f, letterAudioRepeatSeconds);
+            }
+            else
+            {
+                _loopLetterAudio = false;
+            }
+        }
+    }
+
+    private string GetCurrentWordForAudio()
+    {
+        if (IsMultiLetterActive && !string.IsNullOrEmpty(_multiLetterWordRaw))
+            return _multiLetterWordRaw;
+        return lvl != null ? lvl.currentLetter : string.Empty;
+    }
+
+    private bool PlayCurrentWordAudio()
+    {
+        string word = GetCurrentWordForAudio();
+        if (string.IsNullOrWhiteSpace(word))
+            return false;
+
+        var clip = SharedWordLibrary.FindWordClip(word, wordAudioFolders);
+        if (!clip)
+        {
+            string key = word.ToLowerInvariant();
+            if (_missingWordAudio.Add(key))
+                Debug.LogWarning($"[Dictation] No shared word audio found for '{word}'.");
+            return false;
+        }
+        else
+        {
+            _missingWordAudio.Remove(word.ToLowerInvariant());
+        }
+
+        if (!wordAudioSource)
+            return false;
+
+        wordAudioSource.Stop();
+        wordAudioSource.clip = clip;
+        wordAudioSource.Play();
+        _activeWordForAudio = word.ToLowerInvariant();
+        if (_loopWordAudio)
+            _nextWordAudioAt = Time.time + Mathf.Max(1f, wordAudioRepeatSeconds);
+        return true;
     }
     public void TriggerLocalDebug()
     {

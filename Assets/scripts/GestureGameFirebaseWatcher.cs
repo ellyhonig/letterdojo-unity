@@ -1,23 +1,20 @@
 using System;
 using System.Collections;
-using Newtonsoft.Json.Linq;
 using UnityEngine;
 using UnityEngine.Networking;
 using UnityEngine.SceneManagement;
 
-/// <summary>
-/// Lightweight watcher used in the gesture mini-game scene. Polls the same
-/// Firestore document as FirebaseLevelSyncSinglePlan and returns to the
-/// main tracing scene when the dashboard stops targeting the mini-game.
-/// </summary>
+[Serializable] class DocRoot { public Fields fields; }
+[Serializable] class Fields { public StrVal activeScene; }
+[Serializable] class StrVal { public string stringValue; }
+
 public class GestureGameFirebaseWatcher : MonoBehaviour
 {
     [Header("REST Config")]
     [SerializeField] private string projectId = "homedojo-dashboard";
     [SerializeField] private string apiKey = "AIzaSyA_f94XSrBcmuge4VSD8avpgJ6iWRpOC3g";
     [SerializeField] private string room = "default";
-    [SerializeField, Range(0.1f, 2f)]
-    private float pollInterval = 0.5f;
+    [SerializeField, Range(0.5f, 5f)] private float pollInterval = 1.0f;
 
     [Header("Scene Routing")]
     [SerializeField] private string minigameSceneId = "multiplechoice";
@@ -25,12 +22,15 @@ public class GestureGameFirebaseWatcher : MonoBehaviour
 
     Coroutine _pollRoutine;
     string _minigameSceneIdNormalized;
+    string _etag;
 
     void OnEnable()
     {
         _minigameSceneIdNormalized = NormalizeSceneId(minigameSceneId);
         if (_pollRoutine == null)
+        {
             _pollRoutine = StartCoroutine(PollLoop());
+        }
     }
 
     void OnDisable()
@@ -44,14 +44,21 @@ public class GestureGameFirebaseWatcher : MonoBehaviour
 
     IEnumerator PollLoop()
     {
-        string url = $"https://firestore.googleapis.com/v1/projects/{projectId}/databases/(default)/documents/levelmanager_control/{room}?key={apiKey}";
-        var wait = new WaitForSecondsRealtime(Mathf.Max(0.05f, pollInterval));
+        string url =
+            $"https://firestore.googleapis.com/v1/projects/{projectId}/databases/(default)/documents/levelmanager_control/{room}" +
+            $"?mask.fieldPaths=activeScene&key={apiKey}";
+        var wait = new WaitForSecondsRealtime(Mathf.Max(0.5f, pollInterval));
 
         while (enabled && gameObject.activeInHierarchy)
         {
             using (var request = UnityWebRequest.Get(url))
             {
-                request.timeout = 10;
+                request.timeout = 8;
+                if (!string.IsNullOrEmpty(_etag))
+                {
+                    request.SetRequestHeader("If-None-Match", _etag);
+                }
+
                 yield return request.SendWebRequest();
 
 #if UNITY_2020_2_OR_NEWER
@@ -62,7 +69,9 @@ public class GestureGameFirebaseWatcher : MonoBehaviour
 
                 if (ok)
                 {
-                    string targetScene = ExtractSceneId(request.downloadHandler.text);
+                    _etag = request.GetResponseHeader("ETag") ?? _etag;
+                    var root = JsonUtility.FromJson<DocRoot>(request.downloadHandler.text);
+                    var targetScene = root?.fields?.activeScene?.stringValue;
                     if (!string.IsNullOrEmpty(targetScene) && !IsMiniGameScene(targetScene))
                     {
                         SceneManager.LoadScene(mainSceneName, LoadSceneMode.Single);
@@ -75,47 +84,13 @@ public class GestureGameFirebaseWatcher : MonoBehaviour
         }
     }
 
-    string ExtractSceneId(string json)
-    {
-        try
-        {
-            var root = JObject.Parse(json);
-            var fields = root["fields"] as JObject;
-            if (fields == null)
-                return null;
-
-            return ReadString(fields, "activeScene");
-        }
-        catch (Exception ex)
-        {
-            Debug.LogWarning($"[GestureGameFirebaseWatcher] Failed to parse Firestore payload: {ex.Message}");
-            return null;
-        }
-    }
-
-    static string ReadString(JObject fields, string key, string fallback = "")
-    {
-        if (fields.TryGetValue(key, out var token))
-        {
-            if (token is JObject map && map.TryGetValue("stringValue", out var valueToken))
-                return valueToken.ToString();
-        }
-        return fallback;
-    }
-
-    bool IsMiniGameScene(string sceneId)
-    {
-        string normalized = NormalizeSceneId(sceneId);
-        return normalized == _minigameSceneIdNormalized;
-    }
+    bool IsMiniGameScene(string sceneId) => NormalizeSceneId(sceneId) == _minigameSceneIdNormalized;
 
     static string NormalizeSceneId(string sceneId)
     {
-        if (string.IsNullOrWhiteSpace(sceneId))
-            return string.Empty;
+        if (string.IsNullOrWhiteSpace(sceneId)) return string.Empty;
         string lowered = sceneId.Trim().ToLowerInvariant();
-        if (lowered == "simplelettertrace")
-            return "main";
+        if (lowered == "simplelettertrace") return "main";
         return lowered;
     }
 }

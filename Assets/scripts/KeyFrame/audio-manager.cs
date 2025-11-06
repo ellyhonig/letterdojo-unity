@@ -219,6 +219,8 @@ public class AudioManager : MonoBehaviour
      * ---------------------------------------------------------*/
     private void OnDictationStart_NoArgs()
     {
+        if (dictationManager && dictationManager.IsWordDictationActive)
+            return;
         // Prefer authoritative LevelManager letter to avoid stale reflection reads
         if (levelManager != null && !string.IsNullOrEmpty(levelManager.currentLetter))
         {
@@ -233,12 +235,19 @@ public class AudioManager : MonoBehaviour
 
     private void OnDictationStart_String(string letter)
     {
+        if (dictationManager && dictationManager.IsWordDictationActive)
+            return;
         var one = ExtractFirstAZ(letter);
         if (one != '\0') PlayLetterClip(one);
         else OnDictationStart_NoArgs();
     }
 
-    private void OnDictationStart_Char(char letter) => PlayLetterClip(letter);
+    private void OnDictationStart_Char(char letter)
+    {
+        if (dictationManager && dictationManager.IsWordDictationActive)
+            return;
+        PlayLetterClip(letter);
+    }
 
     public void PlayCurrentLetterPronunciation()
     {

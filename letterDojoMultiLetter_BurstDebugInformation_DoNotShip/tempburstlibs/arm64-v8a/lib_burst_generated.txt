@@ -12,6 +12,7 @@ Library: Z:\questlteertracecopy\questversion\letterDojo_quest\Temp\BurstOutput\t
 --assembly-defines=Meta.XR.EnvironmentDepth;
 --assembly-defines=Meta.XR.ImmersiveDebugger;
 --assembly-defines=Meta.XR.ImmersiveDebugger.Interface;
+--assembly-defines=Meta.XR.MultiplayerBlocks.Shared;
 --assembly-defines=Mono.Security;
 --assembly-defines=mscorlib;
 --assembly-defines=Newtonsoft.Json;
@@ -165,6 +166,7 @@ Library: Z:\questlteertracecopy\questversion\letterDojo_quest\Temp\BurstOutput\t
 --assembly-defines=Meta.XR.EnvironmentDepth;
 --assembly-defines=Meta.XR.ImmersiveDebugger;
 --assembly-defines=Meta.XR.ImmersiveDebugger.Interface;
+--assembly-defines=Meta.XR.MultiplayerBlocks.Shared;
 --assembly-defines=Mono.Security;
 --assembly-defines=mscorlib;
 --assembly-defines=Newtonsoft.Json;
@@ -265,6 +267,7 @@ Library: Z:\questlteertracecopy\questversion\letterDojo_quest\Temp\BurstOutput\t
 --assembly-defines=Meta.XR.EnvironmentDepth;
 --assembly-defines=Meta.XR.ImmersiveDebugger;
 --assembly-defines=Meta.XR.ImmersiveDebugger.Interface;
+--assembly-defines=Meta.XR.MultiplayerBlocks.Shared;
 --assembly-defines=Mono.Security;
 --assembly-defines=mscorlib;
 --assembly-defines=Newtonsoft.Json;
@@ -366,6 +369,7 @@ Library: Z:\questlteertracecopy\questversion\letterDojo_quest\Temp\BurstOutput\t
 --assembly-defines=Meta.XR.EnvironmentDepth;
 --assembly-defines=Meta.XR.ImmersiveDebugger;
 --assembly-defines=Meta.XR.ImmersiveDebugger.Interface;
+--assembly-defines=Meta.XR.MultiplayerBlocks.Shared;
 --assembly-defines=Mono.Security;
 --assembly-defines=mscorlib;
 --assembly-defines=Newtonsoft.Json;
@@ -420,6 +424,7 @@ Library: Z:\questlteertracecopy\questversion\letterDojo_quest\Temp\BurstOutput\t
 --assembly-defines=Meta.XR.EnvironmentDepth;
 --assembly-defines=Meta.XR.ImmersiveDebugger;
 --assembly-defines=Meta.XR.ImmersiveDebugger.Interface;
+--assembly-defines=Meta.XR.MultiplayerBlocks.Shared;
 --assembly-defines=Mono.Security;
 --assembly-defines=mscorlib;
 --assembly-defines=Newtonsoft.Json;

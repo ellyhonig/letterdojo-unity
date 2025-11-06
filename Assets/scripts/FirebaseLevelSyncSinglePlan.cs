@@ -29,7 +29,7 @@ public class FirebaseLevelSyncSinglePlan : MonoBehaviour
     private string _lastCommand = null;
     private readonly List<string> _lastLevelLetters = new List<string>();
 
-    private static readonly string[] DefaultDictationWords = { "box", "cat", "dog", "sun" };
+    private static readonly IReadOnlyList<string> DefaultDictationWords = SharedWordLibrary.Words;
 
     private readonly Dictionary<string, int> _phaseByDrill = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _defaultLetterByDrill = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -383,7 +383,7 @@ public class FirebaseLevelSyncSinglePlan : MonoBehaviour
         {
             Letters = visualLetters,
             Phonemes = new List<string>(visualLetters),
-            Modes = new List<LevelManager.GameMode> { LevelManager.GameMode.TraceChecking }
+            Modes = new List<LevelManager.GameMode> { LevelManager.GameMode.Dictation }
         };
         NormalizePhaseLettersAndPhonemes(visualPhase, true);
         phases.Add(visualPhase);

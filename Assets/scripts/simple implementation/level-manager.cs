@@ -743,6 +743,19 @@ public class LevelManager : MonoBehaviour
         RestartSubsystemsForDrill();
         OnDrillChanged?.Invoke(currentDrill);
     }
+    public void OverrideCurrentLetterForDictation(string word)
+    {
+        if (string.IsNullOrWhiteSpace(word)) return;
+        string normalized = word.Trim();
+        if (string.Equals(currentLetter, normalized, StringComparison.Ordinal))
+        {
+            currentPhoneme = normalized;
+            return;
+        }
+        currentLetter = normalized;
+        currentPhoneme = normalized;
+        NotifyLetterChanged();
+    }
     private void RestartSubsystemsForDrill()
     {
         bool isAudio = string.Equals(currentDrill, "Audio", StringComparison.OrdinalIgnoreCase);
