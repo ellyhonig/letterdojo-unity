@@ -170,6 +170,44 @@ public class LevelManager : MonoBehaviour
         }
         return '\0';
     }
+    private static bool DrillPrefersLetters(string drill)
+    {
+        if (string.IsNullOrWhiteSpace(drill))
+            return true;
+        string lowered = drill.Trim().ToLowerInvariant();
+        return lowered == "audio" ||
+               lowered == "visual" ||
+               lowered == "freedraw" ||
+               lowered == "free draw";
+    }
+    private string NormalizeLetterForDrill(string value, string drill)
+    {
+        string trimmed = (value ?? string.Empty).Trim().ToLowerInvariant();
+        if (string.IsNullOrEmpty(trimmed))
+            return string.Empty;
+        if (!DrillPrefersLetters(drill))
+            return trimmed;
+        char ascii = ExtractFirstAsciiLetter(trimmed);
+        return ascii == '\0'
+            ? trimmed.Substring(0, 1)
+            : char.ToLowerInvariant(ascii).ToString();
+    }
+    private string NormalizeLetterForCurrentDrill(string value) =>
+        NormalizeLetterForDrill(value, currentDrill);
+    private void SyncPhonemeWithLetterForCurrentDrill()
+    {
+        if (DrillPrefersLetters(currentDrill))
+            currentPhoneme = currentLetter ?? string.Empty;
+    }
+    private void CoerceLetterToCurrentDrillIfNeeded()
+    {
+        string normalized = NormalizeLetterForCurrentDrill(currentLetter);
+        if (string.Equals(currentLetter ?? string.Empty, normalized, StringComparison.Ordinal))
+            return;
+        currentLetter = normalized;
+        SyncPhonemeWithLetterForCurrentDrill();
+        NotifyLetterChanged();
+    }
     private void TryPlayLetterAudio(string letter)
     {
         if (string.IsNullOrEmpty(letter))
@@ -324,8 +362,10 @@ public class LevelManager : MonoBehaviour
             StartNextPhase();
             return;
         }
-        currentLetter = currentPhase.Letters[letterIndex];
-        currentPhoneme = SafeGet(currentPhase.Phonemes, letterIndex) ?? currentLetter;
+        var storedLetter = currentPhase.Letters[letterIndex];
+        currentLetter = NormalizeLetterForCurrentDrill(storedLetter);
+        currentPhoneme = SafeGet(currentPhase.Phonemes, letterIndex) ?? storedLetter;
+        SyncPhonemeWithLetterForCurrentDrill();
         currentLevel = ComputeAbsoluteLevel(phaseIndex, letterIndex);
         if (modeIndex >= currentPhase.Modes.Count) modeIndex = 0;
         NotifyLetterChanged();
@@ -591,8 +631,10 @@ public class LevelManager : MonoBehaviour
                     letterIndex = l;
                     modeIndex = 0;
                     currentLevel = level;
-                    currentLetter = phase.Letters[l];
-                    currentPhoneme = SafeGet(phase.Phonemes, l) ?? currentLetter;
+                    var storedLetter = phase.Letters[l];
+                    currentLetter = NormalizeLetterForCurrentDrill(storedLetter);
+                    currentPhoneme = SafeGet(phase.Phonemes, l) ?? storedLetter;
+                    SyncPhonemeWithLetterForCurrentDrill();
                     NotifyLetterChanged();
                     LoadLevelData();
                     hasBootstrapped = false;
@@ -634,10 +676,12 @@ public class LevelManager : MonoBehaviour
                     phaseIndex = preferredPhaseIndex;
                     letterIndex = preferredLetterIndex;
                     modeIndex = 0;
-                    currentLetter = preferredPhase.Letters[preferredLetterIndex];
+                    var storedLetter = preferredPhase.Letters[preferredLetterIndex];
+                    currentLetter = NormalizeLetterForCurrentDrill(storedLetter);
                     if (preferredPhase.Phonemes.Count <= preferredLetterIndex)
-                        preferredPhase.Phonemes.Add(currentLetter);
+                        preferredPhase.Phonemes.Add(storedLetter);
                     currentPhoneme = preferredPhase.Phonemes[preferredLetterIndex];
+                    SyncPhonemeWithLetterForCurrentDrill();
                     currentLevel = ComputeAbsoluteLevel(preferredPhaseIndex, preferredLetterIndex);
                     lettersSinceLastSweep = 0;
 
@@ -663,10 +707,12 @@ public class LevelManager : MonoBehaviour
                 phaseIndex = p;
                 letterIndex = li;
                 modeIndex = 0;
-                currentLetter = phase.Letters[li];
+                var storedLetter = phase.Letters[li];
+                currentLetter = NormalizeLetterForCurrentDrill(storedLetter);
                 if (phase.Phonemes.Count <= li)
-                    phase.Phonemes.Add(currentLetter);
+                    phase.Phonemes.Add(storedLetter);
                 currentPhoneme = phase.Phonemes[li];
+                SyncPhonemeWithLetterForCurrentDrill();
                 currentLevel = ComputeAbsoluteLevel(p, li);
                 lettersSinceLastSweep = 0;
 
@@ -698,8 +744,9 @@ public class LevelManager : MonoBehaviour
         phaseIndex = Mathf.Clamp(injectionPhaseIndex, 0, levelPlan.Count - 1);
         letterIndex = Mathf.Clamp(insertIndex, 0, targetPhase.Letters.Count - 1);
         modeIndex = 0;
-        currentLetter = normalized;
+        currentLetter = NormalizeLetterForCurrentDrill(normalized);
         currentPhoneme = normalized;
+        SyncPhonemeWithLetterForCurrentDrill();
         currentLevel = ComputeAbsoluteLevel(phaseIndex, letterIndex);
         lettersSinceLastSweep = 0;
 
@@ -741,6 +788,7 @@ public class LevelManager : MonoBehaviour
         lettersSinceLastSweep = 0;
         ReleaseMemoryConsumers();
         RestartSubsystemsForDrill();
+        CoerceLetterToCurrentDrillIfNeeded();
         OnDrillChanged?.Invoke(currentDrill);
     }
     public void OverrideCurrentLetterForDictation(string word)
